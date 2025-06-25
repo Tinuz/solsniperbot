@@ -27,6 +27,29 @@ export const useJupiterSwap = (connection: Connection | null) => {
 
   const jupiterApi = createJupiterApiClient()
 
+  // Check if a token is tradeable on Jupiter
+  const isTokenTradeable = useCallback(async (mintAddress: string): Promise<boolean> => {
+    try {
+      // Validate mint address format
+      new PublicKey(mintAddress)
+      
+      // Try a small quote to see if the token is tradeable
+      const testQuote = await jupiterApi.quoteGet({
+        inputMint: SOL_MINT,
+        outputMint: mintAddress,
+        amount: 1000000, // 0.001 SOL
+        slippageBps: 1000, // 10%
+        onlyDirectRoutes: true // Only direct routes for validation
+      })
+      
+      return testQuote !== null
+    } catch (error) {
+      return false
+    }
+  }, [jupiterApi])
+
+  const SOL_MINT = 'So11111111111111111111111111111111111111112'
+
   const getSwapQuote = useCallback(async (
     inputMint: string,  // SOL mint
     outputMint: string, // Target token mint
@@ -35,6 +58,12 @@ export const useJupiterSwap = (connection: Connection | null) => {
   ) => {
     if (!connection) {
       setSwapRoute(prev => ({ ...prev, error: 'No connection available' }))
+      return null
+    }
+
+    // Skip if already loading to prevent multiple concurrent requests
+    if (swapRoute.loading) {
+      console.log('⏳ Quote request already in progress, skipping...')
       return null
     }
 
@@ -57,52 +86,122 @@ export const useJupiterSwap = (connection: Connection | null) => {
         slippageBps
       })
 
-      // Get quote from Jupiter
-      const quote = await jupiterApi.quoteGet({
-        inputMint,
-        outputMint,
-        amount: inputAmount,
-        slippageBps,
-        onlyDirectRoutes: false,
-        asLegacyTransaction: false
-      })
+      // Add timeout and retry logic
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
 
-      if (!quote) {
-        throw new Error('No quote available for this token pair')
+      try {      // Validate mint addresses first
+      try {
+        new PublicKey(inputMint)
+        new PublicKey(outputMint)
+      } catch (validationError) {
+        throw new Error('Invalid mint address format')
       }
 
-      // Calculate price impact and minimum received
-      const priceImpact = parseFloat(quote.priceImpactPct || '0')
-      const outAmount = parseInt(quote.outAmount)
-      const minimumReceived = (outAmount * (1 - slippageBps / 10000)).toString()
+      // Skip validation for SOL-to-SOL or common tokens to avoid extra API calls
+      const commonTokens = [
+        'So11111111111111111111111111111111111111112', // SOL
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+      ]
+      
+      if (!commonTokens.includes(outputMint)) {
+        console.log('🔍 Checking if token is tradeable on Jupiter...')
+        const isTradeable = await isTokenTradeable(outputMint)
+        if (!isTradeable) {
+          throw new Error('This token is not available for trading on Jupiter')
+        }
+        console.log('✅ Token is tradeable on Jupiter')
+      }
 
-      // Estimate fees (simplified)
-      const estimatedFees = quote.routePlan.reduce((total: number, route: any) => {
-        return total + (route.swapInfo?.feeAmount ? parseInt(route.swapInfo.feeAmount) : 5000)
-      }, 0)
+        // Get quote from Jupiter with timeout
+        const quote = await jupiterApi.quoteGet({
+          inputMint,
+          outputMint,
+          amount: inputAmount,
+          slippageBps,
+          onlyDirectRoutes: false,
+          asLegacyTransaction: false
+        })
 
-      setSwapRoute({
-        quote,
-        swapTransaction: null,
-        loading: false,
-        error: null,
-        priceImpact,
-        minimumReceived,
-        estimatedFees: estimatedFees / 1e9 // Convert to SOL
-      })
+        clearTimeout(timeoutId)
 
-      console.log('✅ Jupiter quote received:', {
-        inputAmount: inputAmount / 1e9,
-        outputAmount: outAmount,
-        priceImpact: priceImpact.toFixed(2) + '%',
-        routes: quote.routePlan.length
-      })
+        if (!quote) {
+          throw new Error('No quote available for this token pair')
+        }
 
-      return quote
+        // Calculate price impact and minimum received
+        const priceImpact = parseFloat(quote.priceImpactPct || '0')
+        const outAmount = parseInt(quote.outAmount)
+        const minimumReceived = (outAmount * (1 - slippageBps / 10000)).toString()
+
+        // Estimate fees (simplified)
+        const estimatedFees = quote.routePlan.reduce((total: number, route: any) => {
+          return total + (route.swapInfo?.feeAmount ? parseInt(route.swapInfo.feeAmount) : 5000)
+        }, 0)
+
+        setSwapRoute({
+          quote,
+          swapTransaction: null,
+          loading: false,
+          error: null,
+          priceImpact,
+          minimumReceived,
+          estimatedFees: estimatedFees / 1e9 // Convert to SOL
+        })
+
+        console.log('✅ Jupiter quote received:', {
+          inputAmount: inputAmount / 1e9,
+          outputAmount: outAmount,
+          priceImpact: priceImpact.toFixed(2) + '%',
+          routes: quote.routePlan.length
+        })
+
+        return quote
+
+      } catch (fetchError) {
+        clearTimeout(timeoutId)
+        throw fetchError
+      }
 
     } catch (error) {
       console.error('❌ Error getting Jupiter quote:', error)
-      const errorMessage = error instanceof Error ? error.message : 'Failed to get swap quote'
+      
+      // Better error handling based on error type
+      let errorMessage = 'Failed to get swap quote'
+      
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          errorMessage = 'Request timeout - Jupiter API is slow'
+        } else if (error.message.includes('NetworkError')) {
+          errorMessage = 'Network error - check internet connection'
+        } else if (error.message.includes('fetch')) {
+          errorMessage = 'Jupiter API temporarily unavailable'
+        } else if (error.message.includes('Invalid mint address')) {
+          errorMessage = 'Invalid token address format'
+        } else {
+          errorMessage = error.message
+        }
+      }
+      
+      // Handle Jupiter API specific errors
+      if (error && typeof error === 'object' && 'response' in error) {
+        const response = (error as any).response
+        if (response?.status === 400) {
+          errorMessage = 'This token is not tradeable on Jupiter or the pair does not exist'
+        } else if (response?.status === 404) {
+          errorMessage = 'Token not found in Jupiter database'
+        } else if (response?.status === 429) {
+          errorMessage = 'Too many requests - please wait a moment'
+        } else if (response?.status >= 500) {
+          errorMessage = 'Jupiter API server error - try again later'
+        }
+      }
+      
+      // Check if it's a ResponseError (Jupiter API specific)
+      if (error?.constructor?.name === 'ResponseError') {
+        errorMessage = 'This token pair is not available for trading on Jupiter'
+      }
       
       setSwapRoute({
         quote: null,
@@ -116,7 +215,7 @@ export const useJupiterSwap = (connection: Connection | null) => {
       
       return null
     }
-  }, [connection, jupiterApi])
+  }, [connection, jupiterApi, swapRoute.loading])
 
   const prepareSwapTransaction = useCallback(async (
     quote: QuoteResponse,
@@ -230,6 +329,7 @@ export const useJupiterSwap = (connection: Connection | null) => {
     getSwapQuote,
     prepareSwapTransaction,
     executeSwap,
-    clearRoute
+    clearRoute,
+    isTokenTradeable
   }
 }

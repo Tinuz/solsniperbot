@@ -22,27 +22,60 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
 }) => {
   const { connection } = useConnection()
   const { publicKey, signTransaction } = useWallet()
-  const { swapRoute, getSwapQuote, prepareSwapTransaction, executeSwap, clearRoute } = useJupiterSwap(connection)
+  const { swapRoute, getSwapQuote, prepareSwapTransaction, executeSwap, clearRoute, isTokenTradeable } = useJupiterSwap(connection)
   const [isExecuting, setIsExecuting] = useState(false)
+  const [isValidating, setIsValidating] = useState(false)
+  const [lastQuoteTime, setLastQuoteTime] = useState<number>(0)
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [quoteAge, setQuoteAge] = useState<number>(0)
 
-  // Auto-refresh quote every 10 seconds
+  // Smart quote refresh with user control
   useEffect(() => {
     if (!tokenAddress || !amount || parseFloat(amount) <= 0) {
       clearRoute()
+      setLastQuoteTime(0)
       return
     }
 
     const fetchQuote = () => {
-      const slippageBps = Math.floor(parseFloat(slippage) * 100) // Convert % to basis points
+      const slippageBps = Math.floor(parseFloat(slippage) * 100)
       getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
+      setLastQuoteTime(Date.now())
     }
 
-    fetchQuote()
+    // Initial fetch with delay to prevent immediate multiple calls
+    const initialTimeout = setTimeout(fetchQuote, 500)
 
-    // Auto-refresh every 10 seconds
-    const interval = setInterval(fetchQuote, 10000)
-    return () => clearInterval(interval)
-  }, [tokenAddress, amount, slippage, getSwapQuote, clearRoute])
+    // Only auto-refresh if enabled and quote is older than 30 seconds
+    let interval: NodeJS.Timeout | null = null
+    if (autoRefresh) {
+      interval = setInterval(() => {
+        const timeSinceLastQuote = Date.now() - lastQuoteTime
+        if (timeSinceLastQuote > 30000) { // Only refresh if quote is >30 seconds old
+          fetchQuote()
+        }
+      }, 10000) // Check every 10 seconds, but only refresh if needed
+    }
+    
+    return () => {
+      clearTimeout(initialTimeout)
+      if (interval) clearInterval(interval)
+    }
+  }, [tokenAddress, amount, slippage, getSwapQuote, clearRoute, autoRefresh, lastQuoteTime])
+
+  // Update quote age every second
+  useEffect(() => {
+    if (!lastQuoteTime) return
+
+    const updateAge = () => {
+      setQuoteAge(Date.now() - lastQuoteTime)
+    }
+
+    updateAge() // Initial update
+    const ageInterval = setInterval(updateAge, 1000)
+    
+    return () => clearInterval(ageInterval)
+  }, [lastQuoteTime])
 
   const handleSwap = async () => {
     if (!swapRoute.quote || !publicKey || !signTransaction) return
@@ -71,6 +104,20 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
     }
   }
 
+  const refreshQuote = () => {
+    if (swapRoute.loading) return
+    const slippageBps = Math.floor(parseFloat(slippage) * 100)
+    getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
+    setLastQuoteTime(Date.now())
+  }
+
+  const formatQuoteAge = (ageMs: number) => {
+    const seconds = Math.floor(ageMs / 1000)
+    if (seconds < 60) return `${seconds}s ago`
+    const minutes = Math.floor(seconds / 60)
+    return `${minutes}m ${seconds % 60}s ago`
+  }
+
   const formatNumber = (num: string | number, decimals = 6) => {
     const value = typeof num === 'string' ? parseFloat(num) : num
     return value.toLocaleString(undefined, { 
@@ -93,13 +140,43 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
       <div className="flex items-center justify-between mb-3">
         <h4 className="text-lg font-semibold text-white flex items-center">
           🔄 Jupiter Swap Quote
+          {lastQuoteTime > 0 && !swapRoute.loading && (
+            <span className="ml-2 text-xs text-gray-400">
+              ({formatQuoteAge(quoteAge)})
+            </span>
+          )}
         </h4>
-        {swapRoute.loading && (
-          <div className="flex items-center text-sm text-gray-400">
-            <div className="w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full animate-spin mr-2"></div>
-            Loading...
-          </div>
-        )}
+        <div className="flex items-center space-x-2">
+          {(swapRoute.loading || isValidating) && (
+            <div className="flex items-center text-sm text-gray-400">
+              <div className="w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full animate-spin mr-2"></div>
+              {isValidating ? 'Validating...' : 'Loading...'}
+            </div>
+          )}
+          
+          {/* Auto-refresh toggle */}
+          <button
+            onClick={() => setAutoRefresh(!autoRefresh)}
+            className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+              autoRefresh 
+                ? 'bg-green-600/20 text-green-400 hover:bg-green-600/30' 
+                : 'bg-gray-600/20 text-gray-400 hover:bg-gray-600/30'
+            }`}
+            title={autoRefresh ? 'Auto-refresh enabled' : 'Auto-refresh disabled'}
+          >
+            {autoRefresh ? '🔄' : '⏸️'}
+          </button>
+
+          {/* Manual refresh */}
+          <button
+            onClick={refreshQuote}
+            disabled={swapRoute.loading || isValidating}
+            className="px-3 py-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            title="Refresh quote now"
+          >
+            🔄 Refresh
+          </button>
+        </div>
       </div>
 
       {swapRoute.error && (
@@ -107,11 +184,69 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
           <div className="text-red-400 text-sm">
             ❌ {swapRoute.error}
           </div>
+          {swapRoute.error.includes('Jupiter API') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 Try again in a few seconds. Jupiter API may be experiencing high load.
+            </div>
+          )}
+          {swapRoute.error.includes('Network error') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 Check your internet connection and try again.
+            </div>
+          )}
+          {swapRoute.error.includes('timeout') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 Request took too long. The API may be slow right now.
+            </div>
+          )}
+          {swapRoute.error.includes('not tradeable') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 This token might be very new or not have enough liquidity yet. Try a different token or wait a bit.
+            </div>
+          )}
+          {swapRoute.error.includes('pair does not exist') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 No trading route found for this token. It may not be listed on major DEXs yet.
+            </div>
+          )}
+          {swapRoute.error.includes('Invalid token address') && (
+            <div className="mt-2 text-xs text-gray-400">
+              💡 Please check that the token address is valid and correctly formatted.
+            </div>
+          )}
         </div>
       )}
 
       {swapRoute.quote && !swapRoute.loading && (
         <div className="space-y-3">
+          {/* Quote freshness indicator */}
+          {lastQuoteTime > 0 && (
+            <div className={`flex items-center justify-between p-2 rounded-lg text-xs ${
+              quoteAge < 15000 ? 'bg-green-500/10 border border-green-500/20' :
+              quoteAge < 30000 ? 'bg-yellow-500/10 border border-yellow-500/20' :
+              'bg-red-500/10 border border-red-500/20'
+            }`}>
+              <div className="flex items-center">
+                <div className={`w-2 h-2 rounded-full mr-2 ${
+                  quoteAge < 15000 ? 'bg-green-400' :
+                  quoteAge < 30000 ? 'bg-yellow-400' :
+                  'bg-red-400'
+                }`}></div>
+                <span className={`${
+                  quoteAge < 15000 ? 'text-green-400' :
+                  quoteAge < 30000 ? 'text-yellow-400' :
+                  'text-red-400'
+                }`}>
+                  Quote {formatQuoteAge(quoteAge)}
+                  {quoteAge > 30000 && ' - Consider refreshing'}
+                </span>
+              </div>
+              {!autoRefresh && (
+                <span className="text-gray-400">Auto-refresh disabled</span>
+              )}
+            </div>
+          )}
+
           {/* Swap Details */}
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="space-y-2">
