@@ -17,6 +17,7 @@ const MainInterface = () => {
   const [slippage, setSlippage] = useState('5')
   const [mounted, setMounted] = useState(false)
   const [lastSwapSignature, setLastSwapSignature] = useState<string | null>(null)
+  const [isQuickSniping, setIsQuickSniping] = useState(false)
 
   // Prevent hydration mismatch by only rendering wallet-dependent content after mount
   useEffect(() => {
@@ -29,10 +30,45 @@ const MainInterface = () => {
       return
     }
 
-    // The actual sniping is now handled by the SwapQuote component
-    console.log('Sniping token:', tokenAddress)
-    console.log('Amount:', amount)
-    console.log('Slippage:', slippage)
+    if (!tokenAddress || !amount) {
+      alert('Please enter token address and amount first')
+      return
+    }
+
+    setIsQuickSniping(true)
+    
+    try {
+      // Quick snipe: immediately trigger the swap process
+      console.log('🎯 Quick Sniping token:', tokenAddress)
+      console.log('💰 Amount:', amount, 'SOL')
+      console.log('📊 Slippage:', slippage + '%')
+      
+      // Try to trigger quote refresh or initial quote get
+      const refreshButton = document.querySelector('[data-testid="swap-quote-refresh"]') as HTMLButtonElement
+      const getQuoteButton = document.querySelector('[data-testid="get-swap-quote"]') as HTMLButtonElement
+      
+      if (refreshButton && !refreshButton.disabled) {
+        refreshButton.click()
+        alert(`🎯 Quick Snipe initiated!\n\n✅ Refreshing quote for ${amount} SOL\n⏰ Watch the swap section below for updates`)
+      } else if (getQuoteButton) {
+        getQuoteButton.click()
+        alert(`🎯 Quick Snipe initiated!\n\n✅ Getting initial quote for ${amount} SOL\n⏰ Watch the swap section below for updates`)
+      } else {
+        // Scroll to swap section as fallback
+        const swapSection = document.querySelector('.mt-4.p-4.bg-gradient-to-r.from-purple-500')
+        if (swapSection) {
+          swapSection.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }
+        
+        alert(`🎯 Quick Snipe Ready!\n\nToken: ${tokenAddress.slice(0, 8)}...\nAmount: ${amount} SOL\nSlippage: ${slippage}%\n\n👇 Scroll down to the swap section to get a quote!`)
+      }
+      
+    } catch (error) {
+      console.error('Quick snipe error:', error)
+      alert('Quick snipe failed: ' + (error instanceof Error ? error.message : 'Unknown error'))
+    } finally {
+      setIsQuickSniping(false)
+    }
   }
 
   const handleSwapSuccess = (signature: string) => {
@@ -157,14 +193,40 @@ const MainInterface = () => {
             />
           )}
 
-          {/* Snipe Button */}
-          <button
-            onClick={handleSnipe}
-            disabled={!mounted || !connected || !tokenAddress || !amount}
-            className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed text-white font-semibold py-4 px-6 rounded-lg transition-all duration-200 transform hover:scale-105 disabled:scale-100"
-          >
-            {!mounted ? 'Loading...' : connected ? 'Snipe Token' : 'Connect Wallet to Snipe'}
-          </button>
+          {/* Quick Snipe Button */}
+          <div className="mt-6">
+            <button
+              onClick={handleSnipe}
+              disabled={!mounted || !connected || !tokenAddress || !amount || isQuickSniping}
+              className="w-full bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed text-white font-bold py-4 px-6 rounded-lg transition-all duration-200 transform hover:scale-105 disabled:scale-100 shadow-lg hover:shadow-xl"
+            >
+              <div className="flex items-center justify-center">
+                {isQuickSniping ? (
+                  <>
+                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin mr-3"></div>
+                    Quick Sniping...
+                  </>
+                ) : !mounted ? (
+                  'Loading...'
+                ) : !connected ? (
+                  '🔗 Connect Wallet to Snipe'
+                ) : !tokenAddress || !amount ? (
+                  '⚡ Enter Token & Amount First'
+                ) : (
+                  <>
+                    🎯 Quick Snipe {amount} SOL
+                    <span className="ml-2 text-xs opacity-75">({slippage}% slippage)</span>
+                  </>
+                )}
+              </div>
+            </button>
+            
+            {connected && tokenAddress && amount && (
+              <div className="mt-2 text-center text-xs text-gray-400">
+                Quick snipe will get a fresh quote and guide you through the swap
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Info */}

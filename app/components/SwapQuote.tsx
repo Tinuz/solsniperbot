@@ -26,44 +26,42 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
   const [isExecuting, setIsExecuting] = useState(false)
   const [isValidating, setIsValidating] = useState(false)
   const [lastQuoteTime, setLastQuoteTime] = useState<number>(0)
-  const [autoRefresh, setAutoRefresh] = useState(true)
   const [quoteAge, setQuoteAge] = useState<number>(0)
+  const [hasInitialQuote, setHasInitialQuote] = useState(false)
+  const [lastParams, setLastParams] = useState<string>('')
 
-  // Smart quote refresh with user control
+  // Track parameter changes and manage quote fetching
   useEffect(() => {
+    const currentParams = `${tokenAddress}-${amount}-${slippage}`
+    
+    // If parameters are invalid, clear everything
     if (!tokenAddress || !amount || parseFloat(amount) <= 0) {
-      clearRoute()
-      setLastQuoteTime(0)
+      if (lastParams !== '') {
+        // Defer state updates to avoid React warnings
+        setTimeout(() => {
+          clearRoute()
+          setLastQuoteTime(0)
+          setHasInitialQuote(false)
+          setLastParams('')
+        }, 0)
+      }
       return
     }
 
-    const fetchQuote = () => {
-      const slippageBps = Math.floor(parseFloat(slippage) * 100)
-      getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
-      setLastQuoteTime(Date.now())
+    // If parameters changed, reset and potentially fetch new quote
+    if (currentParams !== lastParams) {
+      setLastParams(currentParams)
+      setHasInitialQuote(false)
+      setLastQuoteTime(0)
+      
+      // Clear existing quote when parameters change
+      setTimeout(() => {
+        clearRoute()
+      }, 0)
     }
+  }, [tokenAddress, amount, slippage, lastParams, clearRoute])
 
-    // Initial fetch with delay to prevent immediate multiple calls
-    const initialTimeout = setTimeout(fetchQuote, 500)
-
-    // Only auto-refresh if enabled and quote is older than 30 seconds
-    let interval: NodeJS.Timeout | null = null
-    if (autoRefresh) {
-      interval = setInterval(() => {
-        const timeSinceLastQuote = Date.now() - lastQuoteTime
-        if (timeSinceLastQuote > 30000) { // Only refresh if quote is >30 seconds old
-          fetchQuote()
-        }
-      }, 10000) // Check every 10 seconds, but only refresh if needed
-    }
-    
-    return () => {
-      clearTimeout(initialTimeout)
-      if (interval) clearInterval(interval)
-    }
-  }, [tokenAddress, amount, slippage, getSwapQuote, clearRoute, autoRefresh, lastQuoteTime])
-
-  // Update quote age every second
+  // Update quote age every second (but don't auto-refresh)
   useEffect(() => {
     if (!lastQuoteTime) return
 
@@ -104,11 +102,16 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
     }
   }
 
-  const refreshQuote = () => {
+  const refreshQuote = async () => {
     if (swapRoute.loading) return
-    const slippageBps = Math.floor(parseFloat(slippage) * 100)
-    getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
-    setLastQuoteTime(Date.now())
+    
+    try {
+      const slippageBps = Math.floor(parseFloat(slippage) * 100)
+      await getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
+      setLastQuoteTime(Date.now())
+    } catch (error) {
+      console.log('Error refreshing quote:', error)
+    }
   }
 
   const formatQuoteAge = (ageMs: number) => {
@@ -132,7 +135,13 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
   }
 
   if (!tokenAddress || !amount || parseFloat(amount) <= 0) {
-    return null
+    return (
+      <div className="mt-4 p-4 bg-gradient-to-r from-purple-500/10 to-pink-500/10 border border-purple-500/20 rounded-lg">
+        <div className="text-center text-gray-400">
+          💰 Enter a token address and amount to get swap quotes
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -153,28 +162,16 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
               {isValidating ? 'Validating...' : 'Loading...'}
             </div>
           )}
-          
-          {/* Auto-refresh toggle */}
-          <button
-            onClick={() => setAutoRefresh(!autoRefresh)}
-            className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
-              autoRefresh 
-                ? 'bg-green-600/20 text-green-400 hover:bg-green-600/30' 
-                : 'bg-gray-600/20 text-gray-400 hover:bg-gray-600/30'
-            }`}
-            title={autoRefresh ? 'Auto-refresh enabled' : 'Auto-refresh disabled'}
-          >
-            {autoRefresh ? '🔄' : '⏸️'}
-          </button>
 
-          {/* Manual refresh */}
+          {/* Manual refresh - always available */}
           <button
             onClick={refreshQuote}
             disabled={swapRoute.loading || isValidating}
             className="px-3 py-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            title="Refresh quote now"
+            title="Get fresh quote"
+            data-testid="swap-quote-refresh"
           >
-            🔄 Refresh
+            🔄 Refresh Quote
           </button>
         </div>
       </div>
@@ -217,6 +214,25 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
         </div>
       )}
 
+      {/* No quote yet - show get quote prompt */}
+      {!swapRoute.quote && !swapRoute.loading && !swapRoute.error && tokenAddress && amount && parseFloat(amount) > 0 && (
+        <div className="text-center py-6 border-2 border-dashed border-gray-500/30 rounded-lg">
+          <div className="text-gray-400 mb-3">
+            💱 Ready to get a swap quote for this token?
+          </div>
+          <button
+            onClick={refreshQuote}
+            className="px-4 py-2 bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 rounded-lg font-medium transition-colors"
+            data-testid="get-swap-quote"
+          >
+            🔄 Get Swap Quote
+          </button>
+          <div className="mt-2 text-xs text-gray-400">
+            Quotes are fetched manually for better control
+          </div>
+        </div>
+      )}
+
       {swapRoute.quote && !swapRoute.loading && (
         <div className="space-y-3">
           {/* Quote freshness indicator */}
@@ -241,9 +257,7 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
                   {quoteAge > 30000 && ' - Consider refreshing'}
                 </span>
               </div>
-              {!autoRefresh && (
-                <span className="text-gray-400">Auto-refresh disabled</span>
-              )}
+              <span className="text-gray-400">Manual refresh only</span>
             </div>
           )}
 
