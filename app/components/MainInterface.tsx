@@ -18,6 +18,7 @@ const MainInterface = () => {
   const [mounted, setMounted] = useState(false)
   const [lastSwapSignature, setLastSwapSignature] = useState<string | null>(null)
   const [isQuickSniping, setIsQuickSniping] = useState(false)
+  const [markTokenAsSniped, setMarkTokenAsSniped] = useState<((mint: string, snipeData?: { amount?: number; price?: number; signature?: string }) => void) | null>(null)
 
   // Prevent hydration mismatch by only rendering wallet-dependent content after mount
   useEffect(() => {
@@ -73,6 +74,21 @@ const MainInterface = () => {
 
   const handleSwapSuccess = (signature: string) => {
     setLastSwapSignature(signature)
+    
+    // Mark token as sniped if we have the function and a valid token address
+    if (markTokenAsSniped && tokenAddress && amount) {
+      try {
+        const snipeAmount = parseFloat(amount)
+        markTokenAsSniped(tokenAddress, {
+          amount: snipeAmount,
+          signature: signature
+        })
+        console.log('✅ Token marked as sniped:', tokenAddress.slice(0, 8))
+      } catch (error) {
+        console.warn('Failed to mark token as sniped:', error)
+      }
+    }
+    
     alert(`🎉 Swap successful! Transaction: ${signature}`)
   }
 
@@ -114,7 +130,10 @@ const MainInterface = () => {
       </div>
 
       {/* Mint Detection */}
-      {mounted && <MintDetection onTokenSelect={handleTokenSelect} />}
+      {mounted && <MintDetection 
+        onTokenSelect={handleTokenSelect} 
+        onMarkTokenAsSnipedRef={setMarkTokenAsSniped}
+      />}
 
       {/* Sniper Interface */}
       <div className="bg-white/10 backdrop-blur-md rounded-xl p-6">
