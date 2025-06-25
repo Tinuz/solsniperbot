@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { Connection, PublicKey } from '@solana/web3.js'
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token'
 import { createJupiterApiClient } from '@jup-ag/api'
@@ -84,18 +84,11 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
   const [lastHeartbeat, setLastHeartbeat] = useState<number>(0)
   const [accountsProcessed, setAccountsProcessed] = useState(0)
   const [pollingResults, setPollingResults] = useState(0)
-  const [intervals, setIntervals] = useState<{ heartbeat?: NodeJS.Timeout; polling?: NodeJS.Timeout; marketCheck?: NodeJS.Timeout }>({})
+  const [intervals, setIntervals] = useState<{ heartbeat?: NodeJS.Timeout; polling?: NodeJS.Timeout; marketCheck?: NodeJS.Timeout; healthCheck?: NodeJS.Timeout }>({})
   const [marketCheckQueue, setMarketCheckQueue] = useState<Set<string>>(new Set())
   const [rateLimitBackoff, setRateLimitBackoff] = useState<number>(0) // Backoff counter for rate limiting
   const [lastMarketCheckTime, setLastMarketCheckTime] = useState<number>(0) // Track last market check time
   const [lastRpcCallTime, setLastRpcCallTime] = useState<number>(0) // Track last RPC call to avoid Helius rate limits
-
-  // Safe state update function to prevent updates on unmounted components
-  const safeSetState = useCallback(<T>(setter: React.Dispatch<React.SetStateAction<T>>, value: React.SetStateAction<T>) => {
-    if (isMountedRef.current) {
-      setter(value)
-    }
-  }, [])
 
   // Sync to localStorage when state changes
   useEffect(() => {
@@ -149,8 +142,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     }
   }, []) // Only run once on mount
 
-  // Jupiter API client for market checking
-  const jupiterApi = createJupiterApiClient()
+  // Jupiter API client for market checking (memoized to prevent re-creation)
+  const jupiterApi = useMemo(() => createJupiterApiClient(), [])
   const SOL_MINT = 'So11111111111111111111111111111111111111112'
 
   // Wrapper function for Jupiter API calls with built-in retry and rate limiting
@@ -260,127 +253,145 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         return 'error'
       }
     }
-  }, [jupiterApi, callJupiterWithRetry])
+  }, [callJupiterWithRetry]) // Removed jupiterApi dependency (now memoized)
 
   // Process market check queue
   const processMarketCheckQueue = useCallback(async () => {
-    if (marketCheckQueue.size === 0) {
+    // Get current queue state
+    let currentQueue: Set<string> = new Set()
+    
+    setMarketCheckQueue(prev => {
+      currentQueue = new Set(prev)
+      return prev // Don't change the queue here
+    })
+    
+    if (currentQueue.size === 0) {
       console.log('🔍 Market check queue is empty, skipping...')
       return
     }
 
-    // Check if we're in backoff mode due to rate limiting
-    if (rateLimitBackoff > 0) {
-      const backoffTime = Math.min(rateLimitBackoff * 60000, 600000) // 1 min per level, max 10 minutes
-      console.log(`⏱️ Rate limit backoff active: waiting ${backoffTime/1000}s before next check...`)
-      return
-    }
+    // Check if we're in backoff mode using state callback
+    let shouldSkipBackoff = false
+    setRateLimitBackoff(prev => {
+      if (prev > 0) {
+        const backoffTime = Math.min(prev * 60000, 600000) // 1 min per level, max 10 minutes
+        console.log(`⏱️ Rate limit backoff active: waiting ${backoffTime/1000}s before next check...`)
+        shouldSkipBackoff = true
+      }
+      return prev // Don't change backoff here
+    })
+    
+    if (shouldSkipBackoff) return
 
-    // Minimum interval between market checks (30 seconds)
+    // Check minimum interval using state callback
+    let shouldSkipTiming = false
     const now = Date.now()
-    if (now - lastMarketCheckTime < 30000) {
-      console.log(`⏱️ Rate limiting: only ${Math.round((now - lastMarketCheckTime)/1000)}s since last check, waiting...`)
-      return
-    }
+    setLastMarketCheckTime(prev => {
+      if (now - prev < 30000) {
+        console.log(`⏱️ Rate limiting: only ${Math.round((now - prev)/1000)}s since last check, waiting...`)
+        shouldSkipTiming = true
+        return prev // Don't update if skipping
+      }
+      return now // Update time if proceeding
+    })
+    
+    if (shouldSkipTiming) return
 
-    console.log(`🔄 Processing market check queue: ${marketCheckQueue.size} tokens`)
-    console.log('📋 Queue contents:', Array.from(marketCheckQueue).map(mint => mint.slice(0, 8)))
+    console.log(`🔄 Processing market check queue: ${currentQueue.size} tokens`)
     
     // Process only 1 token at a time to avoid rate limiting and 400 errors
-    const tokensToCheck = Array.from(marketCheckQueue).slice(0, 1)
-    console.log(`🎯 Checking token: ${tokensToCheck[0]?.slice(0, 8)}...`)
+    const tokensToCheck = Array.from(currentQueue).slice(0, 1)
+    if (tokensToCheck.length === 0) return
     
-    for (const mintAddress of tokensToCheck) {
-      try {
-        // Add extra validation before checking
-        if (!mintAddress || mintAddress.length < 32) {
-          console.log(`⚠️ Invalid mint address format, removing from queue: ${mintAddress}`)
-          setMarketCheckQueue(prev => {
-            const newQueue = new Set(prev)
-            newQueue.delete(mintAddress)
-            return newQueue
-          })
-          continue
-        }
-        
-        console.log(`🔍 Starting market check for: ${mintAddress.slice(0, 8)}...`)
-        
-        // Update last check time
-        if (isMountedRef.current) {
-          setLastMarketCheckTime(Date.now())
-        }
-        
-        const marketStatus = await checkTokenMarket(mintAddress)
-        console.log(`📊 Market check result for ${mintAddress.slice(0, 8)}: ${marketStatus}`)
-        
-        // Reset backoff on successful check
-        if (marketStatus !== 'error') {
-          setRateLimitBackoff(0)
-        } else {
-          // Increase backoff if we got an error (likely rate limit)
-          setRateLimitBackoff(prev => prev + 1)
-          console.log(`⏱️ Increased rate limit backoff to level ${rateLimitBackoff + 1}`)
-        }
-        
-        // Update token status and check if should remove from queue in one operation
-        let shouldRemove = false
-        
-        setDetectedTokens(prev => {
-          const updated = prev.map(token => {
-            if (token.mint === mintAddress) {
-              const updatedToken = {
-                ...token,
-                marketStatus,
-                lastMarketCheck: Date.now(),
-                marketCheckCount: (token.marketCheckCount || 0) + 1
-              }
-              
-              console.log(`📝 Updated token ${mintAddress.slice(0, 8)}:`, {
-                marketStatus: updatedToken.marketStatus,
-                checkCount: updatedToken.marketCheckCount
-              })
-              
-              // Check if we should remove from queue based on updated count
-              shouldRemove = marketStatus === 'available' || updatedToken.marketCheckCount >= 10
-              
-              return updatedToken
-            }
-            return token
-          })
-          
-          return updated
-        })
-        
-        if (shouldRemove) {
-          setMarketCheckQueue(prev => {
-            const newQueue = new Set(prev)
-            newQueue.delete(mintAddress)
-            console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue (${marketStatus === 'available' ? 'available' : 'max attempts'})`)
-            console.log(`📊 Queue size after removal: ${newQueue.size}`)
-            return newQueue
-          })
-        } else {
-          console.log(`🔄 Keeping ${mintAddress.slice(0, 8)} in queue for next check`)
-        }
-        
-        // Longer delay between checks to avoid rate limiting (increased to 10s)
-        await new Promise(resolve => setTimeout(resolve, 10000))
-        
-      } catch (error) {
-        console.error(`❌ Error in market check for ${mintAddress}:`, error)
-        
-        // Remove problematic tokens from queue
+    const mintAddress = tokensToCheck[0]
+    console.log(`🎯 Checking token: ${mintAddress.slice(0, 8)}...`)
+    
+    try {
+      // Add extra validation before checking
+      if (!mintAddress || mintAddress.length < 32) {
+        console.log(`⚠️ Invalid mint address format, removing from queue: ${mintAddress}`)
         setMarketCheckQueue(prev => {
           const newQueue = new Set(prev)
           newQueue.delete(mintAddress)
-          console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue due to error`)
           return newQueue
         })
+        return
       }
+      
+      console.log(`🔍 Starting market check for: ${mintAddress.slice(0, 8)}...`)
+      
+      const marketStatus = await checkTokenMarket(mintAddress)
+      console.log(`📊 Market check result for ${mintAddress.slice(0, 8)}: ${marketStatus}`)
+      
+      // Reset or increase backoff based on result
+      if (marketStatus !== 'error') {
+        setRateLimitBackoff(0)
+      } else {
+        setRateLimitBackoff(prev => {
+          const newBackoff = prev + 1
+          console.log(`⏱️ Increased rate limit backoff to level ${newBackoff}`)
+          return newBackoff
+        })
+      }
+      
+      // Update token status and check if should remove from queue in one operation
+      let shouldRemove = false
+      
+      setDetectedTokens(prev => {
+        const updated = prev.map(token => {
+          if (token.mint === mintAddress) {
+            const updatedToken = {
+              ...token,
+              marketStatus,
+              lastMarketCheck: Date.now(),
+              marketCheckCount: (token.marketCheckCount || 0) + 1
+            }
+            
+            console.log(`📝 Updated token ${mintAddress.slice(0, 8)}:`, {
+              marketStatus: updatedToken.marketStatus,
+              checkCount: updatedToken.marketCheckCount
+            })
+            
+            // Check if we should remove from queue based on updated count
+            shouldRemove = marketStatus === 'available' || updatedToken.marketCheckCount >= 10
+            
+            return updatedToken
+          }
+          return token
+        })
+        
+        return updated
+      })
+      
+      if (shouldRemove) {
+        setMarketCheckQueue(prev => {
+          const newQueue = new Set(prev)
+          newQueue.delete(mintAddress)
+          console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue (${marketStatus === 'available' ? 'available' : 'max attempts'})`)
+          console.log(`📊 Queue size after removal: ${newQueue.size}`)
+          return newQueue
+        })
+      } else {
+        console.log(`🔄 Keeping ${mintAddress.slice(0, 8)} in queue for next check`)
+      }
+      
+      // Longer delay between checks to avoid rate limiting (increased to 10s)
+      await new Promise(resolve => setTimeout(resolve, 10000))
+      
+    } catch (error) {
+      console.error(`❌ Error in market check for ${mintAddress}:`, error)
+      
+      // Remove problematic tokens from queue
+      setMarketCheckQueue(prev => {
+        const newQueue = new Set(prev)
+        newQueue.delete(mintAddress)
+        console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue due to error`)
+        return newQueue
+      })
     }
     
-    console.log(`✅ Market check queue processing completed. Remaining: ${marketCheckQueue.size}`)
-  }, [marketCheckQueue, checkTokenMarket, rateLimitBackoff, lastMarketCheckTime])
+    console.log(`✅ Market check queue processing completed.`)
+  }, [checkTokenMarket]) // Removed rateLimitBackoff and lastMarketCheckTime dependencies
 
   const processNewToken = useCallback(async (logs: any, context: any) => {
     try {
@@ -407,10 +418,12 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         
         // Rate limit RPC calls to avoid Helius 429 errors
         const now = Date.now()
+        // Use a ref to track last RPC call time to avoid triggering useCallback
         if (now - lastRpcCallTime < 2000) { // Minimum 2 seconds between RPC calls
           console.log('⏱️ Rate limiting RPC call, skipping this transaction to avoid 429...')
           return
         }
+        // Update using state setter with callback to avoid dependency
         setLastRpcCallTime(now)
         
         // Get the parsed transaction with maxSupportedTransactionVersion
@@ -524,20 +537,30 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         logs: logs
       })
     }
-  }, [connection, lastRpcCallTime])
+  }, [connection]) // Removed lastRpcCallTime dependency
 
   // Light polling backup method (with rate limiting)
   const pollForNewMints = useCallback(async () => {
     try {
       const activeConnection = connection || HeliusConnection.getRpcConnection()
       
-      // Rate limit polling calls
+      // Rate limit polling calls using state setter callback to avoid dependency
       const now = Date.now()
-      if (now - lastRpcCallTime < 5000) { // Minimum 5 seconds between polling calls
+      
+      // Check if enough time has passed since last RPC call
+      let shouldSkip = false
+      setLastRpcCallTime(prev => {
+        if (now - prev < 5000) { // Minimum 5 seconds between polling calls
+          shouldSkip = true
+          return prev // Don't update if skipping
+        }
+        return now // Update if proceeding
+      })
+      
+      if (shouldSkip) {
         console.log('⏱️ Rate limiting polling call to avoid Helius 429...')
         return
       }
-      setLastRpcCallTime(now)
       
       // Check recent signatures (light method)
       try {
@@ -553,48 +576,119 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         
       } catch (error) {
         if (isMountedRef.current) {
-          setPollingResults(prev => prev + 1) // Just show activity
+          setPollingResults(prev => prev + 1)
         }
       }
       
     } catch (error) {
       // Silent polling errors
     }
-  }, [connection, lastRpcCallTime])
+  }, [connection]) // Removed lastRpcCallTime dependency
 
   const startMonitoring = useCallback(async () => {
-    if (!isMonitoring || subscriptionId) return
+    // Direct check instead of state callback since isMonitoring is in dependencies
+    if (!isMonitoring) {
+      console.log('🛑 Not starting monitoring - isMonitoring is false')
+      return
+    }
 
-    const activeConnection = connection || HeliusConnection.getRpcConnection()
+    // Check if we already have a subscription
+    let currentSubscriptionId: number | null = null
+    setSubscriptionId(prev => {
+      if (prev !== null) {
+        console.log('🛑 Not starting monitoring - already have subscription:', prev)
+        currentSubscriptionId = prev
+      }
+      return prev
+    })
+    
+    if (currentSubscriptionId !== null) return
+
+    // Use dedicated WebSocket connection for subscriptions
+    const activeConnection = connection || HeliusConnection.getWebSocketConnection()
 
     try {
       console.log('🔍 Starting mint detection with onLogs...')
       
-      // Test connection
-      const connectionTest = await HeliusConnection.testConnection()
-      if (!connectionTest) {
-        throw new Error('Connection test failed')
+      // Validate configuration without making RPC calls
+      const configValid = HeliusConnection.validateConfiguration()
+      if (!configValid) {
+        console.warn('⚠️ Helius configuration may not be properly set up')
+      } else {
+        console.log('✅ Helius configuration validated')
       }
 
-      // Setup transaction logs listener (more precise than account changes)
+      // Setup transaction logs listener with error wrapper
       console.log('📡 Setting up onLogs listener for InitializeMint...')
-      const id = activeConnection.onLogs(
-        TOKEN_PROGRAM_ID,
-        (logs: any, context: any) => {
-          try {
-            processNewToken(logs, context)
-          } catch (error) {
-            console.error('Error in processNewToken:', error)
+      
+      // Clear any existing subscription first
+      if (currentSubscriptionId) {
+        try {
+          await HeliusConnection.safeRemoveSubscription(currentSubscriptionId)
+          console.log('🧹 Cleared existing subscription before creating new one')
+        } catch (error) {
+          console.warn('⚠️ Could not clear existing subscription (may be already gone):', error)
+        }
+        setSubscriptionId(null)
+      }
+      
+      let retryCount = 0
+      const maxRetries = 3
+      
+      const createSubscription = async (): Promise<number> => {
+        try {
+          console.log(`🔧 Creating subscription attempt ${retryCount + 1}...`)
+          
+          const id = activeConnection.onLogs(
+            TOKEN_PROGRAM_ID,
+            (logs: any, context: any) => {
+              try {
+                // Add safety check to prevent errors during processing
+                if (isMountedRef.current) {
+                  console.log('📨 Received onLogs event:', logs.signature.slice(0, 8))
+                  processNewToken(logs, context)
+                }
+              } catch (error) {
+                console.error('Error in processNewToken:', error)
+                // Don't let errors bubble up to React
+              }
+            },
+            'confirmed'
+          )
+          
+          console.log(`✅ Subscription created successfully with ID: ${id}`)
+          return id
+        } catch (error: any) {
+          console.warn(`🔧 WebSocket subscription attempt ${retryCount + 1} failed:`, error.message)
+          
+          if (retryCount < maxRetries) {
+            retryCount++
+            console.log(`� Retrying WebSocket subscription in ${retryCount * 2}s... (${retryCount}/${maxRetries})`)
+            await new Promise(resolve => setTimeout(resolve, retryCount * 2000))
+            return createSubscription()
+          } else {
+            throw new Error(`Failed to create WebSocket subscription after ${maxRetries} attempts: ${error.message}`)
           }
-        },
-        'confirmed'
-      )
+        }
+      }
 
+      const id = await createSubscription()
+      
+      // Track the subscription
+      HeliusConnection.addSubscription(id)
       setSubscriptionId(id)
       setIsConnected(true)
       console.log('✅ onLogs monitoring started - ID:', id)
       console.log('🎯 Listening for InitializeMint transactions')
       console.log('📊 This method is more precise than account changes')
+      
+      // Test subscription immediately
+      setTimeout(() => {
+        console.log('🔍 Testing subscription health after 5 seconds...')
+        console.log(`📊 Current accountsProcessed: ${accountsProcessed}`)
+        console.log(`🔗 Subscription ID: ${id}`)
+        console.log(`📡 Connection active: ${activeConnection ? 'Yes' : 'No'}`)
+      }, 5000)
       
       // Heartbeat every 30 seconds
       const heartbeatInterval = setInterval(() => {
@@ -603,15 +697,15 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         
         const timestamp = Date.now()
         
-        setHeartbeatCount(prev => prev + 1)
+        setHeartbeatCount(prev => {
+          const newCount = prev + 1
+          console.log(`💓 Heartbeat #${newCount} - Subscription ID: ${id}`)
+          return newCount
+        })
         setLastHeartbeat(timestamp)
         
-        // Log heartbeat with current state (avoid nested state updates)
-        console.log(`💓 Heartbeat:`)
-        console.log(`  📊 Transactions processed: ${accountsProcessed}`)
-        console.log(`  🔄 Polling activity: ${pollingResults}`)
-        console.log(`  🎯 Market check queue size: ${marketCheckQueue.size}`)
-        console.log(`  📋 Queue: [${Array.from(marketCheckQueue).map(m => m.slice(0, 8)).join(', ')}]`)
+        // Simple heartbeat log without accessing other state
+        console.log(`💓 Heartbeat: ${new Date().toLocaleTimeString()}`)
       }, 30000)
 
       // Light polling every 5 minutes (reduced from 2 min to avoid Helius rate limits)
@@ -619,9 +713,44 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         pollForNewMints()
       }, 300000)
 
+      // Connection health check every 5 minutes (increased to reduce load)
+      const healthCheckInterval = setInterval(async () => {
+        if (!isMountedRef.current) return
+        
+        try {
+          // Use configuration check first, then optional RPC test
+          const configValid = HeliusConnection.validateConfiguration()
+          if (!configValid) {
+            console.warn('⚠️ Health check: Configuration issues detected')
+            if (isMountedRef.current) setIsConnected(false)
+            return
+          }
+          
+          // Optional RPC test - don't fail if it errors
+          try {
+            const testConnection = await HeliusConnection.lightConnectionTest()
+            if (isMountedRef.current) {
+              if (testConnection && !isConnected) {
+                console.log('✅ Health check: Connection restored')
+                setIsConnected(true)
+              } else if (!testConnection && isConnected) {
+                console.warn('⚠️ Health check: Connection may be degraded')
+                // Don't immediately mark as disconnected, give it some time
+              }
+            }
+          } catch (rpcError) {
+            // Silent RPC errors during health check
+            // Connection status will be updated by actual usage
+          }
+        } catch (error) {
+          // Silent overall health check errors
+        }
+      }, 300000) // Check every 5 minutes instead of 2
+
       setIntervals({ 
         heartbeat: heartbeatInterval, 
-        polling: pollingInterval
+        polling: pollingInterval,
+        healthCheck: healthCheckInterval
       })
       
       // Initial setup
@@ -630,31 +759,83 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       // Removed initial pollForNewMints() call to reduce RPC usage
       
       // Start market checking immediately if there are tokens in queue
-      if (marketCheckQueue.size > 0) {
-        console.log('🚀 Starting immediate market check for existing tokens...')
-        setTimeout(() => processMarketCheckQueue(), 2000) // Small delay to let things settle
-      }
+      setMarketCheckQueue(currentQueue => {
+        if (currentQueue.size > 0) {
+          console.log('🚀 Starting immediate market check for existing tokens...')
+          setTimeout(() => {
+            try {
+              if (isMountedRef.current) {
+                processMarketCheckQueue()
+              }
+            } catch (error) {
+              console.warn('Error in initial market check:', error)
+            }
+          }, 2000) // Small delay to let things settle
+        }
+        return currentQueue // Don't change queue, just inspect
+      })
       
     } catch (error) {
       console.error('❌ Failed to start monitoring:', error)
-      setIsConnected(false)
+      // Safely update state even if there was an error
+      if (isMountedRef.current) {
+        setIsConnected(false)
+      }
     }
-  }, [isMonitoring, subscriptionId, processNewToken, connection, pollForNewMints])
+  }, [isMonitoring, connection]) // Added isMonitoring back to dependencies
 
   const stopMonitoring = useCallback(async () => {
-    if (!subscriptionId) return
+    // Use state callback to get current subscription ID and check if we should stop
+    let currentSubscriptionId: number | null = null
+    let shouldStop = false
+    
+    setSubscriptionId(prev => {
+      if (!prev) {
+        console.log('🛑 No subscription to stop')
+        return prev
+      }
+      currentSubscriptionId = prev
+      shouldStop = true
+      return prev
+    })
+    
+    if (!shouldStop || !currentSubscriptionId) return
 
-    const activeConnection = connection || HeliusConnection.getRpcConnection()
+    console.log(`🛑 Stopping monitoring for subscription ID: ${currentSubscriptionId}`)
+
+    // Use the same connection type for cleanup
+    const activeConnection = connection || HeliusConnection.getWebSocketConnection()
 
     try {
-      // Clear intervals
-      if (intervals.heartbeat) clearInterval(intervals.heartbeat)
-      if (intervals.polling) clearInterval(intervals.polling)
-      if (intervals.marketCheck) clearInterval(intervals.marketCheck)
-      setIntervals({})
+      // Clear intervals first
+      setIntervals(currentIntervals => {
+        if (currentIntervals.heartbeat) {
+          clearInterval(currentIntervals.heartbeat)
+          console.log('⏹️ Cleared heartbeat interval')
+        }
+        if (currentIntervals.polling) {
+          clearInterval(currentIntervals.polling)
+          console.log('⏹️ Cleared polling interval')
+        }
+        if (currentIntervals.marketCheck) {
+          clearInterval(currentIntervals.marketCheck)
+          console.log('⏹️ Cleared market check interval')
+        }
+        if (currentIntervals.healthCheck) {
+          clearInterval(currentIntervals.healthCheck)
+          console.log('⏹️ Cleared health check interval')
+        }
+        return {} // Clear all intervals
+      })
       
-      // Remove logs subscription
-      activeConnection.removeOnLogsListener(subscriptionId)
+      // Remove logs subscription with error handling
+      try {
+        await HeliusConnection.safeRemoveSubscription(currentSubscriptionId)
+        console.log('✅ WebSocket subscription removed successfully')
+      } catch (error: any) {
+        // Error already handled in safeRemoveSubscription
+        console.log('ℹ️ Subscription cleanup completed (may have been auto-removed)')
+      }
       
       // Reset state
       setSubscriptionId(null)
@@ -664,35 +845,59 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       setAccountsProcessed(0)
       setPollingResults(0)
       
-      console.log('🛑 onLogs monitoring stopped')
+      console.log('🛑 onLogs monitoring stopped completely')
     } catch (error) {
       console.error('Error stopping monitoring:', error)
+      // Force reset state even if there was an error
+      setSubscriptionId(null)
+      setIsConnected(false)
     }
-  }, [subscriptionId, connection, intervals])
+  }, [connection]) // Minimized dependencies - removed subscriptionId and intervals
 
   useEffect(() => {
     isMountedRef.current = true // Ensure we're mounted
     
+    console.log('🔧 useEffect triggered - isMonitoring:', isMonitoring)
+    
     if (isMonitoring) {
+      console.log('🚀 Starting monitoring...')
       startMonitoring()
     } else {
+      console.log('🛑 Stopping monitoring...')
       stopMonitoring()
     }
 
     return () => {
       // Mark as unmounted to prevent state updates
       isMountedRef.current = false
-      
-      // Cleanup on unmount
-      if (intervals.heartbeat) clearInterval(intervals.heartbeat)
-      if (intervals.polling) clearInterval(intervals.polling)
-      if (intervals.marketCheck) clearInterval(intervals.marketCheck)
-      if (subscriptionId) {
-        const activeConnection = connection || HeliusConnection.getRpcConnection()
-        activeConnection.removeOnLogsListener(subscriptionId)
-      }
     }
   }, [isMonitoring, startMonitoring, stopMonitoring])
+
+  // Cleanup effect on unmount
+  useEffect(() => {
+    return () => {
+      // Cleanup on unmount using state callbacks to avoid dependencies
+      setIntervals(currentIntervals => {
+        if (currentIntervals.heartbeat) clearInterval(currentIntervals.heartbeat)
+        if (currentIntervals.polling) clearInterval(currentIntervals.polling)
+        if (currentIntervals.marketCheck) clearInterval(currentIntervals.marketCheck)
+        if (currentIntervals.healthCheck) clearInterval(currentIntervals.healthCheck)
+        return {}
+      })
+      
+      setSubscriptionId(currentId => {
+        if (currentId) {
+          try {
+            HeliusConnection.safeRemoveSubscription(currentId)
+            console.log('🧹 Cleaned up subscription on unmount')
+          } catch (error) {
+            console.warn('⚠️ Error removing subscription on unmount:', error)
+          }
+        }
+        return null
+      })
+    }
+  }, []) // Only run on unmount
 
   // Separate useEffect for market check interval to avoid dependency issues
   useEffect(() => {
@@ -702,19 +907,11 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     }
 
     console.log('🔧 Setting up market check interval (every 120 seconds to avoid rate limits)...')
-    console.log(`📊 Current queue size when setting up interval: ${marketCheckQueue.size}`)
     
     const marketCheckInterval = setInterval(() => {
-      const queueSize = marketCheckQueue.size
-      console.log(`⏰ Market check interval triggered! Queue size: ${queueSize}`)
-      
-      if (queueSize > 0) {
-        console.log('🚀 Processing queue...')
-        processMarketCheckQueue()
-      } else {
-        console.log('🔍 Queue is empty, nothing to process')
-      }
-    }, 120000) // Increased from 60s to 120s (2 minutes) to further reduce rate limiting
+      console.log(`⏰ Market check interval triggered!`)
+      processMarketCheckQueue()
+    }, 120000) // 2 minutes
 
     // Store the interval for cleanup
     setIntervals(prev => ({
@@ -726,7 +923,7 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       console.log('🔧 Cleaning up market check interval...')
       clearInterval(marketCheckInterval)
     }
-  }, [isMonitoring, processMarketCheckQueue, marketCheckQueue.size])
+  }, [isMonitoring, processMarketCheckQueue])
 
   // Backoff recovery effect - gradually reduce backoff over time
   useEffect(() => {
@@ -845,10 +1042,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
   // Debug function to force market check queue processing
   const debugForceMarketCheck = useCallback(() => {
     console.log('🔧 DEBUG: Force triggering market check queue...')
-    console.log(`📊 Current queue size: ${marketCheckQueue.size}`)
-    console.log(`📋 Queue contents: [${Array.from(marketCheckQueue).map(m => m.slice(0, 8)).join(', ')}]`)
     processMarketCheckQueue()
-  }, [marketCheckQueue, processMarketCheckQueue])
+  }, [processMarketCheckQueue])
 
   // Function to manually reset rate limit backoff
   const resetRateLimitBackoff = useCallback(() => {

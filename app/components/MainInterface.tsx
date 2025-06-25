@@ -129,11 +129,13 @@ const MainInterface = () => {
         )}
       </div>
 
-      {/* Mint Detection */}
-      {mounted && <MintDetection 
-        onTokenSelect={handleTokenSelect} 
-        onMarkTokenAsSnipedRef={setMarkTokenAsSniped}
-      />}
+      {/* Token Detection & Sniping */}
+      <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 mb-6">
+        {mounted && <MintDetection 
+          onTokenSelect={handleTokenSelect} 
+          onMarkTokenAsSnipedRef={setMarkTokenAsSniped}
+        />}
+      </div>
 
       {/* Sniper Interface */}
       <div className="bg-white/10 backdrop-blur-md rounded-xl p-6">

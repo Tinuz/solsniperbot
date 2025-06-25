@@ -55,21 +55,8 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
   }, [onMarkTokenAsSnipedRef, markTokenAsSniped])
 
   const toggleMonitoring = () => {
+    console.log('🔧 Toggle monitoring clicked! Current state:', isMonitoring, '-> New state:', !isMonitoring)
     setIsMonitoring(!isMonitoring)
-  }
-
-  // Demo function to simulate token detection for testing
-  const addDemoToken = () => {
-    const demoMints = [
-      'So11111111111111111111111111111111111111112', // Wrapped SOL
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-      '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
-      'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
-    ]
-    
-    const randomMint = demoMints[Math.floor(Math.random() * demoMints.length)]
-    onTokenSelect(randomMint)
   }
 
   const formatTime = (timestamp: number) => {
@@ -143,64 +130,59 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
   }
 
   return (
-    <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 mb-6">
+    <div>
+      {/* Header with title and connection status */}
       <div className="flex items-center justify-between mb-4">
-        <div>
-          <h2 className="text-xl font-semibold text-white mb-1">
-            🔍 Token Detection & Sniping
-          </h2>
-          
-          {/* Tab Navigation */}
-          <div className="flex items-center space-x-4 mb-2">
-            <div className="flex bg-white/5 rounded-lg p-1">
-              <button
-                onClick={() => setActiveTab('detected')}
-                className={`px-3 py-1 rounded text-sm font-medium transition-all ${
-                  activeTab === 'detected'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                New Tokens ({detectedTokens.length})
-              </button>
-              <button
-                onClick={() => setActiveTab('sniped')}
-                className={`px-3 py-1 rounded text-sm font-medium transition-all ${
-                  activeTab === 'sniped'
-                    ? 'bg-green-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                Sniped ({snipedTokens.length})
-              </button>
-            </div>
-          </div>
-          
-          <div className="flex items-center space-x-4 text-sm">
-            <div className={`flex items-center ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-              <div className={`w-2 h-2 rounded-full mr-2 ${isConnected ? 'bg-green-400' : 'bg-red-400'}`}></div>
-              {isConnected ? 'Connected' : 'Disconnected'}
-            </div>
-            {actuallyMonitoring && heartbeatCount > 0 && (
-              <div className="flex items-center text-blue-400">
-                <div className="w-2 h-2 bg-blue-400 rounded-full mr-2 animate-pulse"></div>
-                <span className="text-xs">
-                  Heartbeat #{heartbeatCount} {formatLastHeartbeat()}
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
+        <h2 className="text-xl font-semibold text-white">
+          🔍 Token Detection & Sniping
+        </h2>
         
-        <div className="flex space-x-2">
-          <button
-            onClick={addDemoToken}
-            className="px-4 py-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg text-sm font-medium transition-colors"
-            title="Add a demo token for testing"
-          >
-            Demo Token
-          </button>
+        {/* Connection Status */}
+        <div className={`flex items-center text-sm ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
+          <div className={`w-2 h-2 rounded-full mr-2 ${isConnected ? 'bg-green-400' : 'bg-red-400'}`}></div>
+          {isConnected ? 'Connected' : 'Disconnected'}
+        </div>
+      </div>
+
+      {/* Tab Navigation and Controls Row */}
+      <div className="flex items-center justify-between mb-4 gap-3">
+        <div className="flex items-center gap-3">
+          {/* Tab Navigation */}
+          <div className="flex bg-white/5 rounded-lg p-1">
+            <button
+              onClick={() => setActiveTab('detected')}
+              className={`px-3 py-1 rounded text-sm font-medium transition-all ${
+                activeTab === 'detected'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-400 hover:text-white'
+              }`}
+            >
+              New Tokens ({detectedTokens.length})
+            </button>
+            <button
+              onClick={() => setActiveTab('sniped')}
+              className={`px-3 py-1 rounded text-sm font-medium transition-all ${
+                activeTab === 'sniped'
+                  ? 'bg-green-600 text-white'
+                  : 'text-gray-400 hover:text-white'
+              }`}
+            >
+              Sniped ({snipedTokens.length})
+            </button>
+          </div>
           
+          {/* Heartbeat Status */}
+          {actuallyMonitoring && heartbeatCount > 0 && (
+            <div className="flex items-center text-blue-400 text-sm">
+              <div className="w-2 h-2 bg-blue-400 rounded-full mr-2 animate-pulse"></div>
+              <span className="text-xs">
+                Heartbeat #{heartbeatCount} {formatLastHeartbeat()}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3">
           {marketCheckQueue > 0 && (
             <button
               onClick={debugForceMarketCheck}
@@ -208,11 +190,11 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
               className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
                 rateLimitBackoff > 0 
                   ? 'bg-gray-600/20 text-gray-500 cursor-not-allowed' 
-                  : 'bg-yellow-600/20 hover:bg-yellow-600/30 text-yellow-400'
+                  : 'bg-orange-600/20 hover:bg-orange-600/30 text-orange-400'
               }`}
-              title={rateLimitBackoff > 0 ? 'Rate limited - please wait' : 'Force check market queue now'}
+              title={rateLimitBackoff > 0 ? 'Rate limited - please wait before checking again' : `Check if ${marketCheckQueue} token(s) are ready for trading now`}
             >
-              {rateLimitBackoff > 0 ? 'Rate Limited' : `Force Check (${marketCheckQueue})`}
+              {rateLimitBackoff > 0 ? '⏱️ Rate Limited' : `⚡ Check Now (${marketCheckQueue})`}
             </button>
           )}
           
@@ -291,6 +273,11 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
             )}
             <div className="mt-1 text-xs text-blue-300">
               💡 Real-time detection + Market availability checking
+              {marketCheckQueue > 0 && (
+                <div className="mt-1 text-orange-300">
+                  ⚡ {marketCheckQueue} token(s) waiting for market check - use "Check Now" for instant results
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -301,10 +288,23 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
         {activeTab === 'detected' ? (
           detectedTokens.length === 0 ? (
             <div className="text-center py-8 text-gray-400">
-              {actuallyMonitoring 
-                ? 'Listening for new tokens... 👂' 
-                : 'Start monitoring to detect new token mints'
-              }
+              {actuallyMonitoring ? (
+                <div>
+                  <div className="text-lg mb-2">👂 Listening for new tokens...</div>
+                  <div className="text-sm">
+                    New token mints will appear here automatically.
+                    <br />
+                    Market availability will be checked within 2 minutes.
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="text-lg mb-2">� Ready to detect new tokens</div>
+                  <div className="text-sm">
+                    Click "Start Monitoring" to begin detecting new token mints on Solana
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             detectedTokens.map((token) => {
