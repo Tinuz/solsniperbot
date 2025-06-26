@@ -11,7 +11,7 @@ import { clusterApiUrl } from '@solana/web3.js'
 import '@solana/wallet-adapter-react-ui/styles.css'
 
 interface WalletProviderProps {
-  children: any
+  children: React.ReactNode
 }
 
 const WalletProvider = ({ children }: WalletProviderProps) => {
@@ -20,12 +20,10 @@ const WalletProvider = ({ children }: WalletProviderProps) => {
     // Check if Helius endpoint is available from environment
     const heliusRpc = process.env.NEXT_PUBLIC_HELIUS_RPC_URL
     if (heliusRpc) {
-      console.log('🔗 Using Helius RPC endpoint')
       return heliusRpc
     }
     
     // Fallback to public mainnet
-    console.log('🔗 Using public mainnet endpoint')
     return clusterApiUrl(WalletAdapterNetwork.Mainnet)
   }, [])
 

@@ -2,7 +2,8 @@
 
 import React, { useState } from 'react'
 import { useConnection } from '@solana/wallet-adapter-react'
-import { useMintDetection, NewToken, SnipedToken } from '../hooks/useMintDetection'
+import { useMintDetection, NewToken } from '../hooks/useMintDetection'
+import { usePriceTracker } from '../hooks/usePriceTracker'
 
 interface MintDetectionProps {
   onTokenSelect: (mint: string) => void
@@ -13,6 +14,7 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
   const { connection } = useConnection()
   const [isMonitoring, setIsMonitoring] = useState(false)
   const [activeTab, setActiveTab] = useState<'detected' | 'sniped'>('detected')
+  const { addTokenToTracking, isTokenTracked } = usePriceTracker()
   
   const {
     detectedTokens,
@@ -31,8 +33,9 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
     clearSnipedTokens,
     removeSnipedToken,
     checkTokenMarket,
-    debugForceMarketCheck,
-    resetRateLimitBackoff
+    resetRateLimitBackoff,
+    repairMarketCheckQueue,
+    updateTokenMetadata
   } = useMintDetection(connection, isMonitoring)
 
   // Setup callback ref for markTokenAsSniped
@@ -42,11 +45,6 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
     }
   }, [markTokenAsSniped, onMarkTokenAsSnipedRef])
 
-  // Debug: log token state changes
-  React.useEffect(() => {
-    console.log('🔍 MintDetection: detectedTokens changed:', detectedTokens.length, detectedTokens)
-  }, [detectedTokens])
-
   // Pass markTokenAsSniped function to parent
   React.useEffect(() => {
     if (onMarkTokenAsSnipedRef) {
@@ -55,7 +53,6 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
   }, [onMarkTokenAsSnipedRef, markTokenAsSniped])
 
   const toggleMonitoring = () => {
-    console.log('🔧 Toggle monitoring clicked! Current state:', isMonitoring, '-> New state:', !isMonitoring)
     setIsMonitoring(!isMonitoring)
   }
 
@@ -73,6 +70,17 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
     const ago = Math.floor((Date.now() - lastHeartbeat) / 1000)
     if (ago < 60) return `${ago}s ago`
     return `${Math.floor(ago / 60)}m ago`
+  }
+
+  const shouldShowRepairButton = () => {
+    const tokensNeedingCheck = detectedTokens.filter(t => 
+      t.marketStatus !== 'available' && 
+      (t.marketCheckCount || 0) < 10
+    );
+    const queueIsEmpty = marketCheckQueue === 0;
+    
+    // Only show repair button when queue is empty but tokens need checking
+    return queueIsEmpty && tokensNeedingCheck.length > 0;
   }
 
   const getMarketStatusDisplay = (token: NewToken) => {
@@ -129,6 +137,28 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
     await checkTokenMarket(mint)
   }
 
+  const handleAddToTracking = async (e: React.MouseEvent, token: NewToken) => {
+    e.stopPropagation()
+    
+    // Add token to price tracking (default purchase price of 0.001 SOL and 1M tokens)
+    const defaultPurchasePrice = 0.001 // SOL
+    const defaultAmount = 1000000 // tokens
+    
+    const added = addTokenToTracking(
+      token.mint,
+      token.name || `Token-${token.mint.slice(0, 8)}`,
+      token.symbol || 'NEW',
+      defaultPurchasePrice,
+      defaultAmount
+    )
+    
+    if (added) {
+      alert(`📊 Token added to price tracking!\n\nYou can now monitor its price in the Price Tracker tab.`)
+    } else {
+      alert(`This token is already being tracked.`)
+    }
+  }
+
   return (
     <div>
       {/* Header with title and connection status */}
@@ -183,18 +213,14 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
         </div>
 
         <div className="flex items-center gap-3">
-          {marketCheckQueue > 0 && (
+          {/* Repair button - only when queue is empty but tokens need checking */}
+          {shouldShowRepairButton() && (
             <button
-              onClick={debugForceMarketCheck}
-              disabled={rateLimitBackoff > 0}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                rateLimitBackoff > 0 
-                  ? 'bg-gray-600/20 text-gray-500 cursor-not-allowed' 
-                  : 'bg-orange-600/20 hover:bg-orange-600/30 text-orange-400'
-              }`}
-              title={rateLimitBackoff > 0 ? 'Rate limited - please wait before checking again' : `Check if ${marketCheckQueue} token(s) are ready for trading now`}
+              onClick={repairMarketCheckQueue}
+              className="px-4 py-2 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg text-sm font-medium transition-colors"
+              title="Repair market check queue - add tokens that need checking back to queue"
             >
-              {rateLimitBackoff > 0 ? '⏱️ Rate Limited' : `⚡ Check Now (${marketCheckQueue})`}
+              🔧 Repair Queue
             </button>
           )}
           
@@ -273,9 +299,24 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
             )}
             <div className="mt-1 text-xs text-blue-300">
               💡 Real-time detection + Market availability checking
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Aggressive Settings Info */}
+      {actuallyMonitoring && activeTab === 'detected' && (
+        <div className="mb-4 p-3 bg-orange-500/10 border border-orange-500/20 rounded-lg">
+          <div className="flex items-center text-orange-400">
+            <div className="text-lg mr-2">⚡</div>
+            <div className="text-sm">
+              <div className="font-medium">Aggressive Mode Active</div>
+              <div className="text-xs text-orange-300 mt-1">
+                Market checks: 30s interval • 5s min delay • 3 tokens parallel • 0.5s stagger
+              </div>
               {marketCheckQueue > 0 && (
-                <div className="mt-1 text-orange-300">
-                  ⚡ {marketCheckQueue} token(s) waiting for market check - use "Check Now" for instant results
+                <div className="text-xs text-orange-300 mt-1">
+                  Queue: {marketCheckQueue} tokens waiting
                 </div>
               )}
             </div>
@@ -301,7 +342,7 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
                 <div>
                   <div className="text-lg mb-2">� Ready to detect new tokens</div>
                   <div className="text-sm">
-                    Click "Start Monitoring" to begin detecting new token mints on Solana
+                    Click &ldquo;Start Monitoring&rdquo; to begin detecting new token mints on Solana
                   </div>
                 </div>
               )}
@@ -321,11 +362,20 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
                       <div className="flex-1">
                         <div className="flex items-center justify-between">
                           <div>
-                            <div className="font-mono text-white text-sm">
-                              {formatMint(token.mint)}
+                            {/* Token name and symbol - prominently displayed */}
+                            <div className="flex items-center space-x-2">
+                              <div className="text-white text-sm font-medium">
+                                {token.name || `Token-${token.mint.slice(0, 8)}`}
+                              </div>
+                              {token.symbol && token.symbol !== 'NEW' && (
+                                <div className="px-2 py-0.5 bg-purple-600/20 text-purple-300 rounded text-xs font-mono">
+                                  {token.symbol}
+                                </div>
+                              )}
                             </div>
-                            <div className="text-xs text-gray-400">
-                              {token.name} • {formatTime(token.timestamp)}
+                            {/* Mint address and timestamp - secondary info */}
+                            <div className="text-xs text-gray-400 font-mono">
+                              {formatMint(token.mint)} • {formatTime(token.timestamp)}
                             </div>
                           </div>
                           
@@ -353,6 +403,20 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
                   </div>
                   
                   <div className="flex items-center space-x-2 ml-4">
+                    {/* Refresh metadata button for tokens with default names */}
+                    {(token.name?.startsWith('Token-') || token.symbol === 'NEW') && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          updateTokenMetadata(token.mint)
+                        }}
+                        className="px-2 py-1 bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 rounded text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Refresh token name and symbol"
+                      >
+                        🔄 Name
+                      </button>
+                    )}
+                    
                     {/* Manual market check button */}
                     {token.marketStatus !== 'available' && (
                       <button
@@ -362,6 +426,24 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
                       >
                         Check Now
                       </button>
+                    )}
+                    
+                    {/* Track Price button - only for available tokens */}
+                    {token.marketStatus === 'available' && !isTokenTracked(token.mint) && (
+                      <button
+                        onClick={(e) => handleAddToTracking(e, token)}
+                        className="px-2 py-1 bg-green-600/20 hover:bg-green-600/40 text-green-400 rounded text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Add to price tracking"
+                      >
+                        📊 Track Price
+                      </button>
+                    )}
+                    
+                    {/* Already tracking indicator */}
+                    {token.marketStatus === 'available' && isTokenTracked(token.mint) && (
+                      <span className="px-2 py-1 bg-green-600/10 text-green-400 rounded text-xs font-medium opacity-70">
+                        📊 Tracked
+                      </span>
                     )}
                     
                     <button
@@ -406,11 +488,20 @@ const MintDetection: React.FC<MintDetectionProps> = ({ onTokenSelect, onMarkToke
                     <div className="flex-1">
                       <div className="flex items-center justify-between">
                         <div>
-                          <div className="font-mono text-white text-sm">
-                            {formatMint(token.mint)}
+                          {/* Token name and symbol - prominently displayed */}
+                          <div className="flex items-center space-x-2">
+                            <div className="text-white text-sm font-medium">
+                              {token.name || `Token-${token.mint.slice(0, 8)}`}
+                            </div>
+                            {token.symbol && token.symbol !== 'NEW' && (
+                              <div className="px-2 py-0.5 bg-green-600/20 text-green-300 rounded text-xs font-mono">
+                                {token.symbol}
+                              </div>
+                            )}
                           </div>
+                          {/* Snipe info and mint address - secondary info */}
                           <div className="text-xs text-gray-400">
-                            Sniped: {formatTime(token.snipedAt)}
+                            <span className="font-mono">{formatMint(token.mint)}</span> • Sniped: {formatTime(token.snipedAt)}
                             {token.snipeAmount && (
                               <span className="text-green-400 ml-2">
                                 • {token.snipeAmount} SOL

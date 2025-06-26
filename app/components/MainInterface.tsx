@@ -1,17 +1,16 @@
 'use client'
 
 import React, { useState, useEffect } from 'react'
-import { useWallet, useConnection } from '@solana/wallet-adapter-react'
+import { useWallet } from '@solana/wallet-adapter-react'
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui'
-import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js'
 import MintDetection from './MintDetection'
 import TokenInfo from './TokenInfo'
 import SwapQuote from './SwapQuote'
 import ConnectionStatus from './ConnectionStatus'
+import PriceTracker from './PriceTracker'
 
 const MainInterface = () => {
   const { publicKey, connected } = useWallet()
-  const { connection } = useConnection()
   const [tokenAddress, setTokenAddress] = useState('')
   const [amount, setAmount] = useState('')
   const [slippage, setSlippage] = useState('5')
@@ -19,6 +18,7 @@ const MainInterface = () => {
   const [lastSwapSignature, setLastSwapSignature] = useState<string | null>(null)
   const [isQuickSniping, setIsQuickSniping] = useState(false)
   const [markTokenAsSniped, setMarkTokenAsSniped] = useState<((mint: string, snipeData?: { amount?: number; price?: number; signature?: string }) => void) | null>(null)
+  const [activeSection, setActiveSection] = useState<'detection' | 'tracker'>('detection')
 
   // Prevent hydration mismatch by only rendering wallet-dependent content after mount
   useEffect(() => {
@@ -40,9 +40,6 @@ const MainInterface = () => {
     
     try {
       // Quick snipe: immediately trigger the swap process
-      console.log('🎯 Quick Sniping token:', tokenAddress)
-      console.log('💰 Amount:', amount, 'SOL')
-      console.log('📊 Slippage:', slippage + '%')
       
       // Try to trigger quote refresh or initial quote get
       const refreshButton = document.querySelector('[data-testid="swap-quote-refresh"]') as HTMLButtonElement
@@ -83,7 +80,6 @@ const MainInterface = () => {
           amount: snipeAmount,
           signature: signature
         })
-        console.log('✅ Token marked as sniped:', tokenAddress.slice(0, 8))
       } catch (error) {
         console.warn('Failed to mark token as sniped:', error)
       }
@@ -129,12 +125,45 @@ const MainInterface = () => {
         )}
       </div>
 
-      {/* Token Detection & Sniping */}
+      {/* Section Navigation */}
       <div className="bg-white/10 backdrop-blur-md rounded-xl p-6 mb-6">
-        {mounted && <MintDetection 
-          onTokenSelect={handleTokenSelect} 
-          onMarkTokenAsSnipedRef={setMarkTokenAsSniped}
-        />}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex space-x-1">
+            <button
+              onClick={() => setActiveSection('detection')}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeSection === 'detection'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-white/10'
+              }`}
+            >
+              🔍 Token Detection
+            </button>
+            <button
+              onClick={() => setActiveSection('tracker')}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeSection === 'tracker'
+                  ? 'bg-green-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-white/10'
+              }`}
+            >
+              📊 Price Tracker
+            </button>
+          </div>
+        </div>
+
+        {/* Token Detection Section */}
+        {activeSection === 'detection' && mounted && (
+          <MintDetection 
+            onTokenSelect={handleTokenSelect} 
+            onMarkTokenAsSnipedRef={setMarkTokenAsSniped}
+          />
+        )}
+
+        {/* Price Tracker Section */}
+        {activeSection === 'tracker' && mounted && (
+          <PriceTracker />
+        )}
       </div>
 
       {/* Sniper Interface */}

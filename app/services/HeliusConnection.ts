@@ -19,7 +19,6 @@ export class HeliusConnection {
       }
 
       this.instance = new Connection(this.RPC_URL, config)
-      console.log('🚀 Helius RPC connection established:', this.RPC_URL)
     }
     return this.instance
   }
@@ -38,23 +37,19 @@ export class HeliusConnection {
       }
 
       this.wsConnection = new Connection(this.RPC_URL, config)
-      console.log('📡 Helius WebSocket connection established:', this.WS_URL)
     }
     return this.wsConnection
   }
 
   static addSubscription(id: number) {
     this.activeSubscriptions.add(id)
-    console.log(`📝 Tracking subscription ${id} (total: ${this.activeSubscriptions.size})`)
   }
 
   static removeSubscription(id: number) {
     if (this.activeSubscriptions.has(id)) {
       this.activeSubscriptions.delete(id)
-      console.log(`🗑️ Removed subscription ${id} from tracking (remaining: ${this.activeSubscriptions.size})`)
       return true
     } else {
-      console.log(`⚠️ Subscription ${id} was not being tracked`)
       return false
     }
   }
@@ -65,26 +60,24 @@ export class HeliusConnection {
       
       // Check if we're tracking this subscription
       if (!this.activeSubscriptions.has(id)) {
-        console.log(`⚠️ Subscription ${id} not found in tracking, skipping removal`)
         return false
       }
       
       // Ensure removeOnLogsListener is properly awaited as Promise
       await Promise.resolve(connection.removeOnLogsListener(id))
       this.removeSubscription(id)
-      console.log(`✅ Successfully removed subscription ${id}`)
       return true
-    } catch (error: any) {
+    } catch (error: unknown) {
       // Always remove from tracking, even on error, to prevent leaks
-      const wasTracked = this.removeSubscription(id)
+      this.removeSubscription(id)
       
       // Handle specific error messages
-      if (error?.message?.includes('could not be found') || 
-          error?.message?.includes('Ignored unsubscribe')) {
-        console.log(`ℹ️ Subscription ${id} was already removed (this is normal)`)
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      if (errorMessage?.includes('could not be found') || 
+          errorMessage?.includes('Ignored unsubscribe')) {
         return true
       } else {
-        console.warn(`❌ Error removing subscription ${id}:`, error?.message || error)
+        console.warn(`Error removing subscription ${id}:`, errorMessage)
         return false
       }
     }
@@ -103,19 +96,19 @@ export class HeliusConnection {
         setTimeout(() => reject(new Error('Connection test timeout')), this.DEFAULT_TIMEOUT_MS)
       )
       
-      const version = await Promise.race([
+      await Promise.race([
         connection.getVersion(),
         timeout
       ])
       
-      console.log('✅ Helius connection test successful:', version)
       return true
-    } catch (error: any) {
+    } catch (error: unknown) {
       // Don't log full errors for rate limiting to reduce noise
-      if (error?.message?.includes('429') || error?.message?.includes('rate limit')) {
-        console.warn('⚠️ Connection test rate limited (will retry later)')
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      if (errorMessage?.includes('429') || errorMessage?.includes('rate limit')) {
+        console.warn('Connection test rate limited (will retry later)')
       } else {
-        console.warn('⚠️ Helius connection test failed:', error?.message || error)
+        console.warn('Helius connection test failed:', errorMessage)
       }
       return false
     }
@@ -142,7 +135,7 @@ export class HeliusConnection {
       ])
       
       return true
-    } catch (error: any) {
+    } catch {
       // Silently handle rate limiting and connection errors
       // Don't log anything to avoid console noise
       return false
@@ -166,18 +159,24 @@ export class HeliusConnection {
       ])
 
       // Extract successful results
-      const result: any = {}
+      const result: {
+        currentSlot?: number;
+        blockHeight?: number;
+        epoch?: number;
+        slotIndex?: number;
+        slotsInEpoch?: number;
+      } = {}
       
       if (slot.status === 'fulfilled') {
-        result.currentSlot = slot.value
+        result.currentSlot = slot.value as number
       }
       
       if (blockHeight.status === 'fulfilled') {
-        result.blockHeight = blockHeight.value
+        result.blockHeight = blockHeight.value as number
       }
       
       if (epochInfo.status === 'fulfilled') {
-        const epoch = epochInfo.value as any // Type assertion for epoch info
+        const epoch = epochInfo.value as { epoch: number; slotIndex: number; slotsInEpoch: number }
         result.epoch = epoch.epoch
         result.slotIndex = epoch.slotIndex
         result.slotsInEpoch = epoch.slotsInEpoch
@@ -191,17 +190,14 @@ export class HeliusConnection {
       }
       
     } catch (error) {
-      console.warn('⚠️ Failed to get connection stats (likely rate limited):', error)
+      console.warn('Failed to get connection stats:', error)
       return null
     }
   }
 
   static resetConnections() {
-    console.log('🔧 Resetting all Helius connections...')
-    
     // Clean up any tracked subscriptions
     if (this.activeSubscriptions.size > 0) {
-      console.log(`🧹 Clearing ${this.activeSubscriptions.size} tracked subscriptions`)
       this.activeSubscriptions.clear()
     }
     
@@ -210,11 +206,8 @@ export class HeliusConnection {
   }
 
   static resetWebSocketConnection() {
-    console.log('🔧 Resetting WebSocket connection...')
-    
     // Clean up subscriptions when resetting WebSocket
     if (this.activeSubscriptions.size > 0) {
-      console.log(`🧹 Clearing ${this.activeSubscriptions.size} tracked subscriptions`)
       this.activeSubscriptions.clear()
     }
     
@@ -227,16 +220,9 @@ export class HeliusConnection {
       const hasRpcUrl = this.RPC_URL && this.RPC_URL.length > 0 && this.RPC_URL !== 'https://api.mainnet-beta.solana.com'
       const hasWsUrl = this.WS_URL && this.WS_URL.length > 0 && this.WS_URL !== 'wss://api.mainnet-beta.solana.com'
       
-      console.log('🔧 Configuration check:', {
-        hasCustomRpc: hasRpcUrl,
-        hasCustomWs: hasWsUrl,
-        rpcHost: this.RPC_URL?.split('//')[1]?.split('/')[0] || 'default',
-        wsHost: this.WS_URL?.split('//')[1]?.split('/')[0] || 'default'
-      })
-      
       return Boolean(hasRpcUrl && hasWsUrl)
     } catch (error) {
-      console.warn('⚠️ Configuration validation failed:', error)
+      console.warn('Configuration validation failed:', error)
       return false
     }
   }

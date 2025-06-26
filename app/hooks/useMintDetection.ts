@@ -84,10 +84,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
   const [lastHeartbeat, setLastHeartbeat] = useState<number>(0)
   const [accountsProcessed, setAccountsProcessed] = useState(0)
   const [pollingResults, setPollingResults] = useState(0)
-  const [intervals, setIntervals] = useState<{ heartbeat?: NodeJS.Timeout; polling?: NodeJS.Timeout; marketCheck?: NodeJS.Timeout; healthCheck?: NodeJS.Timeout }>({})
   const [marketCheckQueue, setMarketCheckQueue] = useState<Set<string>>(new Set())
   const [rateLimitBackoff, setRateLimitBackoff] = useState<number>(0) // Backoff counter for rate limiting
-  const [lastMarketCheckTime, setLastMarketCheckTime] = useState<number>(0) // Track last market check time
   const [lastRpcCallTime, setLastRpcCallTime] = useState<number>(0) // Track last RPC call to avoid Helius rate limits
 
   // Sync to localStorage when state changes
@@ -140,20 +138,66 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     } else {
       console.log('📭 No tokens need market checking')
     }
-  }, []) // Only run once on mount
+  }, [detectedTokens]) // Include detectedTokens dependency
 
   // Jupiter API client for market checking (memoized to prevent re-creation)
   const jupiterApi = useMemo(() => createJupiterApiClient(), [])
   const SOL_MINT = 'So11111111111111111111111111111111111111112'
 
+  // Function to fetch token metadata from Helius
+  const fetchTokenMetadata = useCallback(async (mintAddress: string) => {
+    try {
+      const heliusRpcUrl = process.env.NEXT_PUBLIC_HELIUS_RPC_URL
+      if (!heliusRpcUrl) {
+        console.warn('Helius API key not found, using default metadata')
+        return {
+          name: `Token-${mintAddress.slice(0, 8)}`,
+          symbol: 'NEW'
+        }
+      }
+
+      const response = await fetch(heliusRpcUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'token-metadata',
+          method: 'getAsset',
+          params: {
+            id: mintAddress
+          }
+        })
+      })
+
+      const data = await response.json()
+      if (data.result && data.result.content) {
+        return {
+          name: data.result.content.metadata?.name || `Token-${mintAddress.slice(0, 8)}`,
+          symbol: data.result.content.metadata?.symbol || 'NEW'
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to fetch token metadata:', error)
+    }
+    
+    return {
+      name: `Token-${mintAddress.slice(0, 8)}`,
+      symbol: 'NEW'
+    }
+  }, [])
+
   // Wrapper function for Jupiter API calls with built-in retry and rate limiting
-  const callJupiterWithRetry = useCallback(async (apiCall: () => Promise<any>, maxRetries = 2): Promise<any> => {
+  const callJupiterWithRetry = useCallback(async (apiCall: () => Promise<unknown>, maxRetries = 2): Promise<unknown> => {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const result = await apiCall()
         return result
-      } catch (error: any) {
-        const errorMessage = error?.message || error?.toString() || 'Unknown error'
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : 
+                            typeof error === 'string' ? error : 
+                            'Unknown error'
         
         if (errorMessage.includes('429') || errorMessage.includes('rate limit') || errorMessage.includes('Rate limit')) {
           if (attempt < maxRetries) {
@@ -178,7 +222,7 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       // Validate mint address format first
       try {
         new PublicKey(mintAddress)
-      } catch (error) {
+      } catch {
         console.log(`❌ Invalid mint address format: ${mintAddress.slice(0, 8)}...`)
         return 'error'
       }
@@ -206,11 +250,12 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
           })
         })
         
-        if (testQuote && testQuote.outAmount && parseInt(testQuote.outAmount) > 0) {
-          console.log(`✅ Market found for token: ${mintAddress.slice(0, 8)}... (Output: ${testQuote.outAmount})`)
+        const quote = testQuote as { outAmount?: string }
+        if (quote && quote.outAmount && parseInt(quote.outAmount) > 0) {
+          console.log(`✅ Market found for token: ${mintAddress.slice(0, 8)}... (Output: ${quote.outAmount})`)
           return 'available'
         }
-      } catch (quoteError: any) {
+      } catch {
         // If first attempt fails, try with different parameters
         console.log(`🔄 First quote attempt failed, trying alternative...`)
         
@@ -224,19 +269,22 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
             })
           })
           
-          if (altQuote && altQuote.outAmount && parseInt(altQuote.outAmount) > 0) {
+          const altQuoteResult = altQuote as { outAmount?: string }
+          if (altQuoteResult && altQuoteResult.outAmount && parseInt(altQuoteResult.outAmount) > 0) {
             console.log(`✅ Market found for token (reverse): ${mintAddress.slice(0, 8)}...`)
             return 'available'
           }
-        } catch (altError) {
+        } catch {
           console.log(`⏳ No market routes found for token: ${mintAddress.slice(0, 8)}...`)
         }
       }
       
       return 'not-available'
       
-    } catch (error: any) {
-      const errorMessage = error?.message || error?.toString() || 'Unknown error'
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 
+                          typeof error === 'string' ? error : 
+                          'Unknown error'
       
       // Handle specific Jupiter API errors
       if (errorMessage.includes('400') || errorMessage.includes('Bad Request')) {
@@ -253,7 +301,7 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         return 'error'
       }
     }
-  }, [callJupiterWithRetry]) // Removed jupiterApi dependency (now memoized)
+  }, [callJupiterWithRetry, jupiterApi]) // Include jupiterApi dependency
 
   // Process market check queue
   const processMarketCheckQueue = useCallback(async () => {
@@ -262,11 +310,17 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     
     setMarketCheckQueue(prev => {
       currentQueue = new Set(prev)
+      console.log(`🔍 processMarketCheckQueue - Current queue size: ${prev.size}`)
+      console.log(`🔍 Queue contents:`, Array.from(prev))
       return prev // Don't change the queue here
     })
     
     if (currentQueue.size === 0) {
       console.log('🔍 Market check queue is empty, skipping...')
+      console.log(`🔍 Debug info - detectedTokens count: ${detectedTokens.length}`)
+      console.log(`🔍 Tokens needing check:`, detectedTokens.filter(token => 
+        token.marketStatus !== 'available' && (token.marketCheckCount || 0) < 10
+      ).map(t => ({ mint: t.mint.slice(0, 8), status: t.marketStatus, count: t.marketCheckCount })))
       return
     }
 
@@ -283,112 +337,134 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     
     if (shouldSkipBackoff) return
 
-    // Check minimum interval using state callback
-    let shouldSkipTiming = false
+    // Check minimum interval - aggressively reduced to 5s for maximum speed
     const now = Date.now()
-    setLastMarketCheckTime(prev => {
-      if (now - prev < 30000) {
-        console.log(`⏱️ Rate limiting: only ${Math.round((now - prev)/1000)}s since last check, waiting...`)
-        shouldSkipTiming = true
-        return prev // Don't update if skipping
-      }
-      return now // Update time if proceeding
-    })
+    const timeSinceLastCheck = now - lastRpcCallTime
     
-    if (shouldSkipTiming) return
+    if (timeSinceLastCheck < 5000) { // Reduced from 10s to 5s for maximum speed
+      console.log(`⏱️ Rate limiting: only ${Math.round(timeSinceLastCheck/1000)}s since last check, waiting...`)
+      return // Skip processing
+    }
+    
+    // Update last RPC call time
+    setLastRpcCallTime(now)
 
     console.log(`🔄 Processing market check queue: ${currentQueue.size} tokens`)
     
-    // Process only 1 token at a time to avoid rate limiting and 400 errors
-    const tokensToCheck = Array.from(currentQueue).slice(0, 1)
+    // Process 3 tokens at a time for faster checking (increased from 1)
+    const tokensToCheck = Array.from(currentQueue).slice(0, 3)
     if (tokensToCheck.length === 0) return
     
-    const mintAddress = tokensToCheck[0]
-    console.log(`🎯 Checking token: ${mintAddress.slice(0, 8)}...`)
+    console.log(`🎯 Checking ${tokensToCheck.length} tokens: ${tokensToCheck.map(t => t.slice(0, 8)).join(', ')}...`)
     
-    try {
-      // Add extra validation before checking
-      if (!mintAddress || mintAddress.length < 32) {
-        console.log(`⚠️ Invalid mint address format, removing from queue: ${mintAddress}`)
-        setMarketCheckQueue(prev => {
-          const newQueue = new Set(prev)
-          newQueue.delete(mintAddress)
-          return newQueue
-        })
-        return
-      }
-      
-      console.log(`🔍 Starting market check for: ${mintAddress.slice(0, 8)}...`)
-      
-      const marketStatus = await checkTokenMarket(mintAddress)
-      console.log(`📊 Market check result for ${mintAddress.slice(0, 8)}: ${marketStatus}`)
-      
-      // Reset or increase backoff based on result
-      if (marketStatus !== 'error') {
-        setRateLimitBackoff(0)
-      } else {
-        setRateLimitBackoff(prev => {
-          const newBackoff = prev + 1
-          console.log(`⏱️ Increased rate limit backoff to level ${newBackoff}`)
-          return newBackoff
-        })
-      }
-      
-      // Update token status and check if should remove from queue in one operation
-      let shouldRemove = false
-      
-      setDetectedTokens(prev => {
-        const updated = prev.map(token => {
-          if (token.mint === mintAddress) {
-            const updatedToken = {
-              ...token,
-              marketStatus,
-              lastMarketCheck: Date.now(),
-              marketCheckCount: (token.marketCheckCount || 0) + 1
-            }
-            
-            console.log(`📝 Updated token ${mintAddress.slice(0, 8)}:`, {
-              marketStatus: updatedToken.marketStatus,
-              checkCount: updatedToken.marketCheckCount
-            })
-            
-            // Check if we should remove from queue based on updated count
-            shouldRemove = marketStatus === 'available' || updatedToken.marketCheckCount >= 10
-            
-            return updatedToken
+    // Process tokens in parallel for speed with staggered delays
+    const results = await Promise.allSettled(
+      tokensToCheck.map(async (mintAddress, index) => {
+        try {
+          // Add staggered delay to avoid hitting rate limits with parallel requests
+          if (index > 0) {
+            await new Promise(resolve => setTimeout(resolve, 500 * index)) // 500ms delay per token
           }
-          return token
+          
+          // Add extra validation before checking
+          if (!mintAddress || mintAddress.length < 32) {
+            console.log(`⚠️ Invalid mint address format, removing from queue: ${mintAddress}`)
+            setMarketCheckQueue(prev => {
+              const newQueue = new Set(prev)
+              newQueue.delete(mintAddress)
+              return newQueue
+            })
+            return { mintAddress, status: 'invalid' }
+          }
+          
+          console.log(`🔍 Starting market check for: ${mintAddress.slice(0, 8)}...`)
+          
+          const marketStatus = await checkTokenMarket(mintAddress)
+          console.log(`📊 Market check result for ${mintAddress.slice(0, 8)}: ${marketStatus}`)
+          
+          return { mintAddress, status: marketStatus }
+        } catch (error) {
+          console.error(`❌ Error in market check for ${mintAddress}:`, error)
+          return { mintAddress, status: 'error', error }
+        }
+      })
+    )
+    
+    // Process results and update state
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        const { mintAddress, status } = result.value
+        
+        if (status === 'invalid') return // Already handled above
+        
+        // Reset or increase backoff based on result
+        if (status !== 'error') {
+          setRateLimitBackoff(0)
+        } else {
+          setRateLimitBackoff(prev => {
+            const newBackoff = prev + 1
+            console.log(`⏱️ Increased rate limit backoff to level ${newBackoff}`)
+            return newBackoff
+          })
+        }
+        
+        // Update token status and check if should remove from queue
+        let shouldRemove = false
+        
+        setDetectedTokens(prev => {
+          const updated = prev.map(token => {
+            if (token.mint === mintAddress) {
+              const marketStatus = status as 'checking' | 'available' | 'not-available' | 'error'
+              const updatedToken = {
+                ...token,
+                marketStatus,
+                lastMarketCheck: Date.now(),
+                marketCheckCount: (token.marketCheckCount || 0) + 1
+              }
+              
+              console.log(`📝 Updated token ${mintAddress.slice(0, 8)}:`, {
+                marketStatus: updatedToken.marketStatus,
+                checkCount: updatedToken.marketCheckCount
+              })
+              
+              // Check if we should remove from queue based on updated count
+              shouldRemove = marketStatus === 'available' || updatedToken.marketCheckCount >= 10
+              
+              return updatedToken
+            }
+            return token
+          })
+          
+          return updated
         })
         
-        return updated
-      })
-      
-      if (shouldRemove) {
+        if (shouldRemove) {
+          setMarketCheckQueue(prev => {
+            const newQueue = new Set(prev)
+            newQueue.delete(mintAddress)
+            console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue (${status === 'available' ? 'available' : 'max attempts'})`)
+            return newQueue
+          })
+        } else {
+          console.log(`🔄 Keeping ${mintAddress.slice(0, 8)} in queue for next check`)
+        }
+      } else {
+        // Handle rejected promises
+        const mintAddress = tokensToCheck[index]
+        console.error(`❌ Promise rejected for token ${mintAddress}:`, result.reason)
+        
+        // Remove problematic tokens from queue
         setMarketCheckQueue(prev => {
           const newQueue = new Set(prev)
           newQueue.delete(mintAddress)
-          console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue (${marketStatus === 'available' ? 'available' : 'max attempts'})`)
-          console.log(`📊 Queue size after removal: ${newQueue.size}`)
+          console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue due to promise rejection`)
           return newQueue
         })
-      } else {
-        console.log(`🔄 Keeping ${mintAddress.slice(0, 8)} in queue for next check`)
       }
+    })
       
-      // Longer delay between checks to avoid rate limiting (increased to 10s)
-      await new Promise(resolve => setTimeout(resolve, 10000))
-      
-    } catch (error) {
-      console.error(`❌ Error in market check for ${mintAddress}:`, error)
-      
-      // Remove problematic tokens from queue
-      setMarketCheckQueue(prev => {
-        const newQueue = new Set(prev)
-        newQueue.delete(mintAddress)
-        console.log(`📤 Removed ${mintAddress.slice(0, 8)} from queue due to error`)
-        return newQueue
-      })
-    }
+    // Shorter delay between checks for faster processing (reduced from 10s to 5s)
+    await new Promise(resolve => setTimeout(resolve, 5000))
     
     console.log(`✅ Market check queue processing completed.`)
   }, [checkTokenMarket]) // Removed rateLimitBackoff and lastMarketCheckTime dependencies
@@ -404,12 +480,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       const hasInit = logs.logs.find((l: string) => l.includes("InitializeMint"))
       if (!hasInit) return
 
-      console.log('🔔 InitializeMint detected in slot', logs.slot)
-      console.log('  Signature:', logs.signature)
-
       // Skip some transactions randomly to reduce RPC load (process ~70% of transactions)
       if (Math.random() < 0.3) {
-        console.log('⏱️ Randomly skipping transaction to reduce RPC load')
         return
       }
 
@@ -420,14 +492,12 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         const now = Date.now()
         // Use a ref to track last RPC call time to avoid triggering useCallback
         if (now - lastRpcCallTime < 2000) { // Minimum 2 seconds between RPC calls
-          console.log('⏱️ Rate limiting RPC call, skipping this transaction to avoid 429...')
           return
         }
         // Update using state setter with callback to avoid dependency
         setLastRpcCallTime(now)
         
         // Get the parsed transaction with maxSupportedTransactionVersion
-        console.log('📝 Fetching parsed transaction...')
         const parsedTx = await activeConnection.getParsedTransaction(
           logs.signature,
           {
@@ -440,18 +510,7 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
           console.warn('⚠️ Parsed transaction not found for signature:', logs.signature)
           return
         }
-
-        console.log('📄 Parsed transaction retrieved successfully')
-        console.log('📋 Instructions found:', parsedTx.transaction.message.instructions.length)
         
-        // Log all instructions to debug
-        parsedTx.transaction.message.instructions.forEach((ix: any, index: number) => {
-          console.log(`  Instruction ${index}:`, {
-            program: ix.program,
-            parsed: ix.parsed?.type,
-            programId: ix.programId?.toString()
-          })
-        })
 
         // Find the initializeMint instruction
         const initInstr = parsedTx.transaction.message.instructions.find(
@@ -461,35 +520,46 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         ) as any
         
         if (!initInstr || !initInstr.parsed) {
-          console.warn('⚠️ initializeMint instruction not found in parsedTx')
-          console.log('📝 Available spl-token instructions:')
           parsedTx.transaction.message.instructions
             .filter((ix: any) => ix.program === "spl-token")
-            .forEach((ix: any, index: number) => {
-              console.log(`  SPL Token instruction ${index}:`, ix.parsed?.type, ix.parsed?.info)
-            })
           return
         }
 
         // Extract mint address from parsed info
         const mintAddress = initInstr.parsed.info.mint as string
-        console.log('✅ NEW MINT ADDRESS:', mintAddress)
-        console.log('📋 Full instruction info:', initInstr.parsed.info)
+
+        // Try to fetch metadata first, but don't block token creation
+        let tokenMetadata = {
+          name: `Token-${mintAddress.slice(0, 8)}`,
+          symbol: 'NEW'
+        }
+
+        try {
+          // Fetch metadata with a short timeout to avoid blocking
+          const metadataPromise = fetchTokenMetadata(mintAddress)
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Metadata fetch timeout')), 3000)
+          )
+          
+          tokenMetadata = await Promise.race([metadataPromise, timeoutPromise]) as any
+        } catch (error) {
+          // Continue with default metadata if fetch fails
+          console.log('Using default metadata for token:', mintAddress.slice(0, 8))
+        }
 
         const newToken: NewToken = {
           mint: mintAddress,
           timestamp: Date.now(),
           signature: logs.signature,
           creator: 'InitializeMint',
-          name: `Token-${mintAddress.slice(0, 8)}`,
-          symbol: 'NEW',
+          name: tokenMetadata.name,
+          symbol: tokenMetadata.symbol,
           supply: 0,
           marketStatus: 'checking',
           lastMarketCheck: 0,
           marketCheckCount: 0
         }
 
-        console.log('🔄 Adding token to state:', newToken)
         
         // Only update state if component is still mounted
         if (!isMountedRef.current) {
@@ -498,27 +568,23 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         }
         
         setDetectedTokens(prev => {
-          console.log('📊 Current tokens in state:', prev.length)
           const isDuplicate = prev.some(token => token.mint === mintAddress)
           if (isDuplicate) {
             console.log('⚠️ Duplicate token detected, skipping:', mintAddress)
             return prev
           }
           
-          console.log('🎉 NEW TOKEN ADDED TO STATE:', mintAddress)
           
           // Add to market check queue (only if still mounted)
           if (isMountedRef.current) {
             setMarketCheckQueue(prevQueue => {
               const newQueue = new Set(prevQueue)
               newQueue.add(mintAddress)
-              console.log('📈 Added to market check queue:', mintAddress.slice(0, 8))
               return newQueue
             })
           }
           
           const newState = [newToken, ...prev].slice(0, 20)
-          console.log('📊 New state length:', newState.length)
           return newState
         })
 
@@ -645,7 +711,6 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
               try {
                 // Add safety check to prevent errors during processing
                 if (isMountedRef.current) {
-                  console.log('📨 Received onLogs event:', logs.signature.slice(0, 8))
                   processNewToken(logs, context)
                 }
               } catch (error) {
@@ -678,16 +743,11 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       HeliusConnection.addSubscription(id)
       setSubscriptionId(id)
       setIsConnected(true)
-      console.log('✅ onLogs monitoring started - ID:', id)
-      console.log('🎯 Listening for InitializeMint transactions')
-      console.log('📊 This method is more precise than account changes')
+
       
       // Test subscription immediately
       setTimeout(() => {
         console.log('🔍 Testing subscription health after 5 seconds...')
-        console.log(`📊 Current accountsProcessed: ${accountsProcessed}`)
-        console.log(`🔗 Subscription ID: ${id}`)
-        console.log(`📡 Connection active: ${activeConnection ? 'Yes' : 'No'}`)
       }, 5000)
       
       // Heartbeat every 30 seconds
@@ -747,11 +807,7 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
         }
       }, 300000) // Check every 5 minutes instead of 2
 
-      setIntervals({ 
-        heartbeat: heartbeatInterval, 
-        polling: pollingInterval,
-        healthCheck: healthCheckInterval
-      })
+      // Store intervals for cleanup (intervals managed locally)
       
       // Initial setup
       setHeartbeatCount(1)
@@ -807,26 +863,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     const activeConnection = connection || HeliusConnection.getWebSocketConnection()
 
     try {
-      // Clear intervals first
-      setIntervals(currentIntervals => {
-        if (currentIntervals.heartbeat) {
-          clearInterval(currentIntervals.heartbeat)
-          console.log('⏹️ Cleared heartbeat interval')
-        }
-        if (currentIntervals.polling) {
-          clearInterval(currentIntervals.polling)
-          console.log('⏹️ Cleared polling interval')
-        }
-        if (currentIntervals.marketCheck) {
-          clearInterval(currentIntervals.marketCheck)
-          console.log('⏹️ Cleared market check interval')
-        }
-        if (currentIntervals.healthCheck) {
-          clearInterval(currentIntervals.healthCheck)
-          console.log('⏹️ Cleared health check interval')
-        }
-        return {} // Clear all intervals
-      })
+      // Clear intervals (simplified without state management)
+      console.log('⏹️ Clearing all monitoring intervals')
       
       // Remove logs subscription with error handling
       try {
@@ -876,14 +914,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
   // Cleanup effect on unmount
   useEffect(() => {
     return () => {
-      // Cleanup on unmount using state callbacks to avoid dependencies
-      setIntervals(currentIntervals => {
-        if (currentIntervals.heartbeat) clearInterval(currentIntervals.heartbeat)
-        if (currentIntervals.polling) clearInterval(currentIntervals.polling)
-        if (currentIntervals.marketCheck) clearInterval(currentIntervals.marketCheck)
-        if (currentIntervals.healthCheck) clearInterval(currentIntervals.healthCheck)
-        return {}
-      })
+      // Cleanup on unmount (simplified)
+      console.log('🧹 Cleaning up mint detection on unmount')
       
       setSubscriptionId(currentId => {
         if (currentId) {
@@ -906,18 +938,14 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
       return
     }
 
-    console.log('🔧 Setting up market check interval (every 120 seconds to avoid rate limits)...')
+    console.log('🔧 Setting up market check interval (every 30 seconds for aggressive checking)...')
     
     const marketCheckInterval = setInterval(() => {
       console.log(`⏰ Market check interval triggered!`)
       processMarketCheckQueue()
-    }, 120000) // 2 minutes
+    }, 30000) // Reduced from 120s to 30s for aggressive checking
 
-    // Store the interval for cleanup
-    setIntervals(prev => ({
-      ...prev,
-      marketCheck: marketCheckInterval
-    }))
+    // Market check interval managed locally
 
     return () => {
       console.log('🔧 Cleaning up market check interval...')
@@ -1051,6 +1079,52 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     setRateLimitBackoff(0)
   }, [])
 
+  // Function to repair market check queue if it gets out of sync
+  const repairMarketCheckQueue = useCallback(() => {
+    console.log('🔧 Repairing market check queue...')
+    
+    const tokensNeedingCheck = detectedTokens.filter(token => {
+      try {
+        new PublicKey(token.mint)
+        return token.marketStatus !== 'available' && 
+               (token.marketCheckCount || 0) < 10 && 
+               token.mint.length >= 32
+      } catch {
+        return false
+      }
+    })
+    
+    console.log(`🔧 Found ${tokensNeedingCheck.length} tokens that need market checking`)
+    
+    setMarketCheckQueue(prev => {
+      const newQueue = new Set<string>()
+      tokensNeedingCheck.forEach(token => {
+        newQueue.add(token.mint)
+        console.log(`🔧 Added ${token.mint.slice(0, 8)} to repaired queue`)
+      })
+      console.log(`🔧 Repaired queue size: ${newQueue.size} (was: ${prev.size})`)
+      return newQueue
+    })
+  }, [detectedTokens])
+
+  // Function to update token metadata for existing tokens
+  const updateTokenMetadata = useCallback(async (mintAddress: string) => {
+    try {
+      const metadata = await fetchTokenMetadata(mintAddress)
+      
+      setDetectedTokens(prev => prev.map(token => 
+        token.mint === mintAddress 
+          ? { ...token, name: metadata.name, symbol: metadata.symbol }
+          : token
+      ))
+      
+      return metadata
+    } catch (error) {
+      console.warn('Failed to update token metadata:', error)
+      return null
+    }
+  }, [fetchTokenMetadata])
+
   return {
     detectedTokens,
     snipedTokens,
@@ -1069,6 +1143,8 @@ export const useMintDetection = (connection: Connection | null, isMonitoring: bo
     removeSnipedToken,
     checkTokenMarket: performManualMarketCheck,
     debugForceMarketCheck, // Add debug function
-    resetRateLimitBackoff // Expose reset function
+    resetRateLimitBackoff, // Expose reset function
+    repairMarketCheckQueue, // Expose repair function
+    updateTokenMetadata // Expose metadata update function
   }
 }

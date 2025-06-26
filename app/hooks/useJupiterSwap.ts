@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from 'react'
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js'
-import { createJupiterApiClient, QuoteResponse, SwapResponse } from '@jup-ag/api'
+import { createJupiterApiClient, QuoteResponse } from '@jup-ag/api'
 
 export interface SwapRoute {
   quote: QuoteResponse | null
@@ -43,7 +43,7 @@ export const useJupiterSwap = (connection: Connection | null) => {
       })
       
       return testQuote !== null
-    } catch (error) {
+    } catch {
       return false
     }
   }, [jupiterApi])
@@ -63,7 +63,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
 
     // Skip if already loading to prevent multiple concurrent requests
     if (swapRoute.loading) {
-      console.log('⏳ Quote request already in progress, skipping...')
       return null
     }
 
@@ -79,13 +78,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
       // Convert SOL amount to lamports
       const inputAmount = Math.floor(amount * 1e9)
       
-      console.log('🔍 Getting Jupiter quote for:', {
-        inputMint,
-        outputMint,
-        amount: inputAmount,
-        slippageBps
-      })
-
       // Add timeout and retry logic
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
@@ -94,7 +86,7 @@ export const useJupiterSwap = (connection: Connection | null) => {
       try {
         new PublicKey(inputMint)
         new PublicKey(outputMint)
-      } catch (validationError) {
+      } catch {
         throw new Error('Invalid mint address format')
       }
 
@@ -106,12 +98,10 @@ export const useJupiterSwap = (connection: Connection | null) => {
       ]
       
       if (!commonTokens.includes(outputMint)) {
-        console.log('🔍 Checking if token is tradeable on Jupiter...')
         const isTradeable = await isTokenTradeable(outputMint)
         if (!isTradeable) {
           throw new Error('This token is not available for trading on Jupiter')
         }
-        console.log('✅ Token is tradeable on Jupiter')
       }
 
         // Get quote from Jupiter with timeout
@@ -136,8 +126,9 @@ export const useJupiterSwap = (connection: Connection | null) => {
         const minimumReceived = (outAmount * (1 - slippageBps / 10000)).toString()
 
         // Estimate fees (simplified)
-        const estimatedFees = quote.routePlan.reduce((total: number, route: any) => {
-          return total + (route.swapInfo?.feeAmount ? parseInt(route.swapInfo.feeAmount) : 5000)
+        const estimatedFees = quote.routePlan.reduce((total: number, route: unknown) => {
+          const routeInfo = route as { swapInfo?: { feeAmount?: string } }
+          return total + (routeInfo.swapInfo?.feeAmount ? parseInt(routeInfo.swapInfo.feeAmount) : 5000)
         }, 0)
 
         setSwapRoute({
@@ -148,13 +139,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
           priceImpact,
           minimumReceived,
           estimatedFees: estimatedFees / 1e9 // Convert to SOL
-        })
-
-        console.log('✅ Jupiter quote received:', {
-          inputAmount: inputAmount / 1e9,
-          outputAmount: outAmount,
-          priceImpact: priceImpact.toFixed(2) + '%',
-          routes: quote.routePlan.length
         })
 
         return quote
@@ -186,14 +170,14 @@ export const useJupiterSwap = (connection: Connection | null) => {
       
       // Handle Jupiter API specific errors
       if (error && typeof error === 'object' && 'response' in error) {
-        const response = (error as any).response
+        const response = (error as { response?: { status?: number } }).response
         if (response?.status === 400) {
           errorMessage = 'This token is not tradeable on Jupiter or the pair does not exist'
         } else if (response?.status === 404) {
           errorMessage = 'Token not found in Jupiter database'
         } else if (response?.status === 429) {
           errorMessage = 'Too many requests - please wait a moment'
-        } else if (response?.status >= 500) {
+        } else if ((response?.status ?? 0) >= 500) {
           errorMessage = 'Jupiter API server error - try again later'
         }
       }
@@ -215,7 +199,7 @@ export const useJupiterSwap = (connection: Connection | null) => {
       
       return null
     }
-  }, [connection, jupiterApi, swapRoute.loading])
+  }, [connection, jupiterApi, swapRoute.loading, isTokenTradeable])
 
   const prepareSwapTransaction = useCallback(async (
     quote: QuoteResponse,
@@ -230,8 +214,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
     setSwapRoute(prev => ({ ...prev, loading: true, error: null }))
 
     try {
-      console.log('🔨 Preparing swap transaction...')
-
       // Get swap transaction from Jupiter
       const swapResult = await jupiterApi.swapPost({
         swapRequest: {
@@ -256,7 +238,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
         error: null
       }))
 
-      console.log('✅ Swap transaction prepared')
       return transaction
 
     } catch (error) {
@@ -276,15 +257,13 @@ export const useJupiterSwap = (connection: Connection | null) => {
 
   const executeSwap = useCallback(async (
     transaction: VersionedTransaction,
-    wallet: any
+    wallet: { signTransaction: (tx: VersionedTransaction) => Promise<VersionedTransaction> }
   ) => {
     if (!connection || !wallet || !transaction) {
       throw new Error('Missing required parameters for swap execution')
     }
 
     try {
-      console.log('🚀 Executing swap transaction...')
-
       // Sign the transaction
       const signedTransaction = await wallet.signTransaction(transaction)
       
@@ -294,8 +273,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
         preflightCommitment: 'confirmed'
       })
 
-      console.log('📋 Transaction signature:', signature)
-
       // Wait for confirmation
       const confirmation = await connection.confirmTransaction(signature, 'confirmed')
       
@@ -303,7 +280,6 @@ export const useJupiterSwap = (connection: Connection | null) => {
         throw new Error(`Transaction failed: ${confirmation.value.err}`)
       }
 
-      console.log('✅ Swap executed successfully!')
       return signature
 
     } catch (error) {

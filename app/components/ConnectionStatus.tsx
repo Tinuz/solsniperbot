@@ -5,7 +5,13 @@ import HeliusConnection from '../services/HeliusConnection'
 
 const ConnectionStatus: React.FC = () => {
   const [isConnected, setIsConnected] = useState(false)
-  const [stats, setStats] = useState<any>(null)
+  const [stats, setStats] = useState<{
+    currentSlot?: number;
+    blockHeight?: number;
+    epoch?: number;
+    slotIndex?: number;
+    slotsInEpoch?: number;
+  } | null>(null)
   const [testing, setTesting] = useState(false)
   
   // Load collapsed state from localStorage, default to expanded
@@ -44,7 +50,7 @@ const ConnectionStatus: React.FC = () => {
         try {
           const connectionStats = await HeliusConnection.getConnectionStats()
           setStats(connectionStats)
-        } catch (statsError) {
+        } catch {
           // Stats failed but connection is still valid
           console.warn('⚠️ Could not fetch connection stats, but connection is OK')
           setStats(null)
@@ -52,8 +58,9 @@ const ConnectionStatus: React.FC = () => {
       } else {
         setStats(null)
       }
-    } catch (error: any) {
-      console.warn('Connection test error:', error?.message || error)
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      console.warn('Connection test error:', errorMessage)
       setIsConnected(false)
       setStats(null)
     } finally {

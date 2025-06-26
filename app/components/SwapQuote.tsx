@@ -2,8 +2,8 @@
 
 import React, { useState, useEffect } from 'react'
 import { useConnection, useWallet } from '@solana/wallet-adapter-react'
-import { PublicKey } from '@solana/web3.js'
 import { useJupiterSwap } from '../hooks/useJupiterSwap'
+import { usePriceTracker } from '../hooks/usePriceTracker'
 
 interface SwapQuoteProps {
   tokenAddress: string
@@ -22,12 +22,11 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
 }) => {
   const { connection } = useConnection()
   const { publicKey, signTransaction } = useWallet()
-  const { swapRoute, getSwapQuote, prepareSwapTransaction, executeSwap, clearRoute, isTokenTradeable } = useJupiterSwap(connection)
+  const { swapRoute, getSwapQuote, prepareSwapTransaction, executeSwap, clearRoute } = useJupiterSwap(connection)
+  const { addTokenToTracking } = usePriceTracker()
   const [isExecuting, setIsExecuting] = useState(false)
-  const [isValidating, setIsValidating] = useState(false)
   const [lastQuoteTime, setLastQuoteTime] = useState<number>(0)
   const [quoteAge, setQuoteAge] = useState<number>(0)
-  const [hasInitialQuote, setHasInitialQuote] = useState(false)
   const [lastParams, setLastParams] = useState<string>('')
 
   // Track parameter changes and manage quote fetching
@@ -41,7 +40,6 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
         setTimeout(() => {
           clearRoute()
           setLastQuoteTime(0)
-          setHasInitialQuote(false)
           setLastParams('')
         }, 0)
       }
@@ -51,7 +49,6 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
     // If parameters changed, reset and potentially fetch new quote
     if (currentParams !== lastParams) {
       setLastParams(currentParams)
-      setHasInitialQuote(false)
       setLastQuoteTime(0)
       
       // Clear existing quote when parameters change
@@ -89,11 +86,37 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
       // Execute swap
       const signature = await executeSwap(transaction, { signTransaction })
       
+      // Add token to price tracking automatically
+      if (swapRoute.quote) {
+        try {
+          const tokensOut = parseInt(swapRoute.quote.outAmount)
+          const solIn = parseFloat(amount)
+          const pricePerToken = solIn / (tokensOut / 1000000) // Assuming 6 decimals, adjust as needed
+          
+          // Extract token info (you might want to fetch this from metadata)
+          const tokenName = `Token-${tokenAddress.slice(0, 8)}`
+          const tokenSymbol = 'NEW'
+          
+          const added = addTokenToTracking(
+            tokenAddress,
+            tokenName,
+            tokenSymbol,
+            pricePerToken,
+            tokensOut / 1000000 // Convert to actual token amount
+          )
+          
+          if (added) {
+            console.log(`📊 Token added to price tracking: ${tokenName}`)
+          }
+        } catch (trackingError) {
+          console.warn('Failed to add token to price tracking:', trackingError)
+        }
+      }
+      
       if (onSwapSuccess) {
         onSwapSuccess(signature)
       }
 
-      console.log('🎉 Swap completed successfully!')
     } catch (error) {
       console.error('Swap failed:', error)
       alert(`Swap failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -110,7 +133,7 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
       await getSwapQuote(SOL_MINT, tokenAddress, parseFloat(amount), slippageBps)
       setLastQuoteTime(Date.now())
     } catch (error) {
-      console.log('Error refreshing quote:', error)
+      console.warn('Error refreshing quote:', error)
     }
   }
 
@@ -156,17 +179,17 @@ const SwapQuote: React.FC<SwapQuoteProps> = ({
           )}
         </h4>
         <div className="flex items-center space-x-2">
-          {(swapRoute.loading || isValidating) && (
+          {swapRoute.loading && (
             <div className="flex items-center text-sm text-gray-400">
               <div className="w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full animate-spin mr-2"></div>
-              {isValidating ? 'Validating...' : 'Loading...'}
+              Loading...
             </div>
           )}
 
           {/* Manual refresh - always available */}
           <button
             onClick={refreshQuote}
-            disabled={swapRoute.loading || isValidating}
+            disabled={swapRoute.loading}
             className="px-3 py-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 rounded text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             title="Get fresh quote"
             data-testid="swap-quote-refresh"
