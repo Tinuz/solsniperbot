@@ -25,9 +25,18 @@ export interface WsStats {
   connected: boolean
   reconnects: number
   messages: number
+  /** Bytes received (what metered providers bill for). */
+  bytes: number
   lastMessageAt: number
+  /** Last subscription notification (not acks or pongs). */
+  lastNotificationAt: number
   connectedAt: number
+  /** Reconnects forced because notifications stopped while the socket looked alive. */
+  stalls: number
 }
+
+const byteLength = (raw: WebSocket.RawData) =>
+  Array.isArray(raw) ? raw.reduce((n, b) => n + b.length, 0) : raw instanceof ArrayBuffer ? raw.byteLength : raw.length
 
 /**
  * Solana JSON-RPC websocket with automatic reconnect and resubscribe.
@@ -48,12 +57,18 @@ export class SolanaWs extends EventEmitter {
   private awaitingPong = false
   private reconnectTimer?: NodeJS.Timeout
 
-  readonly stats: WsStats = { connected: false, reconnects: 0, messages: 0, lastMessageAt: 0, connectedAt: 0 }
+  readonly stats: WsStats = { connected: false, reconnects: 0, messages: 0, bytes: 0, lastMessageAt: 0, lastNotificationAt: 0, connectedAt: 0, stalls: 0 }
 
   constructor(
     private readonly url: string,
     private readonly log: Logger,
     private readonly name = 'ws',
+    /**
+     * Reconnect when subscriptions deliver nothing for this long although the
+     * socket answers pings (e.g. a subscription silently dropped server-side).
+     * Only for streams that are never quiet that long.
+     */
+    private readonly stallMs?: number,
   ) {
     super()
   }
@@ -140,6 +155,14 @@ export class SolanaWs extends EventEmitter {
         ws.terminate()
         return
       }
+      const quietMs = Date.now() - Math.max(this.stats.lastNotificationAt, this.stats.connectedAt)
+      if (this.stallMs && this.subs.size > 0 && quietMs > this.stallMs) {
+        this.stats.stalls++
+        this.log.warn({ ws: this.name, quietSec: Math.round(quietMs / 1000) }, 'websocket delivers nothing, reconnecting')
+        this.emit('stall', quietMs)
+        ws.terminate()
+        return
+      }
       this.awaitingPong = true
       ws.ping()
     }, 10_000)
@@ -157,6 +180,7 @@ export class SolanaWs extends EventEmitter {
 
   private onMessage(raw: WebSocket.RawData): void {
     this.stats.messages++
+    this.stats.bytes += byteLength(raw)
     this.stats.lastMessageAt = Date.now()
     let msg: RpcMessage
     try {
@@ -168,6 +192,7 @@ export class SolanaWs extends EventEmitter {
     if (msg.params && typeof msg.params.subscription === 'number') {
       const sub = this.byServerId.get(msg.params.subscription)
       if (!sub) return
+      this.stats.lastNotificationAt = this.stats.lastMessageAt
       const result = msg.params.result as { context?: { slot: number }; value?: unknown }
       const hasEnvelope = result !== null && typeof result === 'object' && 'value' in result
       try {
@@ -184,6 +209,7 @@ export class SolanaWs extends EventEmitter {
       this.pendingSubscribe.delete(msg.id)
       if (msg.error) {
         this.log.error({ ws: this.name, method: sub.method, error: msg.error }, 'subscription rejected')
+        this.emit('rejected', msg.error.message)
         return
       }
       if (!this.subs.has(sub.localId)) {

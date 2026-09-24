@@ -97,6 +97,9 @@ describe('paper trading end to end', () => {
     expect(closed.closeReason).toMatch(/take profit/)
     expect(positionPnl(closed) > 0n).toBe(true)
     expect(engine.status().pnl.wins).toBe(1)
+    // What a metered RPC provider would bill is visible.
+    expect(engine.status().usage.streamedMb).toBeGreaterThan(0)
+    expect(engine.status().usage.rpcCalls).toBeGreaterThan(0)
   })
 
   it('rejects launches that fail the filters and never buys them', async () => {

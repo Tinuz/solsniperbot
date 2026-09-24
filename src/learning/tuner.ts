@@ -32,6 +32,10 @@ export interface TunerOptions {
   testFrac?: number
   /** Settings (`paramsKey`) never to propose, e.g. ones that failed probation. */
   exclude?: string[]
+  /** Operating cost the edge must cover, per day; null when it cannot be priced yet. */
+  costPerDayLamports?: number | null
+  /** Recorded launches per loaded one, when the data was sampled. */
+  sampleStride?: number
 }
 
 export interface Gate {
@@ -333,6 +337,18 @@ export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: Tunab
     },
     { name: 'not one lucky trade', pass: recent.totalPnlLamports - bestWin > 0, detail: `without the best trade: ${sol(recent.totalPnlLamports - bestWin)}` },
   ]
+  const cost = o.costPerDayLamports
+  if (cost !== undefined && cost !== 0) {
+    // Scale the replayed profit to a day of real trading: the window's length,
+    // and the launches left out when the recordings were sampled.
+    const spanDays = test.length > 1 ? (test[test.length - 1]!.t - test[0]!.t) / 86_400_000 : 0
+    const perDay = spanDays > 0 ? (recent.totalPnlLamports * (o.sampleStride ?? 1)) / spanDays : 0
+    gates.push(
+      cost === null
+        ? { name: 'covers its costs', pass: false, detail: 'SOL price unknown, cannot price the operating costs yet' }
+        : { name: 'covers its costs', pass: perDay >= cost, detail: `≈${sol(perDay)}/day vs ${sol(cost)}/day of operating costs` },
+    )
+  }
   const failed = gates.filter((g) => !g.pass)
   return {
     ...base,

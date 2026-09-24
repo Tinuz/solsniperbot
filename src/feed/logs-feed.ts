@@ -26,9 +26,14 @@ export class LogsFeed extends EventEmitter implements Feed {
 
   constructor(wsUrl: string, private readonly log: Logger) {
     super()
-    this.ws = new SolanaWs(wsUrl, log, 'pump-logs')
+    // Pump trades never pause for two minutes; silence means a dead subscription.
+    this.ws = new SolanaWs(wsUrl, log, 'pump-logs', 120_000)
     this.ws.on('open', () => this.emit('status', true))
     this.ws.on('close', () => this.emit('status', false))
+    this.ws.on('stall', (ms: number) =>
+      this.emit('problem', `no data for ${Math.round(ms / 1000)}s although connected; reconnecting (RPC credits used up, or the subscription was dropped?)`),
+    )
+    this.ws.on('rejected', (message: string) => this.emit('problem', `subscription refused by the RPC: ${message}`))
   }
 
   async start(): Promise<void> {
@@ -52,6 +57,8 @@ export class LogsFeed extends EventEmitter implements Feed {
       txs: this.txs,
       reconnects: this.ws.stats.reconnects,
       lastMessageAt: this.ws.stats.lastMessageAt,
+      bytes: this.ws.stats.bytes,
+      stalls: this.ws.stats.stalls,
     }
   }
 

@@ -55,6 +55,8 @@ const toAccount = (raw: RawAccount | null): AccountData | null =>
  */
 export class RpcClient {
   private id = 0
+  /** Requests sent, for usage (credit) accounting. */
+  calls = 0
 
   constructor(
     readonly url: string,
@@ -62,6 +64,7 @@ export class RpcClient {
   ) {}
 
   async call<T>(method: string, params: unknown[] = [], timeoutMs = this.defaultTimeoutMs): Promise<T> {
+    this.calls++
     const body = JSON.stringify({ jsonrpc: '2.0', id: ++this.id, method, params })
     const res = await postJson<{ result?: T; error?: { code: number; message: string; data?: unknown } }>(
       this.url,

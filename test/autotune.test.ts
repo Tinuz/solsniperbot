@@ -354,7 +354,7 @@ describe('AutoTuner', () => {
     expect(s.adopts).toBe(false)
     expect(s.suggestion?.changes).toEqual(run.changes)
     expect(s.overrides).toEqual([])
-    await expect(a.t.revert()).rejects.toThrow(/only tuned automatically in paper mode/)
+    await expect(a.t.revert()).rejects.toThrow(/only tuned automatically/)
   })
 
   it('samples large recordings evenly over the whole period', async () => {
@@ -446,6 +446,63 @@ describe('AutoTuner', () => {
     expect(a.t.tradingGate().allowed).toBe(true) // the .env settings also make money on this data
   })
 
+  it('live: shadow-tests a candidate first, then trades it at reduced size until probation passes', async () => {
+    const { dir, env } = await setup({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]', REQUIRE_EDGE: 'true' })
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    const before = paramsFromConfig(a.cfg)
+
+    // Found and validated, but not traded: a shadow test on new launches comes first.
+    const found = await a.t.run()
+    expect(found.decision).toBe('adopt')
+    expect(found.changes).toHaveLength(1) // live: one change at a time
+    expect(found.reason).toMatch(/shadow test started/)
+    expect(paramsKey(paramsFromConfig(a.cfg))).toBe(paramsKey(before))
+    expect(a.t.status().shadow?.changes).toEqual(found.changes)
+    expect(a.t.sizeFactor()).toBe(1)
+
+    // New launches on which the candidate does well: adopted live, at half size.
+    await writeRecords(dir, Array.from({ length: 30 }, (_, i) => pumpThenFade(clock.now + (i + 1) * 60_000)))
+    clock.now += HOUR
+    const shadowed = await a.t.run()
+    expect(shadowed.probation?.status).toBe('passed')
+    expect(paramsKey(paramsFromConfig(a.cfg))).not.toBe(paramsKey(before))
+    expect(a.t.status().shadow).toBeNull()
+    expect(a.t.status().probation?.changes).toEqual(found.changes)
+    expect(a.t.sizeFactor()).toBe(0.5)
+    expect(a.t.status().edge.status).toBe('proven') // its own proof, not the old settings'
+    expect(a.notices.some((n) => /adopted .* after a shadow test .*trading at 50% size/.test(n))).toBe(true)
+
+    // It keeps doing well on the next launches: probation passes, full size again.
+    await writeRecords(dir, Array.from({ length: 30 }, (_, i) => pumpThenFade(clock.now + (i + 1) * 60_000)))
+    clock.now += HOUR
+    expect((await a.t.run()).probation?.status).toBe('passed')
+    expect(a.t.sizeFactor()).toBe(1)
+  })
+
+  it('live: a candidate that fails its shadow test is never traded', async () => {
+    const { dir, env } = await setup({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]' })
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    const before = paramsKey(paramsFromConfig(a.cfg))
+    const found = await a.t.run()
+    expect(a.t.status().shadow).not.toBeNull()
+
+    await writeRecords(dir, Array.from({ length: 30 }, (_, i) => smallPump(clock.now + (i + 1) * 60_000)))
+    clock.now += HOUR
+    const shadowed = await a.t.run()
+    expect(shadowed.probation?.status).toBe('failed')
+    expect(paramsKey(paramsFromConfig(a.cfg))).toBe(before)
+    expect(a.t.status().shadow).toBeNull()
+    expect(a.t.status().adoptions).toHaveLength(0)
+    expect(a.notices.some((n) => n.startsWith('warn: autotune: shadow test failed'))).toBe(true)
+    // Not proposed again.
+    const next = await a.t.run()
+    expect(next.changes).not.toEqual(found.changes)
+  })
+
   it('runs the search in a worker thread', async () => {
     const { env } = await setup()
     const clock = { now: START + 51 * HOUR }
@@ -468,6 +525,12 @@ describe('autotune config', () => {
     expect(cfgWith({ RECORD_LAUNCHES: 'false' }).autotune.requireEdge).toBe(false)
     expect(cfgWith({ REQUIRE_EDGE: 'false' }).autotune.requireEdge).toBe(false)
     expect(() => cfgWith({ REQUIRE_EDGE: 'true', RECORD_LAUNCHES: 'false' })).toThrow(/REQUIRE_EDGE needs RECORD_LAUNCHES/)
+  })
+
+  it('adopts in live mode only when asked explicitly, and never without the edge gate', () => {
+    expect(cfgWith({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]' }).autotune).toMatchObject({ mode: 'live', requireEdge: true, liveProbationSizePct: 50 })
+    expect(() => cfgWith({ AUTOTUNE: 'live' })).toThrow(/AUTOTUNE=live is for live trading/)
+    expect(() => cfgWith({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]', REQUIRE_EDGE: 'false' })).toThrow(/needs REQUIRE_EDGE/)
   })
 
   it('adopts automatically only in paper mode', () => {

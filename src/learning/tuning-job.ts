@@ -1,6 +1,6 @@
 import type { Config } from '../config.js'
-import { loadRecords } from './dataset.js'
-import type { TunableParams } from './tunable.js'
+import { loadSample } from './dataset.js'
+import { type TunableParams, paramsKey } from './tunable.js'
 import {
   type EdgeResult,
   type ProbationResult,
@@ -45,13 +45,15 @@ export interface TuningJobResult {
  */
 export async function runTuningJob(job: TuningJob): Promise<TuningJobResult> {
   const started = performance.now()
-  const records = await loadRecords(job.cfg.dataDir, { days: job.days, max: job.maxLaunches })
+  const { records, stride } = await loadSample(job.cfg.dataDir, { days: job.days, max: job.maxLaunches })
   const out: TuningJobResult = { records: records.length, ms: 0 }
-  const edge = (p: TunableParams) => evaluateEdge(records, job.cfg, p, job.options, job.now)
+  const edge = (p: TunableParams) => evaluateEdge(records, job.cfg, p, { ...job.options, sampleStride: stride }, job.now)
   if (job.probation) {
     const p = job.probation
     out.probation = evaluateProbation(records, job.cfg, p.adopted, p.previous, p.since, p.neededTrades)
     if (job.edge && out.probation.status === 'failed') out.previousEdge = edge(p.previous)
+    // A shadow-tested candidate that passes goes live right away: it needs its own proof.
+    if (job.edge && out.probation.status === 'passed' && paramsKey(p.adopted) !== paramsKey(job.current)) out.candidateEdge = edge(p.adopted)
   }
   if (job.propose) {
     out.proposal = proposeTuning(records, job.cfg, job.current, job.options, job.now)

@@ -12,12 +12,17 @@ import type { LaunchRecord } from './record.js'
  * is kept (not just the newest), and only sampled lines are parsed.
  */
 export async function loadRecords(dataDir: string, opts: { days?: number; max?: number } = {}): Promise<LaunchRecord[]> {
+  return (await loadSample(dataDir, opts)).records
+}
+
+/** Like `loadRecords`, plus how many recorded launches each loaded one stands for. */
+export async function loadSample(dataDir: string, opts: { days?: number; max?: number } = {}): Promise<{ records: LaunchRecord[]; stride: number }> {
   const dir = join(dataDir, 'launches')
   let files: string[]
   try {
     files = (await readdir(dir)).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort()
   } catch {
-    return []
+    return { records: [], stride: 1 }
   }
   if (opts.days) files = files.slice(-opts.days)
   let stride = 1
@@ -43,7 +48,7 @@ export async function loadRecords(dataDir: string, opts: { days?: number; max?: 
       }
     }
   }
-  return out.sort((a, b) => a.t - b.t)
+  return { records: out.sort((a, b) => a.t - b.t), stride }
 }
 
 async function countLines(path: string): Promise<number> {
