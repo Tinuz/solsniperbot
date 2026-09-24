@@ -1,165 +1,157 @@
-# Solana Sniper Bot
+# Sol Sniper
 
-A modern Next.js application for Solana token sniping with real-time mint detection, price tracking, and intuitive user interface.
+A low-latency [pump.fun](https://pump.fun) sniper for Solana. It detects launches from the program's log stream, decides in microseconds, builds and signs the buy locally, and sends the same signed transaction over several landing paths at once. It then manages each position with take-profit tiers, stop loss, trailing stop, dev-dump detection and time exits.
 
-## 🚀 Features
+> **Risk warning.** Memecoin sniping loses money more often than not. Most launches go to zero, many are built to rug snipers, and this software can have bugs. Run it in paper mode first, use a dedicated hot wallet holding only what you can afford to lose, and read the code before trusting it with funds. Nothing here is financial advice.
 
-### Core Functionality
-- � **Real-time Mint Detection** - Monitor new token mints on Solana mainnet in real-time
-- 💰 **Price Tracking** - Track purchased tokens with live price updates and P&L calculations
-- ⚡ **Jupiter DEX Integration** - Get quotes and execute swaps through Jupiter aggregator
-- 🌐 **Helius RPC Support** - High-performance WebSocket connections for reliable data
-- 💼 **Multi-Wallet Support** - Compatible with Phantom, Solflare, and other Solana wallets
+## Why it is fast
 
-### Technical Features
-- 🚀 **Next.js 15** with App Router and React 18
-- 💎 **TypeScript** for type-safe development
-- 🎨 **Tailwind CSS** for modern, responsive design
-- 📱 **Mobile-friendly** responsive interface
-- 🔄 **Real-time Updates** with WebSocket connections
-- 📊 **Market Analysis** with automated market availability checks
+The previous version detected mints through `InitializeMint` logs, randomly dropped 30% of them, re-fetched every transaction over RPC, polled Jupiter every 30 s for a market, and then waited for a human to click through a browser wallet popup. That adds up to seconds or minutes per snipe. This version removes every one of those steps:
 
-## 📦 Installation
-
-1. **Clone the repository:**
-```bash
-git clone https://github.com/your-username/solsniperbot.git
-cd solsniperbot
+```mermaid
+flowchart LR
+  A[pump program logs<br/>WS or gRPC, processed] -->|decode CreateEvent + dev TradeEvent<br/>0 RPC calls| B[filters<br/>~0.1 ms]
+  B --> C[build buy_exact_quote_in_v2<br/>cached blockhash, local signing]
+  C --> D{same signed bytes}
+  D --> E[Helius Sender / Jito]
+  D --> F[RPC + extra RPCs<br/>rebroadcast until landed]
+  E & F --> G[own TradeEvent in stream<br/>= confirmation + exact fill]
 ```
 
-2. **Install dependencies:**
+- **Zero round-trips on the hot path.** The create transaction's logs carry the coin's name, creator, token program and the curve's reserves after the dev's buy. The bot decides and prices from those alone. Blockhash, fee config, fee recipients and PDAs are all precomputed or cached.
+- **Earliest possible detection.** A websocket `logsSubscribe` works out of the box. Yellowstone gRPC (Triton, Helius LaserStream) adds reconnect with slot backfill. `GRPC_DESHRED=true` goes further and sees launches in shreds, *before* the create transaction has executed; the dev buy is reconstructed from instruction arguments.
+- **Multi-path landing with no double-buy risk.** One signed transaction goes to Helius Sender or Jito plus your RPCs at the same time. Because every path carries the same signature, it can only land once. Plain RPCs are rebroadcast every 400 ms until the transaction lands or its blockhash expires. Connections to every path are kept warm.
+- **Streaming confirmation.** Your own trade shows up in the same log stream at `processed`. That confirms the transaction and gives the exact tokens and SOL filled, without waiting on a status poll.
+- **Streaming prices.** Every pump trade carries the curve's post-trade reserves, so open positions are repriced on every trade, not on a timer.
+
+The dashboard shows the latency you actually get: detect→send percentiles, land time, and how many slots after launch your buy landed.
+
+## Why it is accurate
+
+- **Current protocol.** It uses pump.fun's unified `buy_v2` / `sell_v2` / `buy_exact_quote_in_v2` instructions with Token-2022 mints, the 8+8+8 fee recipient sets from the live `Global` account, market-cap fee tiers from the live `FeeConfig`, holder-reward coins (creator vault = holder-rewards PDA), and mayhem coins.
+- **Verified against the official SDK.** The test suite checks that `buy_v2` and `sell_v2` are **byte-identical** to `@pump-fun/pump-sdk` for both token programs. It checks that event and account decoders agree with the SDK and the published IDL. It checks that sell proceeds and exact-token buy costs match the SDK **exactly** over randomized curves.
+- **Correct entry pricing.** Quotes use the curve state *after* the dev's buy in the create transaction, and fees are applied at the tier that coin's market cap falls in. `buy_exact_quote_in_v2` spends exactly your `BUY_SOL`, and slippage is enforced on the token output.
+- **Exits based on what you can realize.** Gains are measured as what your remaining tokens would fetch if sold right now (curve impact and fees included), not spot price. A thin curve can't trigger a take-profit your sell wouldn't realize.
+- **Exact P&L.** Fills come from your own on-chain trade events. In live mode every transaction is then reconciled against your wallet's actual lamport change (tips, priority fees, rent included), and booked P&L is corrected if the estimate was off. Paper P&L deducts estimated tips and fees so it isn't flattered.
+- **Realistic paper trading.** Paper fills happen against the live curve after `PAPER_LATENCY_MS`. If others bought in that window and your slippage limit is breached, the paper buy fails, as the real one would. With `SIMULATE_DRY_RUN=true` and a funded wallet, each would-be trade is also run through `simulateTransaction` against the real program.
+
+## Quick start
+
+Requires Node.js ≥ 22.19.
+
 ```bash
 npm install
+
+# 1. Offline demo: simulated chain + dashboard, no RPC key needed
+npm run demo                # open http://localhost:8787
+
+# 2. Paper trading against mainnet
+cp .env.example .env        # set RPC_URL (a paid, low-latency RPC)
+npm run dev                 # open http://localhost:8787
+
+# 3. Live trading: only after you have watched paper results for a while
+#    set DRY_RUN=false and PRIVATE_KEY (or KEYPAIR_PATH) in .env
+npm run build && npm start
 ```
 
-3. **Configure environment variables:**
+Open positions are persisted in `data/positions.json` and resume monitoring after a restart. Every buy, sell, close and reconciliation is appended to `data/trades.jsonl`.
+
+## Strategy
+
+### Entry
+
+| Mode | Behaviour |
+| --- | --- |
+| `ENTRY_MODE=instant` | Buy the moment a launch passes the filters (block-0 sniping). Fastest; most exposed to bundled launches and instant rugs. |
+| `ENTRY_MODE=momentum` | Watch a passing launch and buy only once it has `MOMENTUM_MIN_BUYERS` distinct buyers, `MOMENTUM_MIN_NET_BUY_SOL` net inflow excluding the dev, a sell/buy ratio under `MOMENTUM_MAX_SELL_RATIO`, and the dev has not sold, all within `MOMENTUM_MAX_AGE_MS`. |
+
+### Filters
+
+All filters run on data already in the create transaction, so they cost microseconds. They reject:
+
+- non-SOL-paired coins, mayhem coins (`ALLOW_MAYHEM`), and holder-reward coins if disabled;
+- launches missing a metadata URI;
+- names or symbols matching `NAME_BLOCKLIST` (or not matching `NAME_ALLOWLIST`);
+- dev buys outside `DEV_BUY_MIN_SOL`..`DEV_BUY_MAX_SOL`, or a dev holding over `DEV_MAX_SUPPLY_PCT` of supply;
+- curves already past `MAX_CURVE_PROGRESS_PCT`, or above `MAX_ENTRY_MCAP_SOL`;
+- serial launchers: dev wallets with more than `CREATOR_MAX_LAUNCHES` launches in the window. This history is learned from the live stream and persisted across restarts. `CREATOR_BLOCKLIST` / `CREATOR_ALLOWLIST` override it.
+
+`REQUIRE_SOCIALS=true` additionally fetches the off-chain metadata (with a hard timeout) and requires a Twitter, Telegram or website link. This is the only filter that adds network latency.
+
+### Exits
+
+Checked on every trade of the coin and once per second. The order is: protective exits first, then profit-taking, then time.
+
+1. **Dev sold** (`EXIT_ON_DEV_SELL`): exit everything.
+2. **Stop loss** at `-STOP_LOSS_PCT`.
+3. **Trailing stop**: once up `TRAILING_ARM_PCT`, exit if value falls `TRAILING_STOP_PCT` from its peak.
+4. **Take-profit tiers**: `TAKE_PROFIT=60:50,150:100` sells 50% of the remaining position at +60%, and the rest at +150%.
+5. **Max hold** (`MAX_HOLD_SECONDS`) and **stale** (`STALE_SECONDS` without any trades).
+6. **Graduation**: when the curve completes, the position is sold on PumpSwap through the official SDK.
+
+Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` to `SELL_MAX_SLIPPAGE_BPS`. After that, the exit policy retries with backoff. Full exits also close the token account to reclaim its rent.
+
+### Risk limits
+
+`MAX_OPEN_POSITIONS`, `MAX_BUYS_PER_MINUTE`, `MIN_SOL_RESERVE` (a balance check that includes tip, priority fee and account rent), and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. None of these can be overridden by a strategy signal.
+
+## Dashboard and API
+
+The dashboard at `http://localhost:8787` streams launches with the filter verdict and reason, open positions with live P&L, closed trades, latency and win rate. It also has buttons to pause buying, sell 25/50/100% of a position, sell everything, or manually buy any coin still on its bonding curve.
+
+| Endpoint | |
+| --- | --- |
+| `GET /api/status` · `/api/positions` · `/api/launches` · `/api/config` | Read-only state (secrets redacted). |
+| `POST /api/pause` · `/api/resume` | Stop/start new entries. |
+| `POST /api/sell` `{ "mint": "...", "pct": 50 }` | Sell part of a position. |
+| `POST /api/sell-all` | Exit everything. |
+| `POST /api/buy` `{ "mint": "...", "sol": 0.1 }` | Manual buy of a bonding-curve coin. |
+| `WS /ws` | Snapshot, then live events. |
+
+The API binds to `127.0.0.1`. It rejects non-local Host headers (DNS rebinding) and cross-origin requests, and mutating calls must send JSON (so a CORS preflight is forced, which the server never approves). This means a malicious web page can't trade your wallet through your browser. Set `API_TOKEN` before binding it anywhere else, then open the dashboard with `?token=...`.
+
+## Tuning for speed
+
+- **Colocate.** Run the bot in the same region as your RPC and landing endpoints (Frankfurt, Amsterdam, New York or Salt Lake City are common). Point `HELIUS_SENDER_URL` at the regional sender (e.g. `http://fra-sender.helius-rpc.com/fast`).
+- **Prefer gRPC** (`GRPC_URL`) over websockets if your provider offers it. Try `GRPC_DESHRED=true` if they support deshred.
+- **Measure compute.** Run paper mode with `SIMULATE_DRY_RUN=true` and a funded wallet, then read `unitsConsumed` from `data/trades.jsonl`. Set `BUY_COMPUTE_UNITS` just above it: a lower limit at the same total fee means a higher per-CU price.
+- **Watch "Landed slots after launch"** on the dashboard. It's the metric that matters, and it moves with tip, priority fee and region.
+
+## Project layout
+
+```
+src/
+  pump/        protocol: constants, PDAs, account/event decoding, curve + fee math, instruction builders
+  feed/        log-stream (WS) and Yellowstone gRPC/deshred feeds; live per-coin market book
+  strategy/    launch filters, creator reputation, momentum entry, exit policy, risk limits
+  trading/     executor (build/sign/land, paper fills, simulation), positions + P&L, PumpSwap sells
+  solana/      keep-alive RPC, resilient websocket, blockhash cache, priority fees, landing, confirmation
+  api/         local HTTP/WS server and the single-file dashboard
+  engine.ts    wires it all together; index.ts is the entrypoint
+test/          protocol checks against the official SDK/IDL, strategy units, end-to-end tests on a mock chain
+scripts/demo.ts  offline demo
+```
+
+## Tests
+
 ```bash
-cp .env.example .env.local
-```
-Edit `.env.local` and add your Helius API key:
-```env
-NEXT_PUBLIC_HELIUS_API_KEY=your_helius_api_key_here
+npm test          # vitest
+npm run typecheck
 ```
 
-4. **Start the development server:**
-```bash
-npm run dev
-```
+- **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
+- **Strategy**: config parsing, filters, exit policy, momentum and risk limits.
+- **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, and the API's security checks.
 
-5. **Open your browser:**
-Navigate to [http://localhost:3000](http://localhost:3000)
+**Not covered:** these tests can't prove landing performance or strategy profitability on mainnet. Validate with paper trading and small sizes first.
 
-## 🎯 Usage
+## Known limitations
 
-### Getting Started
-1. **Connect Wallet**: Click the wallet button to connect your Solana wallet
-2. **Monitor New Tokens**: Use the "Mint Detection" tab to discover new token launches
-3. **Analyze Markets**: Check if tokens have available trading pairs on DEXs
-4. **Execute Swaps**: Trade tokens through the integrated Jupiter interface
-5. **Track Performance**: Monitor your purchases in the "Price Tracker" tab
+- Only SOL-paired pump.fun bonding-curve coins are sniped. USDC-paired coins and other launchpads are ignored.
+- Jito tip accounts are fetched from the block engine at startup; the bot refuses to start with Jito landing if that fails, rather than guess an address (override with `JITO_TIP_ACCOUNTS`).
+- Paper mode can't fill graduated (PumpSwap) sells; they are booked at the last curve value.
+- pump.fun changes its program regularly. When it does, update `test/fixtures/*.idl.json` from [pump-public-docs](https://github.com/pump-fun/pump-public-docs) and the `@pump-fun/pump-sdk` dev dependency, and run the tests.
 
-### Mint Detection
-- **Real-time Monitoring**: Automatically detects new token mints
-- **Market Validation**: Checks trading availability on Jupiter DEX
-- **Rate Limiting**: Built-in protections to avoid API limits
-- **Queue Management**: Efficiently processes multiple tokens
+## License
 
-### Price Tracking
-- **Portfolio Overview**: View all tracked tokens with current prices
-- **P&L Calculations**: Real-time profit/loss tracking
-- **Auto-adding**: Purchased tokens are automatically added for tracking
-- **Manual Control**: Add or remove tokens from tracking manually
-- **Update Intervals**: Configurable price update frequencies (5-minute default)
-
-### Swap Interface
-- **Jupiter Integration**: Access to the best routes across Solana DEXs
-- **Slippage Control**: Adjustable slippage tolerance for market conditions
-- **Quote Validation**: Real-time price quotes with expiration tracking
-- **Transaction Monitoring**: Track swap execution and confirmation
-
-## 🛠️ Scripts
-
-```bash
-npm run dev          # Start development server
-npm run build        # Build for production
-npm run start        # Start production server
-npm run lint         # Run ESLint checks
-```
-
-## 🏗️ Technology Stack
-
-- **Frontend Framework**: Next.js 15 with App Router
-- **Language**: TypeScript for type safety
-- **Styling**: Tailwind CSS for modern UI
-- **Blockchain**: Solana Web3.js and SPL Token libraries
-- **DEX Integration**: Jupiter API for swap aggregation
-- **RPC Provider**: Helius for enhanced Solana connectivity
-- **Wallet Adapter**: Solana Wallet Adapter for multi-wallet support
-
-## ⚙️ Configuration
-
-### Environment Variables
-```env
-NEXT_PUBLIC_HELIUS_API_KEY=your_helius_api_key
-NEXT_PUBLIC_SOLANA_NETWORK=mainnet-beta
-```
-
-### Customization
-- **Price Update Intervals**: Modify in `PriceTracker.tsx`
-- **Rate Limiting**: Adjust delays in `useMintDetection.ts`
-- **Market Check Settings**: Configure in mint detection hook
-- **UI Themes**: Customize Tailwind configuration
-
-## 🔒 Security & Risk Warning
-
-⚠️ **IMPORTANT: This is experimental software. Use at your own risk.**
-
-Token sniping involves significant risks:
-- **Financial Risk**: You may lose your entire investment
-- **Smart Contract Risk**: Tokens may be malicious or have hidden functions
-- **Market Risk**: Extreme volatility and potential for total loss
-- **Technical Risk**: Software bugs or network issues may cause losses
-
-**Always:**
-- Verify token contracts independently
-- Only invest what you can afford to lose
-- Do your own research (DYOR)
-- Test with small amounts first
-- Understand the risks of new token launches
-
-## 🤝 Contributing
-
-1. **Fork the repository**
-2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
-3. **Commit your changes**: `git commit -m 'Add amazing feature'`
-4. **Push to the branch**: `git push origin feature/amazing-feature`
-5. **Open a Pull Request**
-
-### Development Guidelines
-- Follow TypeScript best practices
-- Use meaningful commit messages
-- Add tests for new features
-- Update documentation as needed
-- Follow the existing code style
-
-## 📄 License
-
-This project is licensed under the ISC License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Jupiter](https://jup.ag) for DEX aggregation
-- [Helius](https://helius.xyz) for enhanced Solana RPC
-- [Solana Labs](https://solana.com) for the blockchain infrastructure
-- The Solana developer community
-
-## 📞 Support
-
-For questions, issues, or contributions:
-- Open an issue on GitHub
-- Check existing documentation
-- Review the code comments for implementation details
-
----
-
-**Disclaimer**: This software is for educational and research purposes. Users are responsible for compliance with applicable laws and regulations.
+ISC
