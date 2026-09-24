@@ -9,8 +9,10 @@ import {
   type ParamChange,
   type TunableParams,
   diffParams,
+  filterKey,
   neighbors,
   paramsKey,
+  replayKey,
   withParams,
   withinLimits,
 } from './tunable.js'
@@ -66,7 +68,7 @@ const sol = (lamports: number) => `${(lamports / 1e9).toFixed(4)} SOL`
 
 /**
  * Evaluates settings on a fixed set of launches, caching the expensive part:
- * replays depend only on exits, filter verdicts only on filters. The search
+ * replays depend only on entry and exits, filter verdicts only on filters. The search
  * mostly revisits the best settings so far, so small caches suffice.
  */
 export class Evaluator {
@@ -96,13 +98,11 @@ export class Evaluator {
    */
   results(p: TunableParams): Outcome[] {
     const c = withParams(this.cfg, p)
-    const exitKey = JSON.stringify([p.takeProfit, p.stopLossPct, p.trailingStopPct, p.trailingArmPct, p.maxHoldSec, p.staleSec])
-    const replays = this.replays.getOrCreate(exitKey, () => {
+    const replays = this.replays.getOrCreate(replayKey(p), () => {
       const rc = replayConfigFrom(c)
       return this.rows.map((r) => outcome(replayLaunch(r.rec, rc)))
     })
-    const filterKey = JSON.stringify([p.devBuyMinSol, p.devBuyMaxSol, p.devMaxSupplyPct, p.maxEntryMcapSol, p.creatorMaxLaunches])
-    const mask = this.masks.getOrCreate(filterKey, () => this.rows.map((r) => staticFilter(r.launch, c.filters, r.ctx).pass))
+    const mask = this.masks.getOrCreate(filterKey(p), () => this.rows.map((r) => staticFilter(r.launch, c.filters, r.ctx).pass))
     const maxOpen = this.cfg.risk.maxOpenPositions
     const openUntil: number[] = []
     const out: Outcome[] = []
@@ -287,5 +287,60 @@ export function evaluateProbation(
     newPnlLamports: n.totalPnlLamports,
     oldPnlLamports: old.totalPnlLamports,
     detail,
+  }
+}
+
+export interface EdgeResult {
+  /** proven: the settings make money on recent launches; trading may go on. */
+  status: 'proven' | 'unproven' | 'insufficient-data'
+  reason: string
+  at: number
+  /** `paramsKey` of the settings that were checked. */
+  settingsKey: string
+  recent?: Summary
+  gates: Gate[]
+}
+
+/**
+ * Does the strategy in effect make money right now? Replays `params` on the
+ * newest part of the recordings (the same window the tuner validates on).
+ * The bot only risks funds while this holds.
+ */
+export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: TunableParams, o: TunerOptions, now = Date.now()): EdgeResult {
+  const sorted = [...records].sort((a, b) => a.t - b.t)
+  const hours = sorted.length ? (sorted[sorted.length - 1]!.t - sorted[0]!.t) / 3_600_000 : 0
+  const base = { at: now, settingsKey: paramsKey(params) }
+  const dataGate: Gate = {
+    name: 'enough data',
+    pass: sorted.length >= o.minLaunches && hours >= o.minHours,
+    detail: `${sorted.length} launches over ${hours.toFixed(1)}h (need ${o.minLaunches} over ${o.minHours}h)`,
+  }
+  if (!dataGate.pass) return { ...base, status: 'insufficient-data', reason: `collecting data: ${dataGate.detail}`, gates: [dataGate] }
+
+  const { test } = splitByTime(sorted, o.testFrac ?? 0.3)
+  const results = new Evaluator(test, cfg).results(params)
+  const recent = summarizeResults(results)
+  const buy = Number(cfg.buyLamports)
+  const needed = (o.minEdgePct / 100) * buy * Math.max(recent.trades, 1)
+  const bestWin = results.reduce((m, r) => Math.max(m, r.pnlLamports), 0)
+  const gates: Gate[] = [
+    dataGate,
+    { name: 'enough trades', pass: recent.trades >= o.minTestTrades, detail: `${recent.trades} recent trades (need ${o.minTestTrades})` },
+    {
+      name: 'makes money',
+      pass: recent.totalPnlLamports > 0 && recent.totalPnlLamports >= needed,
+      detail: `recent total ${sol(recent.totalPnlLamports)} (need +${sol(needed)})`,
+    },
+    { name: 'not one lucky trade', pass: recent.totalPnlLamports - bestWin > 0, detail: `without the best trade: ${sol(recent.totalPnlLamports - bestWin)}` },
+  ]
+  const failed = gates.filter((g) => !g.pass)
+  return {
+    ...base,
+    recent,
+    gates,
+    status: failed.length ? 'unproven' : 'proven',
+    reason: failed.length
+      ? `no proven edge: ${failed.map((g) => g.name).join(', ')} (${recent.trades} recent trades, ${sol(recent.totalPnlLamports)})`
+      : `${recent.trades} recent trades made ${sol(recent.totalPnlLamports)}`,
   }
 }

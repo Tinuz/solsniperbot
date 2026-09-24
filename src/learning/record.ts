@@ -60,6 +60,8 @@ export interface LaunchRecord {
   feeBps: { protocol: number; creator: number }
   verdict: LaunchVerdict
   reason: string
+  /** `settingsFingerprint` of the entry/filter/exit settings in effect (newer records). */
+  settings?: string
   position?: RecordedPosition
   trades: TradeRow[]
   /** Trade cap reached before the horizon. */

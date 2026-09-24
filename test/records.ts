@@ -82,3 +82,29 @@ export function smallPump(t: number): LaunchRecord {
   for (let i = 1; i <= 10; i++) steps.push({ dt: 20_000 + i * 4_000, sellTokens: 20e12 })
   return buildRecord(steps, { t })
 }
+
+/** Nobody trades after the launch. */
+export const deadCoin = (t: number): LaunchRecord => buildRecord([], { t })
+
+/** One small buy, then the dev dumps within two seconds. */
+export const earlyRug = (t: number): LaunchRecord =>
+  buildRecord([{ dt: 800, buy: 0.3e9 }, { dt: 1_500, sellTokens: 15e12, wallet: 0 }], { t })
+
+/** Steady buying for 30s, then a slow fade. */
+export function steadyPump(t: number): LaunchRecord {
+  const steps: Step[] = []
+  for (let i = 1; i <= 20; i++) steps.push({ dt: i * 1_500, buy: 0.8e9 })
+  for (let i = 1; i <= 12; i++) steps.push({ dt: 30_000 + i * 5_000, sellTokens: 15e12 })
+  return buildRecord(steps, { t })
+}
+
+/** A market where blind instant buys pay for dead coins and early rugs, and waiting for momentum pays off. */
+export function momentumMarket(n: number, start = 1_750_000_000_000): LaunchRecord[] {
+  let s = 5
+  const rand = () => ((s = (s * 1_103_515_245 + 12_345) % 2 ** 31) / 2 ** 31)
+  return Array.from({ length: n }, (_, i) => {
+    const r = rand()
+    const t = start + i * 300_000
+    return r < 0.55 ? deadCoin(t) : r < 0.85 ? earlyRug(t) : steadyPump(t)
+  })
+}

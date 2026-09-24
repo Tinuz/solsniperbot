@@ -1,18 +1,26 @@
+import { createHash } from 'node:crypto'
 import { type Config, solToLamports } from '../config.js'
 
 /**
  * The only settings the autotuner may change: which launches to buy
- * (filters) and when to sell (exits). Everything that decides how much money
- * is at risk (trade size, reserve, tips, slippage, risk limits, survival) is
- * deliberately out of its reach.
+ * (filters), when to buy them (entry), and when to sell (exits). Everything
+ * that decides how much money is at risk (trade size, reserve, tips,
+ * slippage, risk limits, survival) is deliberately out of its reach.
  */
 export interface TunableParams {
+  entryMode: 'instant' | 'momentum'
+  momentumMinBuyers: number
+  momentumMinNetBuySol: number
+  momentumMaxSellRatio: number
+  momentumMinAgeMs: number
+  momentumMaxAgeMs: number
   takeProfit: { gainPct: number; sellPct: number }[]
   stopLossPct: number
   trailingStopPct: number
   trailingArmPct: number
   maxHoldSec: number
   staleSec: number
+  exitOnDevSell: boolean
   devBuyMinSol: number
   devBuyMaxSol: number
   devMaxSupplyPct: number
@@ -20,10 +28,15 @@ export interface TunableParams {
   creatorMaxLaunches: number
 }
 
-export type ScalarKey = Exclude<keyof TunableParams, 'takeProfit'>
+export type ScalarKey = Exclude<keyof TunableParams, 'takeProfit' | 'entryMode' | 'exitOnDevSell'>
 
 /** Absolute limits no tuned value may leave. */
 export const BOUNDS: Record<ScalarKey, [number, number]> = {
+  momentumMinBuyers: [1, 30],
+  momentumMinNetBuySol: [0.05, 20],
+  momentumMaxSellRatio: [0.05, 1.5],
+  momentumMinAgeMs: [500, 10_000],
+  momentumMaxAgeMs: [3_000, 60_000],
   stopLossPct: [10, 60],
   trailingStopPct: [0, 50],
   trailingArmPct: [10, 300],
@@ -43,6 +56,11 @@ export const TP_SELL_BOUNDS: [number, number] = [25, 100]
  * strategy evolves in small, individually validated steps.
  */
 export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> = {
+  momentumMinBuyers: { abs: 3 },
+  momentumMinNetBuySol: { factor: 2 },
+  momentumMaxSellRatio: { abs: 0.2 },
+  momentumMinAgeMs: { factor: 2 },
+  momentumMaxAgeMs: { factor: 2 },
   stopLossPct: { abs: 10 },
   trailingStopPct: { abs: 10 },
   trailingArmPct: { abs: 40 },
@@ -57,12 +75,19 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
 const TP_STEP_FACTOR = 2
 
 export const ENV_NAMES: Record<keyof TunableParams, string> = {
+  entryMode: 'ENTRY_MODE',
+  momentumMinBuyers: 'MOMENTUM_MIN_BUYERS',
+  momentumMinNetBuySol: 'MOMENTUM_MIN_NET_BUY_SOL',
+  momentumMaxSellRatio: 'MOMENTUM_MAX_SELL_RATIO',
+  momentumMinAgeMs: 'MOMENTUM_MIN_AGE_MS',
+  momentumMaxAgeMs: 'MOMENTUM_MAX_AGE_MS',
   takeProfit: 'TAKE_PROFIT',
   stopLossPct: 'STOP_LOSS_PCT',
   trailingStopPct: 'TRAILING_STOP_PCT',
   trailingArmPct: 'TRAILING_ARM_PCT',
   maxHoldSec: 'MAX_HOLD_SECONDS',
   staleSec: 'STALE_SECONDS',
+  exitOnDevSell: 'EXIT_ON_DEV_SELL',
   devBuyMinSol: 'DEV_BUY_MIN_SOL',
   devBuyMaxSol: 'DEV_BUY_MAX_SOL',
   devMaxSupplyPct: 'DEV_MAX_SUPPLY_PCT',
@@ -74,12 +99,19 @@ const round = (v: number, d = 3) => Math.round(v * 10 ** d) / 10 ** d
 
 export function paramsFromConfig(cfg: Config): TunableParams {
   return {
+    entryMode: cfg.entryMode,
+    momentumMinBuyers: cfg.momentum.minBuyers,
+    momentumMinNetBuySol: Number(cfg.momentum.minNetBuyLamports) / 1e9,
+    momentumMaxSellRatio: cfg.momentum.maxSellRatio,
+    momentumMinAgeMs: cfg.momentum.minAgeMs,
+    momentumMaxAgeMs: cfg.momentum.maxAgeMs,
     takeProfit: cfg.exits.takeProfit.map((t) => ({ ...t })),
     stopLossPct: cfg.exits.stopLossPct,
     trailingStopPct: cfg.exits.trailingStopPct,
     trailingArmPct: cfg.exits.trailingArmPct,
     maxHoldSec: cfg.exits.maxHoldMs / 1000,
     staleSec: cfg.exits.staleMs / 1000,
+    exitOnDevSell: cfg.exits.exitOnDevSell,
     devBuyMinSol: Number(cfg.filters.devBuyMinLamports) / 1e9,
     devBuyMaxSol: Number(cfg.filters.devBuyMaxLamports) / 1e9,
     devMaxSupplyPct: cfg.filters.devMaxSupplyPct,
@@ -92,6 +124,15 @@ export function paramsFromConfig(cfg: Config): TunableParams {
 export function withParams(cfg: Config, p: TunableParams): Config {
   return {
     ...cfg,
+    entryMode: p.entryMode,
+    momentum: {
+      ...cfg.momentum,
+      minBuyers: p.momentumMinBuyers,
+      minNetBuyLamports: solToLamports(p.momentumMinNetBuySol),
+      maxSellRatio: p.momentumMaxSellRatio,
+      minAgeMs: Math.round(p.momentumMinAgeMs),
+      maxAgeMs: Math.round(p.momentumMaxAgeMs),
+    },
     exits: {
       ...cfg.exits,
       takeProfit: p.takeProfit.map((t) => ({ ...t })),
@@ -100,6 +141,7 @@ export function withParams(cfg: Config, p: TunableParams): Config {
       trailingArmPct: p.trailingArmPct,
       maxHoldMs: Math.round(p.maxHoldSec * 1000),
       staleMs: Math.round(p.staleSec * 1000),
+      exitOnDevSell: p.exitOnDevSell,
     },
     filters: {
       ...cfg.filters,
@@ -113,11 +155,13 @@ export function withParams(cfg: Config, p: TunableParams): Config {
 }
 
 /**
- * Applies `p` to the running bot in place. Filters and exits are read from
- * `cfg` on every decision, so this takes effect on the next launch/trade.
+ * Applies `p` to the running bot in place. Entry, filters and exits are read
+ * from `cfg` on every decision, so this takes effect on the next launch/trade.
  */
 export function applyParams(cfg: Config, p: TunableParams): void {
   const next = withParams(cfg, p)
+  cfg.entryMode = next.entryMode
+  Object.assign(cfg.momentum, next.momentum)
   Object.assign(cfg.exits, next.exits)
   Object.assign(cfg.filters, next.filters)
 }
@@ -128,7 +172,8 @@ export const tpToString = (tp: TunableParams['takeProfit']) =>
 export function toEnv(p: TunableParams): Record<string, string> {
   const out: Record<string, string> = {}
   for (const key of Object.keys(ENV_NAMES) as (keyof TunableParams)[]) {
-    out[ENV_NAMES[key]] = key === 'takeProfit' ? tpToString(p.takeProfit) : String(round(p[key]))
+    const v = p[key]
+    out[ENV_NAMES[key]] = key === 'takeProfit' ? tpToString(p.takeProfit) : typeof v === 'number' ? String(round(v)) : String(v)
   }
   return out
 }
@@ -163,6 +208,8 @@ export function withinLimits(p: TunableParams, origin: TunableParams): boolean {
     if (step.abs !== undefined && Math.abs(v - o) > step.abs + 1e-9) return false
     if (step.factor !== undefined && o > 0 && (v > o * step.factor + 1e-9 || v < o / step.factor - 1e-9)) return false
   }
+  // The config refuses a momentum window that closes before it opens.
+  if (p.momentumMaxAgeMs <= p.momentumMinAgeMs) return false
   if (p.takeProfit.length !== origin.takeProfit.length && p.takeProfit.length > 2) return false
   for (const [i, t] of p.takeProfit.entries()) {
     const o = origin.takeProfit[Math.min(i, origin.takeProfit.length - 1)]
@@ -186,6 +233,19 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
   const set = (group: string, patch: Partial<TunableParams>) => out.push({ group, params: { ...p, ...patch } })
   const scale = (v: number, fs: number[], d = 3) => fs.map((f) => round(v * f, d))
 
+  set('entry mode', { entryMode: p.entryMode === 'instant' ? 'momentum' : 'instant' })
+  // Momentum thresholds only matter when entering on momentum.
+  if (p.entryMode === 'momentum') {
+    for (const d of [-2, -1, 1, 2]) set('momentum buyers', { momentumMinBuyers: p.momentumMinBuyers + d })
+    for (const v of scale(p.momentumMinNetBuySol, [0.5, 0.75, 1.5, 2])) set('momentum net buy', { momentumMinNetBuySol: v })
+    for (const d of [-0.2, -0.1, 0.1, 0.2]) set('momentum sell ratio', { momentumMaxSellRatio: round(p.momentumMaxSellRatio + d, 2) })
+    for (const mn of [p.momentumMinAgeMs, Math.round(p.momentumMinAgeMs / 2), p.momentumMinAgeMs * 2]) {
+      for (const mx of [p.momentumMaxAgeMs, Math.round(p.momentumMaxAgeMs / 2), p.momentumMaxAgeMs * 2]) {
+        if (mn !== p.momentumMinAgeMs || mx !== p.momentumMaxAgeMs) set('momentum window', { momentumMinAgeMs: mn, momentumMaxAgeMs: mx })
+      }
+    }
+  }
+
   for (const d of [-10, -5, 5, 10]) set('stop loss', { stopLossPct: p.stopLossPct + d })
   const trails = p.trailingStopPct === 0 ? [10, 15, 20] : [0, p.trailingStopPct - 5, p.trailingStopPct + 5, p.trailingStopPct + 10]
   for (const t of trails.filter((x) => x >= 0)) {
@@ -195,6 +255,7 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
   }
   for (const v of scale(p.maxHoldSec, [0.5, 0.75, 1.5, 2], 0)) set('max hold', { maxHoldSec: v })
   for (const v of scale(p.staleSec, [0.5, 0.75, 1.5, 2], 0)) set('stale exit', { staleSec: v })
+  set('dev sell exit', { exitOnDevSell: !p.exitOnDevSell })
   if (p.takeProfit.length) {
     for (const f of [0.6, 0.8, 1.25, 1.6]) {
       set('take profit', { takeProfit: p.takeProfit.map((t) => ({ gainPct: round(t.gainPct * f, 1), sellPct: t.sellPct })) })
@@ -217,3 +278,29 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
 }
 
 export const paramsKey = (p: TunableParams) => JSON.stringify(toEnv(p))
+
+/** Short id of a set of settings, stored with each recorded launch. */
+export const settingsFingerprint = (p: TunableParams) => createHash('sha1').update(paramsKey(p)).digest('hex').slice(0, 12)
+
+/**
+ * What a replay depends on: entry and exits, plus the entry mcap cap, which
+ * the momentum rule also checks at the moment of entry.
+ */
+export const replayKey = (p: TunableParams) =>
+  JSON.stringify([
+    p.entryMode,
+    p.entryMode === 'momentum'
+      ? [p.momentumMinBuyers, p.momentumMinNetBuySol, p.momentumMaxSellRatio, p.momentumMinAgeMs, p.momentumMaxAgeMs, p.maxEntryMcapSol]
+      : null,
+    p.takeProfit,
+    p.stopLossPct,
+    p.trailingStopPct,
+    p.trailingArmPct,
+    p.maxHoldSec,
+    p.staleSec,
+    p.exitOnDevSell,
+  ])
+
+/** What the static filters depend on. */
+export const filterKey = (p: TunableParams) =>
+  JSON.stringify([p.devBuyMinSol, p.devBuyMaxSol, p.devMaxSupplyPct, p.maxEntryMcapSol, p.creatorMaxLaunches])

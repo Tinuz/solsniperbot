@@ -95,7 +95,21 @@ Both tools replay the recorded launches through the bot's **own** filter, moment
 
 `backtest` ranks hundreds of exit configurations in seconds.
 
-Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings on the newest 30%, which they were never tuned on. Reports are saved to `data/reports/`. These tools never change settings; the autotuner below does, in paper mode only.
+Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings **and make money** on the newest 30%, which they were never tuned on. A setting that merely loses less, usually by trading less, is reported as such and not recommended. Reports are saved to `data/reports/`.
+
+Both tools replay what the bot actually runs with, autotuned settings included. The replay-vs-bot check only compares trades the bot made with the same settings. Features like "net SOL in first 3s" are marked ⏱: they are only known seconds after launch, so they point towards momentum entry rather than being usable by an instant buy.
+
+To try other settings on the same data, set them for one run. In PowerShell: `$env:ENTRY_MODE="momentum"; npm run analyze` (and `Remove-Item Env:ENTRY_MODE` afterwards). In bash: `ENTRY_MODE=momentum npm run analyze`. These tools never change settings; the autotuner below does, in paper mode only.
+
+## Prove it first: no edge, no trades
+
+A fresh bot doesn't know whether its settings make money, and blind sniping usually doesn't: on pump.fun most launches never trade again after the first seconds, and every one of those costs the round-trip fees (~8% of a 0.05 SOL trade at the default tips). So with `REQUIRE_EDGE=auto` (the default whenever launches are recorded), the bot only buys while the settings in effect make money on the newest recorded launches.
+- **Until then it observes.** It watches and records every launch, which is how it learns, but spends nothing. The dashboard header shows **observing** or **trading**, and skipped launches say why.
+- **The proof.** Every hour it replays the settings in effect on the newest 30% of the recordings. It needs `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`, enough trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade.
+- **It stops when the edge goes.** If the market turns and the settings stop making money, buying pauses again instead of bleeding the wallet. A proof older than three hours no longer counts.
+- **Settings that change get their own proof.** After a rollback or a revert, the bot checks the new settings before it trades on them. A candidate adopted by autotune is only adopted once it made money on the newest data, so that counts as its proof.
+
+Survival rules stay the last line of defence. Set `REQUIRE_EDGE=false` to trade regardless (the offline demo does this).
 
 ## Autotune: the bot tunes itself (paper first)
 
@@ -110,9 +124,12 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 Automatic adoption only works in paper mode. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, and the tuner checks again before it changes anything.
 
 **Strict limits.**
-- **What it can change.** Only filters and exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`.
+- **What it can change.** Only which coins to buy, when, and when to sell:
+  - entry: `ENTRY_MODE` (instant or momentum) and the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`;
+  - filters: `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`;
+  - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`.
 - **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
-- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s), and one adoption moves it at most one step (for example ±10 points of stop loss, or at most 2× the hold time). One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
+- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode or the dev-sell exit counts as one step. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
 
 **Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
 1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
@@ -189,8 +206,8 @@ The dashboard at `http://localhost:8787` streams launches with the filter verdic
 | `POST /api/sell` `{ "mint": "...", "pct": 50 }` | Sell part of a position. |
 | `POST /api/sell-all` | Exit everything. |
 | `POST /api/buy` `{ "mint": "...", "sol": 0.1 }` | Manual buy of a bonding-curve coin. |
-| `GET /api/tuning` | Autotune state: last decision and gates, probation, overrides, history. |
-| `POST /api/tuning/run` | Start an autotune check now. |
+| `GET /api/tuning` | Edge and autotune state: trading or observing and why, last decision and gates, probation, overrides, history. |
+| `POST /api/tuning/run` | Check the edge (and search, when autotune is on) now. |
 | `POST /api/tuning/revert` | Back to the `.env` settings (paper autotune); tuning pauses for the cooldown. |
 | `WS /ws` | Snapshot, then live events. |
 
@@ -228,8 +245,10 @@ npm run typecheck
 
 - **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
 - **Strategy**: config parsing, filters, exit policy, momentum, risk limits, and survival (sizing, fee-drag minimum, defensive mode, critical vs dead, persistence and revival).
+- **Edge gate**: no buys (but full recording) until the settings are proven; proof per exact settings, restored after restart, stale after 3h, withdrawn when the market turns.
 - **Autotune**:
-  - every tunable value round-trips through `.env`;
+  - every tunable value round-trips through `.env`, momentum and entry mode included;
+  - it switches to momentum entry when waiting is what wins out of sample;
   - bounds and step limits hold, and trade size, fees and risk are unreachable;
   - winning settings are adopted, and settings that only won in the past are rejected (regime change);
   - probation passes and fails correctly, and positions are capacity-limited like live;

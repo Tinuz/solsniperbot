@@ -15,13 +15,15 @@ import {
   paramsKey,
   withinLimits,
 } from './tunable.js'
-import type { Gate, ProbationResult, TuningResult } from './tuner.js'
+import type { EdgeResult, Gate, ProbationResult, TuningResult } from './tuner.js'
 import { type TuningJob, type TuningJobResult, runTuningJob } from './tuning-job.js'
 
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
-/** While settings are on probation they are checked at least this often. */
-const PROBATION_CHECK_MS = HOUR
+/** Probation and the edge are checked at least this often. */
+const CHECK_MS = HOUR
+/** Proof of an edge older than this no longer counts. */
+const EDGE_STALE_MS = 3 * CHECK_MS
 /** A cycle that takes longer than this is abandoned. */
 const WORKER_TIMEOUT_MS = 15 * 60_000
 /** Heap cap for the worker: running out stops the cycle, never the bot. */
@@ -46,7 +48,7 @@ export interface CycleSummary {
   trigger: 'schedule' | 'manual'
   ms: number
   records: number
-  /** `skipped`: no search this cycle (probation or cooldown). */
+  /** `skipped`: no search this cycle (probation, cooldown, or not due yet). */
   decision: TuningResult['decision'] | 'skipped' | 'error'
   reason: string
   changes: ParamChange[]
@@ -70,7 +72,12 @@ interface TuningState {
   rolledBack: { key: string; at: number }[]
   /** Latest proposal that passed every gate (suggest mode). */
   suggestion?: { at: number; changes: ParamChange[]; gates: Gate[]; metrics?: TuningResult['metrics'] }
+  /** Last search, probation verdict or failure (what the report shows). */
   lastRun?: CycleSummary
+  lastProposalAt?: number
+  lastCheckAt?: number
+  /** Whether the settings in effect make money on recent launches. */
+  edge?: EdgeResult
 }
 
 export interface AutoTunerOptions {
@@ -81,20 +88,50 @@ export interface AutoTunerOptions {
   now?: () => number
 }
 
+export interface TradingGate {
+  allowed: boolean
+  reason: string
+}
+
 const describe = (changes: ParamChange[]) => changes.map((c) => `${c.env} ${c.from} → ${c.to}`).join(', ')
 const iso = (t: number) => new Date(t).toISOString().slice(0, 16).replace('T', ' ')
+
+const stateFile = (cfg: Config) => {
+  const adopts = cfg.autotune.mode === 'paper' && cfg.dryRun
+  return join(cfg.dataDir, 'tuning', `state-${adopts ? 'paper' : `${cfg.autotune.mode}-${cfg.dryRun ? 'paper' : 'live'}`}.json`)
+}
+
+/**
+ * The autotuned settings the bot would run with (paper autotune), so offline
+ * tools replay what the bot actually does. Undefined when there are none or
+ * the .env settings changed since.
+ */
+export async function loadTunedParams(cfg: Config): Promise<{ params: TunableParams; changes: ParamChange[] } | undefined> {
+  if (!(cfg.autotune.mode === 'paper' && cfg.dryRun)) return undefined
+  const saved = await readJson<TuningState>(stateFile(cfg)).catch(() => undefined)
+  if (!saved || saved.v !== 1) return undefined
+  const baseline = paramsFromConfig(cfg)
+  if (paramsKey(saved.baseline) !== paramsKey(baseline)) return undefined
+  const changes = diffParams(baseline, saved.active)
+  return changes.length ? { params: saved.active, changes } : undefined
+}
 
 /**
  * Self-tuning, with the brakes on.
  *
- * Every cycle searches recorded launches for nearby filter/exit settings that
- * beat the current ones, and only accepts a candidate that also wins on the
- * most recent launches the search never saw (see `proposeTuning`).
+ * Every cycle searches recorded launches for nearby entry/filter/exit
+ * settings that beat the current ones, and only accepts a candidate that
+ * also wins on the most recent launches the search never saw (see
+ * `proposeTuning`).
  *
  * - `suggest`: report the candidate; a human decides.
  * - `paper` (paper trading only): adopt it, then keep it on probation. If it
  *   does worse than the settings it replaced on launches that arrive after
  *   the adoption, it is rolled back and tuning pauses for a cooldown.
+ *
+ * With REQUIRE_EDGE it is also the bot's permission to trade: buying is only
+ * allowed while the settings in effect make money on recent launches
+ * (`evaluateEdge`). Until then the bot only watches and records.
  *
  * Trade size, reserve, fees and risk limits are never touched. Overrides live
  * in data/tuning and are dropped as soon as the .env settings change.
@@ -105,11 +142,14 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
   private readonly reportPath: string
   private readonly journal: Journal
   private state: TuningState
+  private gate: TradingGate = { allowed: false, reason: 'checking whether the settings make money' }
   private timer?: NodeJS.Timeout
   private worker?: Worker
   private running = false
   private stopped = false
+  private started = false
   private nextRunAt?: number
+  private version = 0
   private readonly now: () => number
 
   constructor(
@@ -122,8 +162,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     this.baseline = paramsFromConfig(cfg)
     this.now = opts.now ?? Date.now
     const dir = join(cfg.dataDir, 'tuning')
-    const name = this.adopts ? 'paper' : `suggest-${cfg.dryRun ? 'paper' : 'live'}`
-    this.path = join(dir, `state-${name}.json`)
+    this.path = stateFile(cfg)
     this.reportPath = join(dir, 'report.md')
     this.journal = new Journal(join(dir, 'history.jsonl'), (err) => log.warn({ err }, 'tuning journal write failed'))
     this.state = this.freshState()
@@ -138,48 +177,79 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     return this.running
   }
 
+  /** Bumped whenever the tuner changes the running settings. */
+  get settingsVersion(): number {
+    return this.version
+  }
+
+  /**
+   * May the bot open a position now? Always yes without REQUIRE_EDGE.
+   * Called on every entry, so it only reads cached state.
+   */
+  tradingGate(): TradingGate {
+    if (!this.cfg.autotune.requireEdge) return { allowed: true, reason: 'edge not required' }
+    if (this.gate.allowed && this.now() - (this.state.edge?.at ?? 0) > EDGE_STALE_MS) {
+      return { allowed: false, reason: 'edge check overdue' }
+    }
+    return this.gate
+  }
+
   /** Restores earlier adoptions (paper mode). Call before trading starts. */
   async load(): Promise<void> {
     const saved = await readJson<TuningState>(this.path)
-    if (!saved || saved.v !== 1) return
-    this.state = { ...this.freshState(), ...saved, rolledBack: saved.rolledBack ?? [] }
-    if (paramsKey(saved.baseline) !== paramsKey(this.baseline)) {
-      // The user changed .env: their settings win, earlier overrides are stale.
-      const dropped = diffParams(saved.baseline, saved.active)
-      this.endProbation('reverted', '.env settings changed')
-      this.state.baseline = this.baseline
-      this.state.active = this.baseline
-      this.state.cooldownUntil = undefined
-      this.state.cooldownReason = undefined
-      if (dropped.length) {
-        this.log.warn({ dropped: describe(dropped) }, 'autotune: .env settings changed since the last adoption, tuned overrides dropped')
-        void this.journal.append({ type: 'reset', at: this.now(), reason: '.env settings changed', dropped })
+    if (saved && saved.v === 1) {
+      this.state = { ...this.freshState(), ...saved, rolledBack: saved.rolledBack ?? [] }
+      if (paramsKey(saved.baseline) !== paramsKey(this.baseline)) {
+        // The user changed .env: their settings win, earlier overrides are stale.
+        const dropped = diffParams(saved.baseline, saved.active)
+        this.endProbation('reverted', '.env settings changed')
+        this.state.baseline = this.baseline
+        this.state.active = this.baseline
+        this.state.cooldownUntil = undefined
+        this.state.cooldownReason = undefined
+        if (dropped.length) {
+          this.log.warn({ dropped: describe(dropped) }, 'autotune: .env settings changed since the last adoption, tuned overrides dropped')
+          void this.journal.append({ type: 'reset', at: this.now(), reason: '.env settings changed', dropped })
+        }
+        await this.persist()
+      } else {
+        const overrides = diffParams(this.baseline, this.state.active)
+        if (overrides.length) {
+          this.setActive(this.state.active)
+          this.log.info({ overrides: describe(overrides) }, 'autotune: tuned settings restored')
+        }
       }
-      await this.persist()
-      return
     }
-    const overrides = diffParams(this.baseline, this.state.active)
-    if (overrides.length) {
-      applyParams(this.cfg, this.state.active)
-      this.log.info({ overrides: describe(overrides) }, 'autotune: tuned settings restored')
+    this.refreshGate(false)
+    if (this.cfg.autotune.requireEdge) {
+      const g = this.tradingGate()
+      this.log.info({ allowed: g.allowed, reason: g.reason }, g.allowed ? 'edge proven: trading enabled' : 'no proven edge yet: watching and recording only')
     }
   }
 
   start(): void {
     this.stopped = false
+    this.started = true
     const interval = this.intervalMs()
-    const last = this.state.lastRun?.at
+    const last = this.state.lastCheckAt ?? this.state.lastRun?.at
     const startDelay = this.opts.startDelayMs ?? 60_000
     const due = last === undefined ? startDelay : last + interval - this.now()
     this.schedule(Math.min(interval, Math.max(startDelay, due)))
     this.log.info(
-      { mode: this.cfg.autotune.mode, adopts: this.adopts, everyHours: this.cfg.autotune.intervalMs / HOUR, firstRunInSec: Math.round((this.nextRunAt! - this.now()) / 1000) },
+      {
+        mode: this.cfg.autotune.mode,
+        adopts: this.adopts,
+        requireEdge: this.cfg.autotune.requireEdge,
+        everyHours: this.cfg.autotune.intervalMs / HOUR,
+        firstRunInSec: Math.round((this.nextRunAt! - this.now()) / 1000),
+      },
       'autotune scheduled',
     )
   }
 
   async stop(): Promise<void> {
     this.stopped = true
+    this.started = false
     clearTimeout(this.timer)
     this.timer = undefined
     await this.worker?.terminate()
@@ -187,8 +257,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
   }
 
   /**
-   * One cycle: check the probation of the last adoption, then (if nothing is
-   * on probation or cooling down) look for better settings.
+   * One cycle: check the probation of the last adoption, look for better
+   * settings when a search is due (and nothing is on probation or cooling
+   * down), and check whether the settings in effect make money.
    */
   async run(trigger: CycleSummary['trigger'] = 'manual'): Promise<CycleSummary> {
     if (this.running) throw new Error('a tuning cycle is already running')
@@ -199,6 +270,10 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const current = paramsFromConfig(this.cfg)
     const probationAdoption = this.adopts && st.probation ? this.adoption(st.probation.adoptionId) : undefined
     const coolingDown = (st.cooldownUntil ?? 0) > at
+    // Hourly checks are cheap; the search itself runs every AUTOTUNE_INTERVAL_HOURS,
+    // or with every check while data is still short (then it returns at once).
+    const searchDue =
+      trigger === 'manual' || st.lastRun?.decision === 'insufficient-data' || at - (st.lastProposalAt ?? 0) >= o.intervalMs - 60_000
     const job: TuningJob = {
       cfg: { ...this.cfg, privateKey: undefined, keypairPath: undefined },
       current,
@@ -213,22 +288,25 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
         maxChanges: o.maxChanges,
         exclude: this.recentRollbacks(at).map((r) => r.key),
       },
-      propose: !probationAdoption && !coolingDown,
+      propose: o.mode !== 'off' && !probationAdoption && !coolingDown && searchDue,
       probation: probationAdoption && st.probation
         ? { adopted: probationAdoption.to, previous: probationAdoption.from, since: st.probation.since, neededTrades: st.probation.neededTrades }
         : undefined,
+      edge: o.requireEdge,
       now: at,
     }
 
     let summary: CycleSummary
+    let res: TuningJobResult | undefined
     try {
       // Nothing to check and nothing to search: skip loading the data.
-      const res = job.propose || job.probation ? await this.execute(job) : { records: 0, ms: 0 }
+      res = job.propose || job.probation || job.edge ? await this.execute(job) : { records: 0, ms: 0 }
       if (this.stopped) throw new Error('stopped')
       if (paramsKey(paramsFromConfig(this.cfg)) !== paramsKey(current)) {
         summary = { at, trigger, ms: res.ms, records: res.records, decision: 'skipped', reason: 'settings changed while tuning; result discarded', changes: [], gates: [] }
+        res = undefined
       } else {
-        summary = this.apply(res, job, trigger)
+        summary = this.apply(res, job, trigger, coolingDown)
       }
     } catch (err) {
       const message = (err as Error).message
@@ -241,17 +319,38 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       this.running = false
     }
 
-    st.lastRun = summary
+    st.lastCheckAt = at
+    if (res) {
+      // The edge result that belongs to the settings now in effect (they may
+      // have just changed through an adoption or a rollback).
+      const activeKey = paramsKey(paramsFromConfig(this.cfg))
+      const edge = [res.edge, res.candidateEdge, res.previousEdge].find((e) => e?.settingsKey === activeKey)
+      if (edge) st.edge = edge
+    }
+    this.refreshGate(true)
+
+    // Routine checks (probation pending, cooldown, search not due) are
+    // visible on the dashboard; the report keeps the last real decision.
+    const meaningful = summary.decision !== 'skipped' || (summary.probation && summary.probation.status !== 'pending')
+    if (meaningful) st.lastRun = summary
     this.log.info(
-      { trigger, decision: summary.decision, reason: summary.reason, records: summary.records, ms: Math.round(summary.ms), changes: describe(summary.changes) || undefined },
+      {
+        trigger,
+        decision: summary.decision,
+        reason: summary.reason,
+        records: summary.records,
+        ms: Math.round(summary.ms),
+        changes: describe(summary.changes) || undefined,
+        edge: o.requireEdge ? this.tradingGate().reason : undefined,
+      },
       'autotune cycle',
     )
     await this.persist()
-    // Keep the report on the last real decision; routine skips (probation
-    // pending, cooldown) are visible on the dashboard.
-    const verdict = summary.probation && summary.probation.status !== 'pending'
-    if (summary.decision !== 'skipped' || verdict) await this.writeReport(summary)
+    if (meaningful) await this.writeReport(summary)
     if (!this.stopped && this.timer === undefined && trigger === 'schedule') this.schedule(this.intervalMs())
+    // Settings changed without a matching edge check: check them soon (not
+    // after a failed cycle, which would retry in a tight loop).
+    if (res && o.requireEdge && st.edge?.settingsKey !== paramsKey(paramsFromConfig(this.cfg))) this.checkSoon()
     return summary
   }
 
@@ -262,13 +361,15 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const undone = diffParams(this.state.active, this.baseline)
     if (!undone.length && !this.state.probation) return []
     this.endProbation('reverted', 'reverted by hand')
-    applyParams(this.cfg, this.baseline)
-    this.state.active = this.baseline
+    this.setActive(this.baseline)
     this.startCooldown('reverted by hand')
     void this.journal.append({ type: 'revert', at: this.now(), undone })
     this.log.warn({ undone: describe(undone) || 'nothing' }, 'autotune: reverted to .env settings')
     if (undone.length) this.notice('warn', `autotune: back to .env settings (${describe(undone)})`)
+    // The .env settings need their own proof before the bot trades on them.
+    this.refreshGate(true)
     await this.persist()
+    this.checkSoon()
     return undone
   }
 
@@ -277,12 +378,24 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const o = this.cfg.autotune
     const probationAdoption = st.probation ? this.adoption(st.probation.adoptionId) : undefined
     const at = this.now()
+    const gate = this.tradingGate()
+    const edge = st.edge && st.edge.settingsKey === paramsKey(paramsFromConfig(this.cfg)) ? st.edge : undefined
     return {
       mode: o.mode,
       adopts: this.adopts,
       running: this.running,
       intervalHours: o.intervalMs / HOUR,
       nextRunAt: this.nextRunAt ?? null,
+      lastCheckAt: st.lastCheckAt ?? null,
+      edge: {
+        required: o.requireEdge,
+        allowed: gate.allowed,
+        reason: gate.reason,
+        status: edge?.status ?? 'unknown',
+        at: edge?.at ?? null,
+        recent: edge?.recent ?? null,
+        gates: edge?.gates ?? [],
+      },
       overrides: this.adopts ? diffParams(this.baseline, paramsFromConfig(this.cfg)) : [],
       probation:
         st.probation && probationAdoption
@@ -322,7 +435,8 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
   private intervalMs(): number {
     const o = this.cfg.autotune
-    return this.adopts && this.state.probation ? Math.min(o.intervalMs, PROBATION_CHECK_MS) : o.intervalMs
+    const frequent = o.requireEdge || (this.adopts && this.state.probation)
+    return frequent ? Math.min(o.intervalMs, CHECK_MS) : o.intervalMs
   }
 
   private schedule(ms: number): void {
@@ -339,6 +453,33 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     this.timer.unref()
   }
 
+  /** Runs a check shortly, e.g. after the settings changed. */
+  private checkSoon(): void {
+    if (this.started && !this.stopped) this.schedule(5_000)
+  }
+
+  /**
+   * Recomputes the cached trading permission from the last edge check. It
+   * only counts for the exact settings that were checked.
+   */
+  private refreshGate(announce: boolean): void {
+    const prev = this.gate
+    const e = this.state.edge
+    const key = paramsKey(paramsFromConfig(this.cfg))
+    this.gate = !e || e.settingsKey !== key
+      ? { allowed: false, reason: 'checking whether the settings in effect make money' }
+      : { allowed: e.status === 'proven', reason: e.reason }
+    if (!announce || !this.cfg.autotune.requireEdge || prev.allowed === this.gate.allowed) return
+    void this.journal.append({ type: 'edge', at: this.now(), allowed: this.gate.allowed, reason: this.gate.reason })
+    if (this.gate.allowed) {
+      this.notice('info', `edge proven, trading enabled: ${this.gate.reason}`)
+      this.log.warn({ reason: this.gate.reason }, 'edge proven: trading enabled')
+    } else {
+      this.notice('warn', `buying paused, still recording: ${this.gate.reason}`)
+      this.log.warn({ reason: this.gate.reason }, 'no proven edge: buying paused')
+    }
+  }
+
   /** Settings that failed probation within the data window are not tried again. */
   private recentRollbacks(at: number): TuningState['rolledBack'] {
     return this.state.rolledBack.filter((r) => r.at > at - this.cfg.autotune.days * DAY)
@@ -349,7 +490,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
   }
 
   /** Acts on a finished job: probation verdict first, then the proposal. */
-  private apply(res: TuningJobResult, job: TuningJob, trigger: CycleSummary['trigger']): CycleSummary {
+  private apply(res: TuningJobResult, job: TuningJob, trigger: CycleSummary['trigger'], coolingDown: boolean): CycleSummary {
     const st = this.state
     const at = job.now
     const base = { at, trigger, ms: res.ms, records: res.records }
@@ -364,8 +505,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
         this.notice('info', `autotune: keeping ${describe(adoption.changes)} (${pr.detail})`)
       } else if (pr.status === 'failed') {
         this.endProbation('rolled-back', pr.detail)
-        applyParams(this.cfg, adoption.from)
-        st.active = adoption.from
+        this.setActive(adoption.from)
         st.rolledBack = [...this.recentRollbacks(at), { key: paramsKey(adoption.to), at }]
         this.startCooldown(`rolled back ${describe(adoption.changes)}`)
         void this.journal.append({ type: 'rollback', at, adoption: adoption.id, changes: adoption.changes, probation: pr })
@@ -376,8 +516,16 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
     const p = res.proposal
     if (!p) {
-      return { ...base, decision: 'skipped', reason: `cooling down until ${iso(st.cooldownUntil ?? at)} (${st.cooldownReason ?? ''})`, changes: [], gates: [] }
+      const o = this.cfg.autotune
+      const reason =
+        o.mode === 'off'
+          ? 'autotune off: edge check only'
+          : coolingDown
+            ? `cooling down until ${iso(st.cooldownUntil ?? at)} (${st.cooldownReason ?? ''})`
+            : `next search after ${iso((st.lastProposalAt ?? at) + o.intervalMs)}`
+      return { ...base, decision: 'skipped', reason, changes: [], gates: [] }
     }
+    st.lastProposalAt = at
     const out: CycleSummary = { ...base, decision: p.decision, reason: p.reason, changes: p.changes, gates: p.gates, data: p.data, metrics: p.metrics }
     void this.journal.append({ type: 'cycle', mode: this.cfg.autotune.mode, ...out })
 
@@ -422,8 +570,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       },
       status: 'probation',
     }
-    applyParams(this.cfg, p.candidate)
-    st.active = p.candidate
+    this.setActive(p.candidate)
     st.adoptions = [...st.adoptions, adoption].slice(-MAX_ADOPTIONS_KEPT)
     st.probation = { adoptionId: adoption.id, since: at, neededTrades: this.cfg.autotune.probationTrades }
     void this.journal.append({ type: 'adopt', at, adoption: adoption.id, changes: p.changes, test: adoption.test })
@@ -435,6 +582,13 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     // Probation is checked more often than regular cycles.
     if (this.timer) this.schedule(this.intervalMs())
     return out
+  }
+
+  /** Puts `p` into effect on the running bot. */
+  private setActive(p: TunableParams): void {
+    applyParams(this.cfg, p)
+    this.state.active = p
+    this.version++
   }
 
   private endProbation(status: Adoption['status'], detail: string): void {
@@ -506,11 +660,12 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       '',
       `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.adopts ? ' (adopts automatically, paper only)' : ' (proposes only)'}.`,
       '',
-      `## Decision: ${s.decision.toUpperCase()}`,
-      '',
-      s.reason,
-      '',
     ]
+    if (this.cfg.autotune.requireEdge) {
+      const g = this.tradingGate()
+      lines.push(`**Trading: ${g.allowed ? 'enabled' : 'paused, recording only'}.** ${g.reason}.`, '')
+    }
+    lines.push(`## Decision: ${s.decision.toUpperCase()}`, '', s.reason, '')
     if (s.data) {
       lines.push(`Data: ${s.data.launches} launches over ${s.data.hours.toFixed(1)}h; searched on the oldest ${s.data.trainLaunches}, validated on the newest ${s.data.testLaunches}.`, '')
     }
