@@ -5,17 +5,21 @@ import type { Launch, MintState } from '../feed/market.js'
 
 export type MomentumDecision = { action: 'wait' } | { action: 'buy'; reason: string } | { action: 'reject'; reason: string }
 
-export interface MomentumMetrics {
+/** Everything the momentum rule looks at. Built from live state or from recorded launches. */
+export interface MomentumSnapshot {
   ageMs: number
+  /** Distinct buyers, the dev excluded. */
   buyers: number
+  /** Organic buys (the create transaction's own buy excluded) minus sells, lamports. */
   netBuyLamports: bigint
   sellRatio: number
   mcapLamports: bigint
+  devSold: boolean
+  complete: boolean
 }
 
-export function momentumMetrics(state: MintState, launch: Launch, now: number): MomentumMetrics {
+export function momentumSnapshot(state: MintState, launch: Launch, now: number): MomentumSnapshot {
   const buyers = state.devStr && state.buyers.has(state.devStr) ? state.buyers.size - 1 : state.buyers.size
-  // Volume excludes the create transaction's own buy, which is not organic demand.
   const organicBuys = state.buyVolume - launch.devBuyLamports
   return {
     ageMs: now - launch.detectedAtWall,
@@ -23,6 +27,8 @@ export function momentumMetrics(state: MintState, launch: Launch, now: number): 
     netBuyLamports: organicBuys - state.sellVolume,
     sellRatio: organicBuys > 0n ? Number(state.sellVolume) / Number(organicBuys) : 0,
     mcapLamports: marketCapLamports(state.curve),
+    devSold: state.devSold,
+    complete: state.complete,
   }
 }
 
@@ -31,16 +37,9 @@ export function momentumMetrics(state: MintState, launch: Launch, now: number): 
  * up, the dev has not dumped, and price has not already run past the cap.
  * Trades off a slightly worse entry for far fewer instant rugs.
  */
-export function decideMomentum(
-  state: MintState,
-  launch: Launch,
-  m: Config['momentum'],
-  maxEntryMcapLamports: bigint,
-  now = Date.now(),
-): MomentumDecision {
-  const x = momentumMetrics(state, launch, now)
-  if (state.devSold) return { action: 'reject', reason: 'dev sold during momentum window' }
-  if (state.complete) return { action: 'reject', reason: 'curve completed' }
+export function decideMomentum(x: MomentumSnapshot, m: Config['momentum'], maxEntryMcapLamports: bigint): MomentumDecision {
+  if (x.devSold) return { action: 'reject', reason: 'dev sold during momentum window' }
+  if (x.complete) return { action: 'reject', reason: 'curve completed' }
   if (maxEntryMcapLamports > 0n && x.mcapLamports > maxEntryMcapLamports) {
     return { action: 'reject', reason: `mcap ${lamportsToSol(x.mcapLamports).toFixed(1)} SOL ran past max` }
   }

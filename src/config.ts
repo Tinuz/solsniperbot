@@ -141,6 +141,21 @@ const schema = z.object({
   SELL_RETRIES: num(3, { min: 0, max: 20, int: true }),
   CLOSE_TOKEN_ACCOUNT: bool(true),
 
+  // Survival
+  PAPER_START_SOL: num(1, { min: 0.001, max: 1_000_000 }),
+  PAPER_RESET: bool(false),
+  SIZING: z.enum(['fixed', 'fraction']).default('fixed'),
+  BUY_FRACTION_PCT: num(5, { min: 0.1, max: 100 }),
+  MIN_BUY_SOL: num(0.02, { min: 0.0001, max: 1000 }),
+  MAX_FEE_DRAG_PCT: num(10, { min: 0.1, max: 100 }),
+  DEFENSIVE_DRAWDOWN_PCT: num(30, { min: 0, max: 100 }),
+  SURVIVAL_SHUTDOWN: bool(true),
+
+  // Learning data
+  RECORD_LAUNCHES: bool(true),
+  RECORD_HORIZON_MIN: num(15, { min: 0.001, max: 240 }),
+  RECORD_MAX_TRADES: num(800, { min: 10, max: 100_000, int: true }),
+
   // Risk
   MAX_OPEN_POSITIONS: num(3, { min: 1, int: true }),
   MAX_BUYS_PER_MINUTE: num(6, { min: 1, int: true }),
@@ -245,6 +260,21 @@ export interface Config {
     minReserveLamports: bigint
   }
 
+  survival: {
+    paperStartLamports: bigint
+    paperReset: boolean
+    /** `fixed`: BUY_SOL per trade. `fraction`: BUY_FRACTION_PCT of free balance, capped at BUY_SOL. */
+    sizing: 'fixed' | 'fraction'
+    buyFractionPct: number
+    minBuyLamports: bigint
+    /** Refuse trades whose round-trip network cost exceeds this share of the trade size. */
+    maxFeeDragPct: number
+    defensiveDrawdownPct: number
+    shutdown: boolean
+  }
+
+  recorder: { enabled: boolean; horizonMs: number; maxTrades: number }
+
   api: { host: string; port: number; token?: string }
   dataDir: string
   logLevel: Env['LOG_LEVEL']
@@ -286,6 +316,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.MOMENTUM_MAX_AGE_MS <= e.MOMENTUM_MIN_AGE_MS) {
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
+  if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
   if (!e.DRY_RUN && !e.PRIVATE_KEY && !e.KEYPAIR_PATH) {
     throw new Error('Live trading (DRY_RUN=false) requires PRIVATE_KEY or KEYPAIR_PATH')
   }
@@ -370,6 +401,23 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxBuysPerMinute: e.MAX_BUYS_PER_MINUTE,
       dailyLossLimitLamports: solToLamports(e.DAILY_LOSS_LIMIT_SOL),
       minReserveLamports: solToLamports(e.MIN_SOL_RESERVE),
+    },
+
+    survival: {
+      paperStartLamports: solToLamports(e.PAPER_START_SOL),
+      paperReset: e.PAPER_RESET,
+      sizing: e.SIZING,
+      buyFractionPct: e.BUY_FRACTION_PCT,
+      minBuyLamports: solToLamports(e.MIN_BUY_SOL),
+      maxFeeDragPct: e.MAX_FEE_DRAG_PCT,
+      defensiveDrawdownPct: e.DEFENSIVE_DRAWDOWN_PCT,
+      shutdown: e.SURVIVAL_SHUTDOWN,
+    },
+
+    recorder: {
+      enabled: e.RECORD_LAUNCHES,
+      horizonMs: Math.round(e.RECORD_HORIZON_MIN * 60_000),
+      maxTrades: e.RECORD_MAX_TRADES,
     },
 
     api: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN },

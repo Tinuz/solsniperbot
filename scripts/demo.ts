@@ -41,6 +41,7 @@ const cfg = loadConfig({
 const log = createLogger(cfg.logLevel)
 const engine = new Engine(cfg, undefined, log)
 const api = new ApiServer(engine, log)
+engine.on('dead', (v) => log.fatal({ reason: v.reason }, 'DEMO: the bot ran out of paper money and stopped trading (PAPER_RESET=true starts over)'))
 await engine.start()
 const url = await api.start()
 log.info({ url }, 'DEMO MODE: simulated chain, simulated coins, paper trades only')

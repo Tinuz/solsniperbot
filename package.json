@@ -18,7 +18,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo": "tsx scripts/demo.ts"
+    "demo": "tsx scripts/demo.ts",
+    "analyze": "tsx scripts/analyze.ts",
+    "backtest": "tsx scripts/backtest.ts"
   },
   "dependencies": {
     "@pump-fun/pump-swap-sdk": "^1.20.0",

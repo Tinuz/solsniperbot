@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { ApiServer } from '../src/api/server.js'
 import { loadConfig } from '../src/config.js'
 import { Engine, type EngineEvent } from '../src/engine.js'
+import type { LaunchRecord } from '../src/learning/record.js'
+import { DeadError } from '../src/strategy/survival.js'
 import { PUMP_PROGRAM_ID } from '../src/pump/constants.js'
 import { positionPnl } from '../src/trading/positions.js'
 import { MockChain } from './mock-chain.js'
@@ -189,6 +191,73 @@ describe('live trading end to end (mock chain, Jito landing)', () => {
     expect(failed.costLamports).toBe(0n)
     expect(positionPnl(failed) < 0n && positionPnl(failed) > -2_000_000n).toBe(true)
   })
+})
+
+describe('survival', () => {
+  it('shuts itself down when it can no longer fund a viable trade, and stays down on restart', async () => {
+    const { chain, engine, dataDir } = await boot({ PAPER_START_SOL: '0.056', BUY_SOL: '0.05', MAX_HOLD_SECONDS: '1' })
+    const deaths: string[] = []
+    engine.on('dead', (v) => deaths.push(v.reason))
+
+    // Only 0.03 SOL is affordable after the exit reserve and upfront costs, so the buy shrinks.
+    const { mint } = chain.launch({ symbol: 'LAST', devBuyLamports: 300_000_000n })
+    const pos = await waitFor(() => engine.positions.get(mint.toBase58())?.status === 'open' && engine.positions.get(mint.toBase58()), 5_000, 'buy')
+    expect(pos.costLamports <= 30_000_000n && pos.costLamports > 29_000_000n).toBe(true)
+
+    // Max hold closes it; fees leave the wallet below what a viable trade needs.
+    await waitFor(() => deaths.length > 0, 15_000, 'death')
+    expect(deaths[0]).toMatch(/insufficient funds to trade/)
+    expect(engine.status().survival.state).toBe('dead')
+
+    // New launches are no longer bought.
+    const { mint: next } = chain.launch({ symbol: 'NOPE' })
+    await waitFor(() => engine.recentLaunches().find((l) => l.mint === next.toBase58() && l.verdict === 'skipped'), 3_000, 'skip')
+
+    // A restart refuses to run while the (paper) wallet is still insufficient.
+    await engine.stop()
+    const again = new Engine(loadConfig({ RPC_URL: engine.cfg.rpcUrl, WS_URL: engine.cfg.wsUrl, DATA_DIR: dataDir, PAPER_START_SOL: '0.056', BUY_SOL: '0.05' }), undefined, log)
+    await expect(again.start()).rejects.toBeInstanceOf(DeadError)
+    await again.stop()
+  }, 30_000)
+})
+
+describe('launch recording', () => {
+  it('records rejected and traded launches with their trade paths and results', async () => {
+    const { chain, engine, dataDir } = await boot({ NAME_BLOCKLIST: 'skip', RECORD_HORIZON_MIN: '0.04', MAX_HOLD_SECONDS: '1' })
+    const { mint: rejected, dev } = chain.launch({ name: 'Skip Me', symbol: 'SKIP', devBuyLamports: 200_000_000n })
+    const { mint: bought } = chain.launch({ name: 'Take Me', symbol: 'TAKE', devBuyLamports: 400_000_000n })
+    await waitFor(() => engine.positions.get(bought.toBase58())?.status === 'open', 5_000, 'buy')
+    chain.trade(rejected, { buyLamports: 1_000_000_000n })
+    chain.trade(rejected, { user: dev, sellTokens: 1_000_000_000_000n })
+    chain.trade(bought, { buyLamports: 500_000_000n })
+
+    const records = await waitFor(() => {
+      const dir = join(dataDir, 'launches')
+      let files: string[] = []
+      try {
+        files = readdirSync(dir)
+      } catch {
+        return undefined
+      }
+      const rows = files.flatMap((f) => readFileSync(join(dir, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as LaunchRecord))
+      return rows.length >= 2 ? rows : undefined
+    }, 10_000, 'records')
+
+    const r = records.find((x) => x.mint === rejected.toBase58())!
+    expect(r.verdict).toBe('rejected')
+    expect(r.reason).toBe('name blocklisted')
+    expect(r.trades).toHaveLength(2)
+    expect(r.trades[1]![5]).toBe(0) // the dev's wallet index
+    expect(r.summary.devSold).toBe(true)
+    expect(r.summary.maxMultiple).toBeGreaterThan(1)
+    expect(r.devBuyLamports).toBeGreaterThan(190_000_000)
+
+    const b = records.find((x) => x.mint === bought.toBase58())!
+    expect(b.verdict).toBe('buying')
+    expect(b.position?.paper).toBe(true)
+    expect(b.position?.exits).toEqual(['max hold time'])
+    expect(b.trades.length).toBeGreaterThanOrEqual(1)
+  }, 20_000)
 })
 
 describe('control API', () => {
