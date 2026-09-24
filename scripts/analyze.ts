@@ -12,11 +12,13 @@
 import { config as loadDotenv } from 'dotenv'
 import { type Config, loadConfig, solToLamports } from '../src/config.js'
 import type { Launch } from '../src/feed/market.js'
+import { loadTunedParams } from '../src/learning/autotune.js'
 import { launchFromRecord, loadRecords, splitByTime } from '../src/learning/dataset.js'
 import type { LaunchRecord } from '../src/learning/record.js'
 import { type ReplayResult, replayConfigFrom, replayLaunch, summarizeResults } from '../src/learning/replay.js'
 import {
   FEATURE_LABELS,
+  LOOKAHEAD_SECONDS,
   SUMMARY_HEADERS,
   features,
   num,
@@ -28,11 +30,15 @@ import {
   table,
   writeReport,
 } from '../src/learning/report.js'
+import { applyParams, paramsFromConfig, settingsFingerprint } from '../src/learning/tunable.js'
 import { type FilterContext, staticFilter } from '../src/strategy/filters.js'
 
 loadDotenv({ quiet: true })
 const args = parseArgs()
 const cfg = loadConfig({ RPC_URL: 'http://127.0.0.1:8899', ...process.env })
+// Replay what the bot actually runs with, autotuned settings included.
+const tuned = await loadTunedParams(cfg)
+if (tuned) applyParams(cfg, tuned.params)
 const minTrades = Number(args['min-trades'] ?? 20)
 const records = await loadRecords(cfg.dataDir, { days: args.days ? Number(args.days) : undefined })
 
@@ -49,7 +55,7 @@ interface Row {
   reason: string
   /** The current strategy (filters aside): entry mode + exits. */
   now: ReplayResult
-  /** Instant entry, for judging filters on every launch. */
+  /** Instant entry, for describing every launch by its features. */
   ifBought: ReplayResult
   f: Record<string, number>
 }
@@ -82,6 +88,7 @@ say(`# Launch analysis — ${new Date().toISOString().slice(0, 16)} UTC`)
 say()
 say(`${records.length.toLocaleString()} launches over ${span.toFixed(1)} hours (${new Date(records[0]!.t).toISOString().slice(0, 16)} → ${new Date(records[records.length - 1]!.t).toISOString().slice(0, 16)} UTC).`)
 say(`Replayed with the current settings: ${cfg.entryMode} entry, ${(Number(cfg.buyLamports) / 1e9).toFixed(3)} SOL per trade, ${cfg.paperLatencyMs} ms latency.`)
+if (tuned) say(`Includes the autotuned settings in data/tuning: ${tuned.changes.map((c) => `${c.env}=${c.to}`).join(', ')}.`)
 if (records.length < 500 || traded.length < 50) {
   say()
   say(`> **Small sample.** ${traded.length} simulated trades is too few to trust; treat everything below as anecdotes until there are a few days of data.`)
@@ -116,24 +123,37 @@ if (cutOff > traded.length * 0.1) {
 }
 
 // Calibration ------------------------------------------------------------------
-const actual = rows.filter((r) => r.rec.position && r.now.entered && r.rec.position.exits.length && !r.rec.position.exits[0]!.startsWith('buy failed'))
-if (actual.length) {
-  const diffs = actual.map((r) => r.now.pnlLamports - r.rec.position!.pnlLamports)
-  const meanDiff = diffs.reduce((a, b) => a + b, 0) / diffs.length
-  const botTotal = actual.reduce((a, r) => a + r.rec.position!.pnlLamports, 0)
+// Only launches the bot traded with these same settings are comparable: with
+// another entry mode or other exits the replay trades differently by design.
+const fingerprint = settingsFingerprint(paramsFromConfig(cfg))
+const legacyEntry = (rec: LaunchRecord) =>
+  rec.reason === 'instant snipe' ? 'instant' : /buyers, .* net in/.test(rec.reason) ? 'momentum' : undefined
+const sameSettings = (rec: LaunchRecord) => (rec.settings ? rec.settings === fingerprint : legacyEntry(rec) === cfg.entryMode)
+const botTraded = rows.filter((r) => r.rec.position && r.rec.position.exits.length && !r.rec.position.exits[0]!.startsWith('buy failed'))
+const actual = botTraded.filter((r) => r.now.entered && sameSettings(r.rec))
+if (botTraded.length) {
   say('### Replay vs. what the bot actually did')
   say()
-  say(`${actual.length} launches were traded by the bot and replayed. Bot total ${sol(botTotal)} SOL; replay differs by ${sol(meanDiff)} SOL per trade on average.`)
-  say('A large gap means the replay is optimistic or pessimistic (latency, slippage, fees); weigh its suggestions accordingly.')
+  if (actual.length) {
+    const diffs = actual.map((r) => r.now.pnlLamports - r.rec.position!.pnlLamports)
+    const meanDiff = diffs.reduce((a, b) => a + b, 0) / diffs.length
+    const botTotal = actual.reduce((a, r) => a + r.rec.position!.pnlLamports, 0)
+    say(`${actual.length} launches were traded by the bot with these settings and replayed. Bot total ${sol(botTotal)} SOL; replay differs by ${sol(meanDiff)} SOL per trade on average.`)
+    say('A large gap means the replay is optimistic or pessimistic (latency, slippage, fees); weigh its suggestions accordingly.')
+    const other = botTraded.length - actual.length
+    if (other) say(`${other} other trades were made with different settings${actual.some((r) => !r.rec.settings) ? ' (older recordings only tell the entry mode)' : ''} and are left out.`)
+  } else {
+    say(`The bot traded ${botTraded.length} of these launches, but with different settings than this replay (for example another entry mode), so there is nothing to compare.`)
+  }
   say()
 }
 
 // Filters --------------------------------------------------------------------
 say('## Filter audit: would the rejected launches have made money?')
 say()
-say('Each rejected launch is replayed as if bought instantly. A filter earns its keep when its rejects do worse than what passes.')
+say(`Each rejected launch is replayed with the current entry (${cfg.entryMode}) and exits, as if the filter weren't there. A filter earns its keep when its rejects do worse than what passes.`)
 say()
-const passedInstant = summarizeResults(rows.filter((r) => r.pass).map((r) => r.ifBought))
+const passedNow = summarizeResults(rows.filter((r) => r.pass).map((r) => r.now))
 const groups = new Map<string, Row[]>()
 for (const r of rows) {
   if (r.pass) continue
@@ -141,15 +161,15 @@ for (const r of rows) {
   groups.set(key, [...(groups.get(key) ?? []), r])
 }
 say(table(
-  ['Rejected because', 'Launches', 'Would-be win rate', 'Mean', 'Total SOL', 'Verdict'],
+  ['Rejected because', 'Launches', 'Would-be trades', 'Win rate', 'Mean', 'Total SOL', 'Verdict'],
   [
-    ['*(passed the filters)*', rows.filter((r) => r.pass).length, `${Math.round(passedInstant.winRate * 100)}%`, pct(passedInstant.meanPnlPct), sol(passedInstant.totalPnlLamports), ''],
+    ['*(passed the filters)*', rows.filter((r) => r.pass).length, passedNow.trades, passedNow.trades ? `${Math.round(passedNow.winRate * 100)}%` : '–', passedNow.trades ? pct(passedNow.meanPnlPct) : '–', sol(passedNow.totalPnlLamports), ''],
     ...[...groups]
       .sort((a, b) => b[1].length - a[1].length)
       .map(([reason, g]) => {
-        const s = summarizeResults(g.map((r) => r.ifBought))
-        const helps = s.trades === 0 || s.meanPnlPct <= passedInstant.meanPnlPct
-        return [reason, g.length, s.trades ? `${Math.round(s.winRate * 100)}%` : '–', s.trades ? pct(s.meanPnlPct) : '–', sol(s.totalPnlLamports), helps ? 'helps' : '**costs you**']
+        const s = summarizeResults(g.map((r) => r.now))
+        const helps = s.trades === 0 || s.meanPnlPct <= passedNow.meanPnlPct
+        return [reason, g.length, s.trades, s.trades ? `${Math.round(s.winRate * 100)}%` : '–', s.trades ? pct(s.meanPnlPct) : '–', sol(s.totalPnlLamports), helps ? 'helps' : '**costs you**']
       }),
   ],
 ))
@@ -159,6 +179,8 @@ say()
 say('## What separates winners from losers')
 say()
 say('Every launch replayed as an instant buy, split into five equal-sized groups per feature. (Dev supply % and mcap at detection follow directly from the dev buy, so they are not listed separately.)')
+say()
+say('Features marked ⏱ are only known some seconds after launch. They describe which coins turned out well, but an instant buy cannot use them, and waiting for them means paying the later price. `ENTRY_MODE=momentum` is how the bot waits for them; judge it by replaying with it, not by these tables.')
 say()
 for (const [key, label] of Object.entries(FEATURE_LABELS).filter(([k]) => k !== 'devSupplyPct' && k !== 'mcapSol')) {
   const values = rows.map((r) => r.f[key]!)
@@ -175,7 +197,7 @@ for (const [key, label] of Object.entries(FEATURE_LABELS).filter(([k]) => k !== 
     const range = `${Number.isFinite(lo) ? num(lo) : 'min'} – ${Number.isFinite(hi) ? `<${num(hi)}` : 'max'}`
     bucketRows.push([range, inBucket.length, s.trades ? `${Math.round(s.winRate * 100)}%` : '–', s.trades ? pct(s.meanPnlPct) : '–', s.trades ? pct(s.medianPnlPct) : '–'])
   }
-  say(`### ${label}`)
+  say(`### ${label}${LOOKAHEAD_SECONDS[key] ? ` ⏱ known after ${LOOKAHEAD_SECONDS[key]}s` : ''}`)
   say()
   say(table(['Range', 'Launches', 'Win rate', 'Mean', 'Median'], bucketRows))
   say()
@@ -184,7 +206,7 @@ for (const [key, label] of Object.entries(FEATURE_LABELS).filter(([k]) => k !== 
 // Suggestions ----------------------------------------------------------------
 say('## Suggested filter changes')
 say()
-say(`A value is suggested only if, with every other setting unchanged, it beats the current value on the older 70% of the data **and** on the newest 30% it was not tuned on (min ${minTrades} trades).`)
+say(`A value is suggested only if, with every other setting unchanged, it beats the current value on the older 70% of the data **and** makes money on the newest 30% it was not tuned on (min ${minTrades} trades). Losing less only because fewer trades are made is not an improvement worth adopting.`)
 say()
 const q = (key: string, k = 10) => quantileEdges(rows.map((r) => r.f[key]!), k)
 const round = (v: number, d: number) => Math.round(v * 10 ** d) / 10 ** d
@@ -201,6 +223,7 @@ const baseTrain = evaluate(train, cfg.filters)
 const baseTest = evaluate(test, cfg.filters)
 const suggestionRows: (string | number)[][] = []
 const envLines: string[] = []
+let lessBad = 0
 for (const k of knobs) {
   let best: { v: number; train: ReturnType<typeof evaluate> } | undefined
   for (const v of [...new Set(k.candidates)]) {
@@ -213,12 +236,22 @@ for (const k of knobs) {
     continue
   }
   const bestTest = evaluate(test, k.apply(best.v))
-  const robust = bestTest.totalPnlLamports > baseTest.totalPnlLamports && bestTest.trades >= Math.min(minTrades, baseTest.trades)
+  const enough = bestTest.trades >= Math.min(minTrades, baseTest.trades)
+  const better = bestTest.totalPnlLamports > baseTest.totalPnlLamports
+  const robust = enough && better && bestTest.totalPnlLamports > 0
+  const advice = robust
+    ? '**change**'
+    : !enough
+      ? `keep (only ${bestTest.trades} test trades)`
+      : !better
+        ? 'keep (did not hold up on test data)'
+        : 'keep (loses less, still loses)'
+  if (!robust && enough && better) lessBad++
   suggestionRows.push([
     k.env,
     num(k.current),
     num(best.v),
-    robust ? '**change**' : 'keep (did not hold up on test data)',
+    advice,
     `${sol(baseTrain.totalPnlLamports)} → ${sol(best.train.totalPnlLamports)}`,
     `${sol(baseTest.totalPnlLamports)} → ${sol(bestTest.totalPnlLamports)}`,
   ])
@@ -233,7 +266,11 @@ if (envLines.length) {
   for (const l of envLines) say(l)
   say('```')
 } else {
-  say('No filter change beat the current settings on both halves of the data.')
+  say('No filter change makes money on both halves of the data.')
+  if (lessBad) {
+    say()
+    say('Some values lose less, mostly because they trade less. When every filter setting still loses, the problem is the entry or the exits, not the filters: compare `ENTRY_MODE=momentum`, and tune exits with `npm run backtest`.')
+  }
 }
 say()
 say('Tune exits with `npm run backtest`.')

@@ -168,6 +168,7 @@ const schema = z.object({
   AUTOTUNE_MAX_CHANGES: num(3, { min: 1, max: 11, int: true }),
   AUTOTUNE_PROBATION_TRADES: num(30, { min: 1, int: true }),
   AUTOTUNE_COOLDOWN_HOURS: num(24, { min: 0, max: 720 }),
+  REQUIRE_EDGE: z.enum(['auto', 'true', 'false']).default('auto'),
 
   // Risk
   MAX_OPEN_POSITIONS: num(3, { min: 1, int: true }),
@@ -302,6 +303,8 @@ export interface Config {
     maxChanges: number
     probationTrades: number
     cooldownMs: number
+    /** Only buy while the settings in effect make money on recent launches. */
+    requireEdge: boolean
   }
 
   api: { host: string; port: number; token?: string }
@@ -351,6 +354,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
   if (e.AUTOTUNE !== 'off' && e.AUTOTUNE !== 'auto' && !e.RECORD_LAUNCHES) {
     throw new Error('AUTOTUNE needs RECORD_LAUNCHES=true: it learns from recorded launches')
+  }
+  if (e.REQUIRE_EDGE === 'true' && !e.RECORD_LAUNCHES) {
+    throw new Error('REQUIRE_EDGE needs RECORD_LAUNCHES=true: the edge is measured on recorded launches')
   }
   if (!e.DRY_RUN && !e.PRIVATE_KEY && !e.KEYPAIR_PATH) {
     throw new Error('Live trading (DRY_RUN=false) requires PRIVATE_KEY or KEYPAIR_PATH')
@@ -463,6 +469,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxChanges: e.AUTOTUNE_MAX_CHANGES,
       probationTrades: e.AUTOTUNE_PROBATION_TRADES,
       cooldownMs: Math.round(e.AUTOTUNE_COOLDOWN_HOURS * 3_600_000),
+      requireEdge: e.REQUIRE_EDGE === 'auto' ? e.RECORD_LAUNCHES : e.REQUIRE_EDGE === 'true',
     },
 
     recorder: {

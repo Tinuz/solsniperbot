@@ -49,6 +49,8 @@ async function boot(env: Record<string, string>, wallet?: Keypair, withApi = fal
     API_PORT: '0',
     // The mock also plays the Jito block engine.
     JITO_BLOCK_ENGINE_URLS: `http://127.0.0.1:${port}`,
+    // These tests are about trading mechanics; the edge gate has its own test.
+    REQUIRE_EDGE: 'false',
     ...env,
   })
   if (wallet) chain.fund(wallet.publicKey, 10_000_000_000n)
@@ -122,6 +124,18 @@ describe('paper trading end to end', () => {
     for (let i = 0; i < 3; i++) chain.trade(mint, { buyLamports: 500_000_000n })
     await waitFor(() => engine.positions.has(mint.toBase58()), 5_000, 'momentum entry')
     expect(engine.recentLaunches()[0]?.reason).toMatch(/3 buyers/)
+  })
+
+  it('only watches and records until the settings have a proven edge', async () => {
+    const { chain, engine } = await boot({ REQUIRE_EDGE: 'auto', RECORD_HORIZON_MIN: '0.01' })
+    const { mint } = chain.launch({ symbol: 'WAIT', devBuyLamports: 500_000_000n })
+    const view = await waitFor(() => engine.recentLaunches().find((l) => l.mint === mint.toBase58() && l.verdict === 'skipped'), 5_000, 'observed launch')
+    expect(view.reason).toMatch(/^observing: /)
+    expect(engine.positions.has(mint.toBase58())).toBe(false)
+    const tuning = engine.status().tuning as { edge: { required: boolean; allowed: boolean } }
+    expect(tuning.edge).toMatchObject({ required: true, allowed: false })
+    // Still learning: the launch is recorded even though it was not bought.
+    await waitFor(() => (engine.recorder?.stats().written ?? 0) >= 1, 5_000, 'recorded launch')
   })
 })
 
@@ -215,7 +229,7 @@ describe('survival', () => {
 
     // A restart refuses to run while the (paper) wallet is still insufficient.
     await engine.stop()
-    const again = new Engine(loadConfig({ RPC_URL: engine.cfg.rpcUrl, WS_URL: engine.cfg.wsUrl, DATA_DIR: dataDir, PAPER_START_SOL: '0.056', BUY_SOL: '0.05' }), undefined, log)
+    const again = new Engine(loadConfig({ RPC_URL: engine.cfg.rpcUrl, WS_URL: engine.cfg.wsUrl, DATA_DIR: dataDir, PAPER_START_SOL: '0.056', BUY_SOL: '0.05', REQUIRE_EDGE: 'false' }), undefined, log)
     await expect(again.start()).rejects.toBeInstanceOf(DeadError)
     await again.stop()
   }, 30_000)

@@ -54,6 +54,7 @@ export class LaunchRecorder {
       feeBps: { protocol: bigint; creator: bigint }
       tokenOffset: bigint
       initialRealTokenReserves: bigint
+      settings?: string
     },
   ): void {
     if (!launch.isSolPaired || this.active.has(launch.mintStr)) return
@@ -89,6 +90,7 @@ export class LaunchRecorder {
         feeBps: { protocol: num(extra.feeBps.protocol), creator: num(extra.feeBps.creator) },
         verdict: extra.verdict,
         reason: extra.reason,
+        ...(extra.settings ? { settings: extra.settings } : {}),
         trades: [],
         truncated: false,
         graduated: false,

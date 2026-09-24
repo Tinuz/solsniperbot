@@ -46,6 +46,14 @@ export const FEATURE_LABELS: Record<string, string> = {
   sellsFirst10s: 'Sells in first 10s',
 }
 
+/** Features only known this many seconds after detection: an instant buy cannot use them. */
+export const LOOKAHEAD_SECONDS: Record<string, number> = {
+  buyersFirst3s: 3,
+  netSolFirst3s: 3,
+  tradesFirst10s: 10,
+  sellsFirst10s: 10,
+}
+
 /** Quantile bucket edges (unique, ascending) for `k` buckets. */
 export function quantileEdges(values: number[], k: number): number[] {
   const sorted = [...values].sort((a, b) => a - b)

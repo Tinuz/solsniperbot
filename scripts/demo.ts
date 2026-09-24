@@ -37,6 +37,8 @@ const cfg = loadConfig({
   MAX_HOLD_SECONDS: process.env.MAX_HOLD_SECONDS ?? '90',
   STALE_SECONDS: process.env.STALE_SECONDS ?? '20',
   NAME_BLOCKLIST: process.env.NAME_BLOCKLIST ?? 'rug|scam',
+  // The demo shows trading right away; a real bot first proves an edge.
+  REQUIRE_EDGE: process.env.REQUIRE_EDGE ?? 'false',
 })
 const log = createLogger(cfg.logLevel)
 const engine = new Engine(cfg, undefined, log)

@@ -17,8 +17,8 @@ import {
   withParams,
   withinLimits,
 } from '../src/learning/tunable.js'
-import { Evaluator, evaluateProbation, proposeTuning } from '../src/learning/tuner.js'
-import { dataset, pumpThenFade, slowRug, smallPump } from './records.js'
+import { Evaluator, evaluateEdge, evaluateProbation, proposeTuning } from '../src/learning/tuner.js'
+import { dataset, momentumMarket, pumpThenFade, slowRug, smallPump } from './records.js'
 
 const log = pino({ level: 'silent' })
 const START = 1_750_000_000_000
@@ -32,8 +32,11 @@ describe('tunable settings', () => {
   const current = paramsFromConfig(cfg)
 
   it('round-trips through .env: every suggestion can be pasted into .env as is', () => {
-    const candidates = [current, ...neighbors(current).map((n) => n.params).filter((p) => withinLimits(p, current))]
-    expect(candidates.length).toBeGreaterThan(30)
+    const momentum = paramsFromConfig(cfgWith({ ENTRY_MODE: 'momentum' }))
+    const candidates = [current, momentum, ...[current, momentum].flatMap((o) => neighbors(o).map((n) => n.params).filter((p) => withinLimits(p, o)))]
+    expect(candidates.length).toBeGreaterThan(80)
+    expect(candidates.some((p) => p.entryMode === 'momentum' && p.momentumMinBuyers !== momentum.momentumMinBuyers)).toBe(true)
+    expect(candidates.some((p) => p.exitOnDevSell !== current.exitOnDevSell)).toBe(true)
     for (const p of candidates) {
       const parsed = paramsFromConfig(cfgWith(toEnv(p)))
       expect(paramsKey(parsed)).toBe(paramsKey(p))
@@ -57,9 +60,14 @@ describe('tunable settings', () => {
     expect(at({ takeProfit: [{ gainPct: 121, sellPct: 50 }, { gainPct: 150, sellPct: 100 }] })).toBe(false) // more than 2x
     expect(at({ takeProfit: [{ gainPct: 60, sellPct: 50 }, { gainPct: 60, sellPct: 100 }] })).toBe(false) // tiers must rise
     expect(at({ takeProfit: [{ gainPct: 60, sellPct: 10 }, { gainPct: 150, sellPct: 100 }] })).toBe(false) // sells too little
+    expect(at({ momentumMinNetBuySol: 1 })).toBe(true) // 2 → 1: factor 2
+    expect(at({ momentumMinNetBuySol: 0.9 })).toBe(false)
+    expect(at({ momentumMinBuyers: 10 })).toBe(false) // 6 → 10: more than ±3
+    expect(at({ momentumMinAgeMs: 3_000, momentumMaxAgeMs: 3_000 })).toBe(false) // window must stay open
+    expect(at({ entryMode: 'momentum', exitOnDevSell: false })).toBe(true) // switches are single steps
   })
 
-  it('can only reach filters and exits, never trade size, fees or risk limits', () => {
+  it('can only reach entry, filters and exits, never trade size, fees or risk limits', () => {
     for (const { params } of neighbors(current)) {
       const c = withParams(cfg, params)
       expect(c.buyLamports).toBe(cfg.buyLamports)
@@ -67,7 +75,7 @@ describe('tunable settings', () => {
       expect(c.survival).toBe(cfg.survival)
       expect(c.buyTipLamports).toBe(cfg.buyTipLamports)
       expect(c.buySlippageBps).toBe(cfg.buySlippageBps)
-      expect(c.momentum).toBe(cfg.momentum)
+      expect(c.momentum.minAgeMs).toBeLessThan(c.momentum.maxAgeMs)
       expect(c.exits.sellSlippageBps).toBe(cfg.exits.sellSlippageBps)
       expect(c.filters.creatorBlocklist).toBe(cfg.filters.creatorBlocklist)
     }
@@ -117,6 +125,13 @@ describe('proposeTuning', () => {
     expect(failed).toContain('not one lucky trade')
   })
 
+  it('switches to momentum entry when waiting is what wins out of sample', () => {
+    const r = proposeTuning(momentumMarket(600), cfg, current, OPTS, 0)
+    expect(r.decision).toBe('adopt')
+    expect(r.changes.find((c) => c.env === 'ENTRY_MODE')).toMatchObject({ from: 'instant', to: 'momentum' })
+    expect(r.candidate!.entryMode).toBe('momentum')
+  })
+
   it('waits for enough data', () => {
     const r = proposeTuning(dataset(100), cfg, current, OPTS, 0)
     expect(r.decision).toBe('insufficient-data')
@@ -127,6 +142,15 @@ describe('proposeTuning', () => {
 })
 
 describe('Evaluator', () => {
+  it('re-replays when the entry mcap cap changes in momentum mode', () => {
+    // The cap is checked again at the moment of a momentum entry, not only at detection.
+    const cfg = cfgWith()
+    const e = new Evaluator(momentumMarket(200), cfg)
+    const m: TunableParams = { ...paramsFromConfig(cfg), entryMode: 'momentum' }
+    expect(e.summary(m).trades).toBeGreaterThan(20)
+    expect(e.summary({ ...m, maxEntryMcapSol: 34 }).trades).toBe(0)
+  })
+
   it('respects MAX_OPEN_POSITIONS like the live bot', () => {
     const recs = dataset(40, { spacingMs: 5_000, pumpShare: 1 })
     const one = new Evaluator(recs, cfgWith({ MAX_OPEN_POSITIONS: '1' })).summary(paramsFromConfig(cfgWith()))
@@ -162,6 +186,31 @@ describe('evaluateProbation', () => {
     const r = evaluateProbation(after(smallPump, 30), cfg, adopted, previous, since, 20)
     expect(r.status).toBe('failed')
     expect(r.newPnlLamports).toBeLessThan(r.oldPnlLamports)
+  })
+})
+
+describe('evaluateEdge', () => {
+  const cfg = cfgWith()
+  const current = paramsFromConfig(cfg)
+
+  it('needs enough data before anything counts', () => {
+    const e = evaluateEdge(dataset(100), cfg, current, OPTS, 0)
+    expect(e.status).toBe('insufficient-data')
+    expect(e.reason).toMatch(/^collecting data/)
+  })
+
+  it('is not proven when the settings lose on recent launches', () => {
+    const e = evaluateEdge(dataset(600, { pumpShare: 0 }), cfg, current, OPTS, 0)
+    expect(e.status).toBe('unproven')
+    expect(e.gates.find((g) => g.name === 'makes money')?.pass).toBe(false)
+    expect(e.recent!.totalPnlLamports).toBeLessThan(0)
+  })
+
+  it('is proven when the settings make money on recent launches', () => {
+    const e = evaluateEdge(dataset(600), cfg, current, OPTS, 0)
+    expect(e.status).toBe('proven')
+    expect(e.gates.every((g) => g.pass)).toBe(true)
+    expect(e.settingsKey).toBe(paramsKey(current))
   })
 })
 
@@ -250,8 +299,9 @@ describe('AutoTuner', () => {
 
     // Cooling down: no search.
     clock.now += HOUR
-    expect((await b.t.run()).decision).toBe('skipped')
-    expect(b.t.status().last?.reason).toMatch(/cooling down/)
+    const cooling = await b.t.run()
+    expect(cooling.decision).toBe('skipped')
+    expect(cooling.reason).toMatch(/cooling down/)
 
     // After the cooldown it searches again, skipping what just failed.
     clock.now += 24 * HOUR
@@ -319,6 +369,83 @@ describe('AutoTuner', () => {
     expect(all.at(-1)!.t - sample.at(-1)!.t).toBeLessThanOrEqual(4 * 300_000)
   })
 
+  it('only allows trading while the settings in effect have a proven edge', async () => {
+    const { dir, env } = await setup({ AUTOTUNE: 'off', REQUIRE_EDGE: 'true' })
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/checking/) })
+
+    const run = await a.t.run()
+    expect(run.decision).toBe('skipped')
+    expect(run.reason).toMatch(/edge check only/)
+    expect(a.t.tradingGate().allowed).toBe(true)
+    expect(a.t.status().edge).toMatchObject({ required: true, allowed: true, status: 'proven' })
+    expect(a.notices.some((n) => n.startsWith('info: edge proven'))).toBe(true)
+    expect(a.t.status().last).toBeNull() // an edge check is not a tuning decision
+
+    // A proof goes stale if checks stop.
+    clock.now += 4 * HOUR
+    expect(a.t.tradingGate()).toEqual({ allowed: false, reason: 'edge check overdue' })
+    clock.now -= 4 * HOUR
+
+    // Restored after a restart.
+    const b = tuner(env, clock)
+    await b.t.load()
+    expect(b.t.tradingGate().allowed).toBe(true)
+
+    // The market turns: every new launch rugs. The edge is gone, buying stops.
+    await writeRecords(dir, dataset(300, { pumpShare: 0, start: START + 50 * HOUR }))
+    clock.now += HOUR
+    await b.t.run()
+    expect(b.t.tradingGate().allowed).toBe(false)
+    expect(b.t.tradingGate().reason).toMatch(/no proven edge/)
+    expect(b.notices.some((n) => n.startsWith('warn: buying paused, still recording'))).toBe(true)
+  })
+
+  it('searches with every check while data is still short', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
+    dirs.push(dir)
+    await writeRecords(dir, dataset(100))
+    const env = { ...BASE_ENV, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    const clock = { now: START + 9 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    expect((await a.t.run('schedule')).decision).toBe('insufficient-data')
+    clock.now += HOUR
+    expect((await a.t.run('schedule')).decision).toBe('insufficient-data') // not "next search in 6h"
+    expect(a.t.tradingGate().reason).toMatch(/collecting data/)
+    await a.t.stop()
+  })
+
+  it('keeps observing when nothing makes money', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
+    dirs.push(dir)
+    await writeRecords(dir, dataset(600, { pumpShare: 0 }))
+    const env = { ...BASE_ENV, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    const a = tuner(env, { now: START + 51 * HOUR })
+    await a.t.load()
+    const run = await a.t.run()
+    expect(run.decision).not.toBe('adopt')
+    expect(a.t.tradingGate().allowed).toBe(false)
+    expect(a.t.status().edge.status).toBe('unproven')
+  })
+
+  it('trades on adopted settings that proved themselves, and re-checks after a revert', async () => {
+    const { env } = await setup()
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    expect((await a.t.run()).decision).toBe('adopt')
+    // The edge that counts is the adopted settings' own.
+    expect(a.t.status().edge.status).toBe('proven')
+    expect(a.t.tradingGate().allowed).toBe(true)
+    await a.t.revert()
+    expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/checking/) })
+    await a.t.run()
+    expect(a.t.tradingGate().allowed).toBe(true) // the .env settings also make money on this data
+  })
+
   it('runs the search in a worker thread', async () => {
     const { env } = await setup()
     const clock = { now: START + 51 * HOUR }
@@ -335,6 +462,14 @@ describe('AutoTuner', () => {
 })
 
 describe('autotune config', () => {
+  it('requires a proven edge whenever launches are recorded', () => {
+    expect(cfgWith().autotune.requireEdge).toBe(true)
+    expect(cfgWith({ DRY_RUN: 'false', PRIVATE_KEY: '[1]' }).autotune.requireEdge).toBe(true)
+    expect(cfgWith({ RECORD_LAUNCHES: 'false' }).autotune.requireEdge).toBe(false)
+    expect(cfgWith({ REQUIRE_EDGE: 'false' }).autotune.requireEdge).toBe(false)
+    expect(() => cfgWith({ REQUIRE_EDGE: 'true', RECORD_LAUNCHES: 'false' })).toThrow(/REQUIRE_EDGE needs RECORD_LAUNCHES/)
+  })
+
   it('adopts automatically only in paper mode', () => {
     expect(cfgWith().autotune.mode).toBe('paper')
     expect(cfgWith({ DRY_RUN: 'false', PRIVATE_KEY: '[1]' }).autotune.mode).toBe('suggest')

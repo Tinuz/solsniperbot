@@ -79,6 +79,7 @@
   <div class="row">
     <h1>Sol Sniper</h1>
     <span id="mode" class="badge">…</span>
+    <span id="edgeBadge" class="badge" hidden></span>
     <span class="row muted"><span id="feedDot" class="dot"></span><span id="feedText">connecting</span></span>
   </div>
   <div class="row">
@@ -225,15 +226,30 @@
   const changesText = (changes) => changes.map((c) => `${c.env} ${c.from} → ${c.to}`).join(', ')
   let tuneHtml = ''
   function renderTuning(t) {
-    $('tunePanel').hidden = !t || t.mode === 'off'
-    if (!t || t.mode === 'off') return
-    $('tuneMode').textContent = t.adopts ? 'adopts · paper only' : 'suggests only'
+    const edge = t && t.edge
+    $('edgeBadge').hidden = !edge || !edge.required
+    if (edge && edge.required) {
+      $('edgeBadge').textContent = edge.allowed ? 'trading' : 'observing'
+      $('edgeBadge').className = 'badge ' + (edge.allowed ? 'good' : 'warn')
+      $('edgeBadge').title = edge.reason
+    }
+    $('tunePanel').hidden = !t || (t.mode === 'off' && !(edge && edge.required))
+    if ($('tunePanel').hidden) return
+    $('tuneMode').textContent = t.adopts ? 'adopts · paper only' : t.mode === 'suggest' ? 'suggests only' : 'autotune off'
     $('tuneMode').className = 'badge ' + (t.adopts ? 'accent' : '')
     $('tuneNext').textContent = t.running ? 'checking…' : t.nextRunAt ? `next check in ${age(t.nextRunAt - Date.now())}` : ''
     $('tuneRunBtn').disabled = t.running
     $('tuneRevertBtn').hidden = !(t.adopts && t.overrides.length)
 
     const parts = []
+    if (edge && edge.required) {
+      const r = edge.recent
+      const recent = r ? ` <span class="faint">· recent: ${r.trades} trades, ${signed(lam(r.totalPnlLamports))} SOL${edge.at ? ` · checked ${when(edge.at)}` : ''}</span>` : ''
+      parts.push(`<div><span class="badge ${edge.allowed ? 'good' : 'warn'}">${edge.allowed ? 'trading' : 'observing'}</span> ${esc(edge.allowed ? 'edge proven' : edge.reason)}${recent}</div>`)
+      if (edge.gates.length > 1) {
+        parts.push(`<div class="gates">${edge.gates.map((g) => `<span class="badge ${g.pass ? 'good' : 'bad'}" title="${esc(g.detail)}">${g.pass ? '✓' : '✗'} ${esc(g.name)}</span>`).join('')}</div>`)
+      }
+    }
     if (t.probation) {
       parts.push(`<div><span class="badge warn">probation</span> ${esc(changesText(t.probation.changes))} <span class="muted">· ${t.probation.trades}/${t.probation.neededTrades} trades · ${esc(t.probation.detail)}</span></div>`)
     }
@@ -247,8 +263,8 @@
       if (last.gates.length > 1) {
         parts.push(`<div class="gates">${last.gates.map((g) => `<span class="badge ${g.pass ? 'good' : 'bad'}" title="${esc(g.detail)}">${g.pass ? '✓' : '✗'} ${esc(g.name)}</span>`).join('')}</div>`)
       }
-    } else {
-      parts.push(`<div class="muted">No check yet. The bot needs ${t.limits.minLaunches.toLocaleString()} recorded launches over ${t.limits.minHours}h before it tunes anything.</div>`)
+    } else if (t.mode !== 'off') {
+      parts.push(`<div class="muted">No search yet. The bot needs ${t.limits.minLaunches.toLocaleString()} recorded launches over ${t.limits.minHours}h before it tunes anything.</div>`)
     }
     if (t.overrides.length) {
       parts.push(`<h3>Tuned settings in effect</h3><div class="scroll"><table><thead><tr><th>Setting</th><th>.env</th><th>In effect</th></tr></thead><tbody>${t.overrides.map((c) => `<tr><td class="mono">${esc(c.env)}</td><td class="mono">${esc(c.from)}</td><td class="mono">${esc(c.to)}</td></tr>`).join('')}</tbody></table></div>`)

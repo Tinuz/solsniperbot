@@ -10,14 +10,19 @@
  */
 import { config as loadDotenv } from 'dotenv'
 import { type Config, loadConfig } from '../src/config.js'
+import { loadTunedParams } from '../src/learning/autotune.js'
 import { launchFromRecord, loadRecords, splitByTime } from '../src/learning/dataset.js'
 import { type Summary, replayConfigFrom, replayLaunch, summarizeResults } from '../src/learning/replay.js'
 import { SUMMARY_HEADERS, parseArgs, sol, summaryRow, table, writeReport } from '../src/learning/report.js'
+import { applyParams } from '../src/learning/tunable.js'
 import { staticFilter } from '../src/strategy/filters.js'
 
 loadDotenv({ quiet: true })
 const args = parseArgs()
 const cfg = loadConfig({ RPC_URL: 'http://127.0.0.1:8899', ...process.env })
+// Start from what the bot actually runs with, autotuned settings included.
+const tuned = await loadTunedParams(cfg)
+if (tuned) applyParams(cfg, tuned.params)
 const minTrades = Number(args['min-trades'] ?? 20)
 const top = Number(args.top ?? 10)
 const entry = (args.entry === 'instant' || args.entry === 'momentum' ? args.entry : cfg.entryMode) as Config['entryMode']
@@ -96,6 +101,7 @@ const out: string[] = []
 const say = (s = '') => out.push(s)
 say(`# Exit backtest — ${new Date().toISOString().slice(0, 16)} UTC`)
 say()
+if (tuned) say(`Includes the autotuned settings in data/tuning: ${tuned.changes.map((c) => `${c.env}=${c.to}`).join(', ')}.`)
 say(`${eligible.length} launches pass the current filters (train ${train.length}, test ${test.length}); ${entry} entry, ${(Number(cfg.buyLamports) / 1e9).toFixed(3)} SOL per trade, ${cfg.paperLatencyMs} ms latency. ${candidates.length} settings in ${((Date.now() - started) / 1000).toFixed(1)}s.`)
 if (train.length < 100) say(`\n> **Small sample.** Rankings on ${train.length} training launches are noisy; collect more data before acting on them.`)
 say()
@@ -124,14 +130,19 @@ say(`The current settings would rank #${rank === -1 ? qualified.length + 1 : ran
 say()
 
 const best = qualified[0]
-if (best && best.train.totalPnlLamports > base.train.totalPnlLamports && best.test.totalPnlLamports > base.test.totalPnlLamports) {
+const beats = best && best.train.totalPnlLamports > base.train.totalPnlLamports && best.test.totalPnlLamports > base.test.totalPnlLamports
+if (best && beats && best.test.totalPnlLamports > 0) {
   say('## Recommendation')
   say()
-  say(`**${best.c.label}** beat the current settings on both halves (test ${sol(base.test.totalPnlLamports)} → ${sol(best.test.totalPnlLamports)} SOL). Try it in paper mode first:`)
+  say(`**${best.c.label}** beat the current settings on both halves and made money on the test data (test ${sol(base.test.totalPnlLamports)} → ${sol(best.test.totalPnlLamports)} SOL). Try it in paper mode first:`)
   say()
   say('```env')
   for (const [k, v] of Object.entries(best.c.env)) say(`${k}=${v}`)
   say('```')
+} else if (best && beats) {
+  say('## Recommendation')
+  say()
+  say(`Keep the current exits: **${best.c.label}** loses less (test ${sol(base.test.totalPnlLamports)} → ${sol(best.test.totalPnlLamports)} SOL) but still loses. When no exit setting makes money, the entry is the problem: try \`--entry=momentum\` or \`--entry=instant\`.`)
 } else if (best) {
   say('## Recommendation')
   say()

@@ -7,6 +7,7 @@ import { type Launch, MarketBook, type MintState } from './feed/market.js'
 import type { Feed, FeedTx } from './feed/types.js'
 import { AutoTuner } from './learning/autotune.js'
 import { LaunchRecorder } from './learning/recorder.js'
+import { paramsFromConfig, settingsFingerprint } from './learning/tunable.js'
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from './pump/constants.js'
 import { curveFromAccount, curveProgressBps, feeRates, marketCapLamports, spotPriceLamports } from './pump/curve.js'
 import type { TradeEvent } from './pump/events.js'
@@ -113,6 +114,8 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
   private vitals?: Vitals
   private timers: NodeJS.Timeout[] = []
   private readonly startedAt = Date.now()
+  /** Fingerprint of the strategy settings, recomputed only when the tuner changes them. */
+  private settingsFp = { version: -1, value: '' }
 
   constructor(
     readonly cfg: Config,
@@ -163,7 +166,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       this.recorder = new LaunchRecorder({ dataDir: cfg.dataDir, horizonMs: cfg.recorder.horizonMs, maxTrades: cfg.recorder.maxTrades }, log)
     }
     // Built before anything can change cfg, so it captures the .env settings.
-    if (cfg.autotune.mode !== 'off') this.tuner = new AutoTuner(cfg, log)
+    if (cfg.autotune.mode !== 'off' || cfg.autotune.requireEdge) this.tuner = new AutoTuner(cfg, log)
 
     if (cfg.feed === 'grpc' && cfg.grpc) this.feeds.push(new GrpcFeed(cfg.grpc, log))
     else this.feeds.push(new LogsFeed(cfg.wsUrl, log))
@@ -343,6 +346,12 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
   private async enter(launch: Launch, state: MintState, reason: string): Promise<void> {
     const mint = launch.mintStr
     if (this.entering.has(mint) || this.positions.has(mint)) return
+    // No proven edge yet: watch and record, don't spend.
+    const gate = this.tuner?.tradingGate()
+    if (gate && !gate.allowed) {
+      this.updateLaunch(mint, 'skipped', `observing: ${gate.reason}`)
+      return
+    }
     this.entering.add(mint)
     try {
       if (this.cfg.filters.requireSocials) {
@@ -563,7 +572,14 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       feeBps: { protocol: rates.protocolBps, creator: rates.creatorBps },
       tokenOffset: g ? g.initialVirtualTokenReserves - g.initialRealTokenReserves : 279_900_000_000_000n,
       initialRealTokenReserves: this.protocol.initialRealTokenReserves,
+      settings: this.settingsFingerprint(),
     })
+  }
+
+  private settingsFingerprint(): string {
+    const version = this.tuner?.settingsVersion ?? 0
+    if (version !== this.settingsFp.version) this.settingsFp = { version, value: settingsFingerprint(paramsFromConfig(this.cfg)) }
+    return this.settingsFp.value
   }
 
   private updateLaunch(mint: string, verdict: LaunchView['verdict'], reason: string): void {
