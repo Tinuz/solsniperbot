@@ -68,6 +68,10 @@
   #buyMint { flex: 1 1 220px; }
   #buySol { flex: 0 0 72px; width: 72px; }
   label.toggle { color: var(--muted); font-size: 12px; display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  #tuneBody { display: grid; gap: 10px; }
+  #tuneBody h3 { font-size: 12px; margin: 4px 0 0; color: var(--muted); font-weight: 600; }
+  .gates { display: flex; flex-wrap: wrap; gap: 6px; }
+  pre.env { margin: 0; padding: 8px 10px; background: var(--panel-2); border-radius: 7px; font-family: var(--mono); font-size: 12px; overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -137,6 +141,17 @@
     </section>
   </div>
 
+  <section class="panel" id="tunePanel" hidden>
+    <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
+      <div class="row"><h2 style="margin: 0;">Autotune</h2><span id="tuneMode" class="badge">–</span><span class="faint" id="tuneNext"></span></div>
+      <div class="row">
+        <button id="tuneRunBtn" class="small">Run check now</button>
+        <button id="tuneRevertBtn" class="small" hidden>Back to .env settings</button>
+      </div>
+    </div>
+    <div id="tuneBody"></div>
+  </section>
+
   <section class="panel">
     <h2>Activity</h2>
     <div id="notices"><div class="empty" id="noNotices">Buys, sells and connection changes appear here.</div></div>
@@ -155,6 +170,7 @@
   const cls = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '')
   const age = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` }
   const time = (t) => new Date(t).toLocaleTimeString([], { hour12: false })
+  const when = (t) => new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
   const coinCell = (p) => `<a href="https://pump.fun/coin/${encodeURIComponent(p.mint)}" target="_blank" rel="noopener">${esc(p.symbol || '?')}</a> <span class="faint">${esc((p.name || '').slice(0, 22))}</span>`
 
   const state = { positions: new Map(), closed: [], launches: [], status: null, showRejected: true }
@@ -203,6 +219,49 @@
     $('tLatencySub').textContent = l.detectToSendMs.p90 === undefined ? `decide p50 ${l.decideMs.p50 === undefined ? '–' : l.decideMs.p50.toFixed(3) + ' ms'}` : `p90 ${l.detectToSendMs.p90.toFixed(1)} ms · n=${l.detectToSendMs.n}`
     $('tSlots').textContent = l.slotsAfterLaunch.p50 === undefined ? '–' : `${l.slotsAfterLaunch.p50}`
     $('tLand').textContent = l.landMs.p50 === undefined ? '' : `land p50 ${Math.round(l.landMs.p50)} ms · p90 ${Math.round(l.landMs.p90)} ms`
+    renderTuning(s.tuning)
+  }
+
+  const changesText = (changes) => changes.map((c) => `${c.env} ${c.from} → ${c.to}`).join(', ')
+  let tuneHtml = ''
+  function renderTuning(t) {
+    $('tunePanel').hidden = !t || t.mode === 'off'
+    if (!t || t.mode === 'off') return
+    $('tuneMode').textContent = t.adopts ? 'adopts · paper only' : 'suggests only'
+    $('tuneMode').className = 'badge ' + (t.adopts ? 'accent' : '')
+    $('tuneNext').textContent = t.running ? 'checking…' : t.nextRunAt ? `next check in ${age(t.nextRunAt - Date.now())}` : ''
+    $('tuneRunBtn').disabled = t.running
+    $('tuneRevertBtn').hidden = !(t.adopts && t.overrides.length)
+
+    const parts = []
+    if (t.probation) {
+      parts.push(`<div><span class="badge warn">probation</span> ${esc(changesText(t.probation.changes))} <span class="muted">· ${t.probation.trades}/${t.probation.neededTrades} trades · ${esc(t.probation.detail)}</span></div>`)
+    }
+    if (t.cooldownUntil) parts.push(`<div><span class="badge">paused</span> <span class="muted">until ${when(t.cooldownUntil)} · ${esc(t.cooldownReason || '')}</span></div>`)
+    const last = t.last
+    if (last) {
+      const badge = { adopt: 'good', reject: 'warn', error: 'bad' }[last.decision] || ''
+      parts.push(`<div><span class="badge ${badge}">${esc(last.decision)}</span> ${esc(last.reason)} <span class="faint">· ${when(last.at)}${last.records ? ` · ${last.records.toLocaleString()} launches` : ''}</span></div>`)
+      // Adopted or suggested changes show below; a rejected candidate only here.
+      if (last.decision === 'reject' && last.changes.length) parts.push(`<div class="mono muted">tried: ${esc(changesText(last.changes))}</div>`)
+      if (last.gates.length > 1) {
+        parts.push(`<div class="gates">${last.gates.map((g) => `<span class="badge ${g.pass ? 'good' : 'bad'}" title="${esc(g.detail)}">${g.pass ? '✓' : '✗'} ${esc(g.name)}</span>`).join('')}</div>`)
+      }
+    } else {
+      parts.push(`<div class="muted">No check yet. The bot needs ${t.limits.minLaunches.toLocaleString()} recorded launches over ${t.limits.minHours}h before it tunes anything.</div>`)
+    }
+    if (t.overrides.length) {
+      parts.push(`<h3>Tuned settings in effect</h3><div class="scroll"><table><thead><tr><th>Setting</th><th>.env</th><th>In effect</th></tr></thead><tbody>${t.overrides.map((c) => `<tr><td class="mono">${esc(c.env)}</td><td class="mono">${esc(c.from)}</td><td class="mono">${esc(c.to)}</td></tr>`).join('')}</tbody></table></div>`)
+    }
+    if (t.suggestion) {
+      parts.push(`<h3>Suggested (${when(t.suggestion.at)}): put in .env to use</h3><pre class="env">${esc(t.suggestion.changes.map((c) => `${c.env}=${c.to}`).join('\n'))}</pre>`)
+    }
+    if (t.adoptions.length) {
+      const badge = { probation: 'warn', kept: 'good', 'rolled-back': 'bad' }
+      parts.push(`<h3>History</h3><div class="scroll"><table><thead><tr><th>When</th><th>Change</th><th>Status</th></tr></thead><tbody>${t.adoptions.map((a) => `<tr><td class="mono">${when(a.at)}</td><td class="mono">${esc(changesText(a.changes))}</td><td><span class="badge ${badge[a.status] || ''}" title="${esc(a.detail || '')}">${esc(a.status)}</span></td></tr>`).join('')}</tbody></table></div>`)
+    }
+    const html = parts.join('')
+    if (html !== tuneHtml) $('tuneBody').innerHTML = tuneHtml = html
   }
 
   function renderPositions() {
@@ -328,6 +387,14 @@
     notice('info', `manual buy ${mint.slice(0, 6)}… submitted`)
     try { const p = await post('/api/buy', { mint, sol: solAmt || undefined }); notice('info', `manual buy ${p.symbol}: ${p.status}`); $('buyMint').value = '' }
     catch (e) { notice('error', `manual buy failed: ${e.message}`) }
+  }
+  $('tuneRunBtn').onclick = async () => {
+    $('tuneRunBtn').disabled = true
+    try { await post('/api/tuning/run'); notice('info', 'autotune check started') } catch (e) { notice('error', `autotune: ${e.message}`) }
+  }
+  $('tuneRevertBtn').onclick = async () => {
+    if (!confirm('Undo every tuned setting and go back to the .env settings? Autotune then pauses for its cooldown.')) return
+    try { await post('/api/tuning/revert') } catch (e) { notice('error', `autotune: ${e.message}`) }
   }
   $('showRejected').onchange = (e) => { state.showRejected = e.target.checked; schedule() }
   setInterval(schedule, 1000)

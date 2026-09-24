@@ -259,7 +259,7 @@ export interface Summary {
 }
 
 /** Aggregates entered replays in chronological order (for drawdown). */
-export function summarizeResults(results: ReplayResult[]): Summary {
+export function summarizeResults(results: readonly Pick<ReplayResult, 'entered' | 'pnlLamports' | 'pnlPct' | 'holdMs'>[]): Summary {
   const entered = results.filter((r) => r.entered)
   const pcts = entered.map((r) => r.pnlPct).sort((a, b) => a - b)
   let equity = 0

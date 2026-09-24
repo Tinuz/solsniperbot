@@ -95,7 +95,49 @@ Both tools replay the recorded launches through the bot's **own** filter, moment
 
 `backtest` ranks hundreds of exit configurations in seconds.
 
-Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings on the newest 30%, which they were never tuned on. Reports are saved to `data/reports/`. Nothing is applied automatically: review a suggestion, try it in paper mode, and analyze again.
+Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings on the newest 30%, which they were never tuned on. Reports are saved to `data/reports/`. These tools never change settings; the autotuner below does, in paper mode only.
+
+## Autotune: the bot tunes itself (paper first)
+
+Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in its own recordings. The work runs in a worker thread, so the trading loop never waits on it. What happens next depends on `AUTOTUNE`:
+
+| Mode | What it does |
+| --- | --- |
+| `paper` (default in paper mode) | Adopts a validated candidate straight away, then puts it on probation. |
+| `suggest` (default live) | Only proposes. The candidate shows on the dashboard and in `data/tuning/report.md` as `.env` lines; you decide. |
+| `off` | Nothing. Also the result when `RECORD_LAUNCHES=false`. |
+
+Automatic adoption only works in paper mode. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, and the tuner checks again before it changes anything.
+
+**Strict limits.**
+- **What it can change.** Only filters and exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`.
+- **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
+- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s), and one adoption moves it at most one step (for example ±10 points of stop loss, or at most 2× the hold time). One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
+
+**Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
+1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
+2. **Enough trades:** enough simulated trades in both parts.
+3. **Wins out of sample:** it beats the current settings by at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade.
+4. **Profitable out of sample:** it makes money on its own.
+5. **Consistent over time:** it wins in both halves of the test period.
+6. **Not one lucky trade:** it still wins without its single best trade.
+7. **Drawdown in check:** its drawdown is not materially worse.
+
+**Probation and rollback.** An adopted change is replayed on launches recorded *after* the adoption, which no search has ever seen, next to the settings it replaced. It is checked at least hourly. Once the new settings have made `AUTOTUNE_PROBATION_TRADES` replayed trades:
+- if it did at least as well, it is kept;
+- otherwise it is rolled back, tuning pauses for `AUTOTUNE_COOLDOWN_HOURS`, and those settings are not tried again for `AUTOTUNE_DAYS`.
+
+Only one change is on probation at a time.
+
+**Your .env stays in charge.** Tuned values live in `data/tuning/state-paper.json` and survive restarts. As soon as you edit any tunable setting in `.env`, the overrides are dropped and your values apply. The dashboard's **Autotune** panel shows:
+- the last decision with every gate;
+- what is on probation;
+- the settings that differ from `.env`, with a button to go back to `.env`;
+- the history of adoptions.
+
+Every cycle is logged to `data/tuning/history.jsonl`. `data/tuning/report.md` holds the last decision and the `.env` lines needed to keep the tuned settings, or to use them live.
+
+> Autotune picks the best of the nearby settings on recent data. It can't find an edge that isn't in the data, and a market that changes faster than the tuner can learn will still cost money. That is why it starts in paper mode.
 
 ## Strategy
 
@@ -138,7 +180,7 @@ Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` t
 
 ## Dashboard and API
 
-The dashboard at `http://localhost:8787` streams launches with the filter verdict and reason, open positions with live P&L, closed trades, latency and win rate. It also has buttons to pause buying, sell 25/50/100% of a position, sell everything, or manually buy any coin still on its bonding curve.
+The dashboard at `http://localhost:8787` streams launches with the filter verdict and reason, open positions with live P&L, closed trades, latency, win rate, vitals and autotune state. It also has buttons to pause buying, sell 25/50/100% of a position, sell everything, manually buy any coin still on its bonding curve, run an autotune check, or revert tuned settings.
 
 | Endpoint | |
 | --- | --- |
@@ -147,6 +189,9 @@ The dashboard at `http://localhost:8787` streams launches with the filter verdic
 | `POST /api/sell` `{ "mint": "...", "pct": 50 }` | Sell part of a position. |
 | `POST /api/sell-all` | Exit everything. |
 | `POST /api/buy` `{ "mint": "...", "sol": 0.1 }` | Manual buy of a bonding-curve coin. |
+| `GET /api/tuning` | Autotune state: last decision and gates, probation, overrides, history. |
+| `POST /api/tuning/run` | Start an autotune check now. |
+| `POST /api/tuning/revert` | Back to the `.env` settings (paper autotune); tuning pauses for the cooldown. |
 | `WS /ws` | Snapshot, then live events. |
 
 The API binds to `127.0.0.1`. It rejects non-local Host headers (DNS rebinding) and cross-origin requests, and mutating calls must send JSON (so a CORS preflight is forced, which the server never approves). This means a malicious web page can't trade your wallet through your browser. Set `API_TOKEN` before binding it anywhere else, then open the dashboard with `?token=...`.
@@ -165,7 +210,7 @@ src/
   pump/        protocol: constants, PDAs, account/event decoding, curve + fee math, instruction builders
   feed/        log-stream (WS) and Yellowstone gRPC/deshred feeds; live per-coin market book
   strategy/    launch filters, creator reputation, momentum entry, exit policy, risk limits, survival
-  learning/    launch recorder, dataset loading, replay engine, report helpers
+  learning/    launch recorder, dataset loading, replay engine, reports, autotuner (bounds, search, gates, probation, worker)
   trading/     executor (build/sign/land, paper fills, simulation), positions + P&L, PumpSwap sells
   solana/      keep-alive RPC, resilient websocket, blockhash cache, priority fees, landing, confirmation
   api/         local HTTP/WS server and the single-file dashboard
@@ -183,6 +228,15 @@ npm run typecheck
 
 - **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
 - **Strategy**: config parsing, filters, exit policy, momentum, risk limits, and survival (sizing, fee-drag minimum, defensive mode, critical vs dead, persistence and revival).
+- **Autotune**:
+  - every tunable value round-trips through `.env`;
+  - bounds and step limits hold, and trade size, fees and risk are unreachable;
+  - winning settings are adopted, and settings that only won in the past are rejected (regime change);
+  - probation passes and fails correctly, and positions are capacity-limited like live;
+  - adopted settings survive a restart and are dropped when `.env` changes;
+  - a rollback pauses tuning, and the failed settings are skipped afterwards;
+  - suggest mode never changes anything;
+  - the search runs in a real worker thread.
 - **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips and momentum timing.
 - **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 
