@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sol Sniper</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --border: #dfe3e8;
+    --text: #151a21; --muted: #5d6673; --faint: #8a93a0;
+    --accent: #5b4fe0; --good: #0f8a4f; --bad: #c9352b; --warn: #a86200;
+    --good-bg: #e3f5ec; --bad-bg: #fbe8e6; --warn-bg: #fdf1dc; --accent-bg: #ecebfc;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1015; --panel: #151a21; --panel-2: #1b212a; --border: #262e39;
+      --text: #e6e9ee; --muted: #9aa4b2; --faint: #6b7583;
+      --accent: #8b80ff; --good: #38c98a; --bad: #ff6b5e; --warn: #f0a93b;
+      --good-bg: #12291f; --bad-bg: #2d1614; --warn-bg: #2c2210; --accent-bg: #1f1d3a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+  main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1400px; margin: 0 auto; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--panel-2); color: var(--muted); }
+  .badge.good { background: var(--good-bg); color: var(--good); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.accent { background: var(--accent-bg); color: var(--accent); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--bad); }
+  .dot.up { background: var(--good); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .tile .label { color: var(--muted); font-size: 12px; }
+  .tile .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .sub { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+  @media (max-width: 980px) { .grid-2 { grid-template-columns: minmax(0, 1fr); } }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  tbody tr:last-child td { border-bottom: none; }
+  .pos { color: var(--good); } .neg { color: var(--bad); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .muted { color: var(--muted); } .faint { color: var(--faint); }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  button { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: default; }
+  input { font: inherit; padding: 6px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text); min-width: 0; }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .feed { max-height: 460px; overflow-y: auto; }
+  .empty { color: var(--faint); padding: 18px 0; text-align: center; }
+  .reason { color: var(--muted); max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  #notices { display: grid; gap: 6px; max-height: 220px; overflow-y: auto; }
+  .notice { font-size: 13px; }
+  .notice time { color: var(--faint); font-family: var(--mono); font-size: 11px; margin-right: 6px; }
+  #buyForm { flex: 1 1 360px; justify-content: flex-end; }
+  #buyMint { flex: 1 1 220px; }
+  #buySol { flex: 0 0 72px; width: 72px; }
+  label.toggle { color: var(--muted); font-size: 12px; display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>Sol Sniper</h1>
+    <span id="mode" class="badge">…</span>
+    <span class="row muted"><span id="feedDot" class="dot"></span><span id="feedText">connecting</span></span>
+  </div>
+  <div class="row">
+    <span class="muted mono" id="wallet"></span>
+    <span class="badge" id="balance"></span>
+    <button id="pauseBtn">Pause buying</button>
+    <button id="sellAllBtn" class="danger">Sell all</button>
+  </div>
+</header>
+
+<main>
+  <section class="tiles" aria-label="Summary">
+    <div class="panel tile"><div class="label">Realized P&amp;L</div><div class="value" id="tRealized">–</div><div class="sub" id="tToday"></div></div>
+    <div class="panel tile"><div class="label">Open P&amp;L</div><div class="value" id="tUnrealized">–</div><div class="sub" id="tOpen"></div></div>
+    <div class="panel tile"><div class="label">Win rate</div><div class="value" id="tWin">–</div><div class="sub" id="tWL"></div></div>
+    <div class="panel tile"><div class="label">Launches</div><div class="value" id="tLaunches">–</div><div class="sub" id="tLaunchSub"></div></div>
+    <div class="panel tile"><div class="label">Detect → send (p50)</div><div class="value" id="tLatency">–</div><div class="sub" id="tLatencySub"></div></div>
+    <div class="panel tile"><div class="label">Landed slots after launch</div><div class="value" id="tSlots">–</div><div class="sub" id="tLand"></div></div>
+  </section>
+
+  <section class="panel">
+    <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
+      <h2 style="margin: 0;">Open positions</h2>
+      <form id="buyForm" class="row">
+        <input id="buyMint" placeholder="Mint address" aria-label="Mint address" autocomplete="off" spellcheck="false">
+        <input id="buySol" placeholder="SOL" aria-label="SOL amount" inputmode="decimal">
+        <button type="submit">Manual buy</button>
+      </form>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Coin</th><th>Age</th><th class="num">Cost</th><th class="num">Value</th><th class="num">Gain</th><th class="num">Peak</th><th class="num">P&amp;L</th><th>Status</th><th></th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel">
+      <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
+        <h2 style="margin: 0;">Launch feed</h2>
+        <label class="toggle"><input type="checkbox" id="showRejected" checked> show rejected</label>
+      </div>
+      <div class="feed scroll">
+        <table>
+          <thead><tr><th>Time</th><th>Coin</th><th class="num">Dev buy</th><th class="num">Mcap</th><th>Verdict</th><th>Reason</th></tr></thead>
+          <tbody id="launches"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Closed trades</h2>
+      <div class="feed scroll">
+        <table>
+          <thead><tr><th>Coin</th><th class="num">P&amp;L</th><th class="num">Held</th><th>Exit</th></tr></thead>
+          <tbody id="closed"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Activity</h2>
+    <div id="notices"><div class="empty" id="noNotices">Buys, sells and connection changes appear here.</div></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const token = new URLSearchParams(location.search).get('token') || ''
+  const headers = { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) }
+  const $ = (id) => document.getElementById(id)
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+  const lam = (v) => Number(v ?? 0) / 1e9
+  const sol = (v, d = 4) => (v === null || v === undefined || Number.isNaN(v)) ? '–' : `${v >= 0 ? '' : '−'}${Math.abs(v).toFixed(d)}`
+  const signed = (v, d = 4) => (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(d)
+  const cls = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '')
+  const age = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` }
+  const time = (t) => new Date(t).toLocaleTimeString([], { hour12: false })
+  const coinCell = (p) => `<a href="https://pump.fun/coin/${encodeURIComponent(p.mint)}" target="_blank" rel="noopener">${esc(p.symbol || '?')}</a> <span class="faint">${esc((p.name || '').slice(0, 22))}</span>`
+
+  const state = { positions: new Map(), closed: [], launches: [], status: null, showRejected: true }
+
+  const pnl = (p) => {
+    if (p.reconciled && p.walletDeltaLamports !== undefined) return lam(p.walletDeltaLamports) + lam(p.valueLamports)
+    return lam(p.realizedLamports) + lam(p.valueLamports) - lam(p.costLamports) - lam(p.networkFeesLamports)
+  }
+
+  function renderStatus() {
+    const s = state.status
+    if (!s) return
+    $('mode').textContent = s.mode === 'live' ? 'LIVE' : 'PAPER'
+    $('mode').className = 'badge ' + (s.mode === 'live' ? 'bad' : 'accent')
+    $('wallet').textContent = s.wallet.slice(0, 4) + '…' + s.wallet.slice(-4)
+    $('wallet').title = s.wallet
+    $('balance').textContent = s.balanceSol === null ? 'balance n/a' : `${s.balanceSol.toFixed(4)} SOL`
+    const feed = s.feeds[0] || {}
+    $('feedDot').className = 'dot' + (feed.connected ? ' up' : '')
+    $('feedText').textContent = `${feed.source || 'feed'} · ${(feed.txs || 0).toLocaleString()} txs · ${s.trackedMints} coins`
+    $('pauseBtn').textContent = s.risk.paused ? 'Resume buying' : 'Pause buying'
+    $('pauseBtn').title = s.risk.pauseReason || ''
+    const r = s.pnl
+    $('tRealized').textContent = signed(r.realizedSol) + ' SOL'
+    $('tRealized').className = 'value ' + cls(r.realizedSol)
+    $('tToday').textContent = `today ${signed(s.risk.realizedTodaySol)} SOL` + (s.risk.paused ? ` · paused: ${s.risk.pauseReason}` : '')
+    $('tUnrealized').textContent = signed(r.unrealizedSol) + ' SOL'
+    $('tUnrealized').className = 'value ' + cls(r.unrealizedSol)
+    $('tOpen').textContent = `${state.positions.size} open · ${s.pendingTxs} tx pending`
+    $('tWin').textContent = r.winRate === null ? '–' : `${Math.round(r.winRate * 100)}%`
+    $('tWL').textContent = `${r.wins}W / ${r.losses}L · avg hold ${age(r.avgHoldSec * 1000)}`
+    $('tLaunches').textContent = s.counters.launches.toLocaleString()
+    $('tLaunchSub').textContent = `${s.counters.rejected.toLocaleString()} rejected · ${s.counters.entries} entries · ${s.counters.watching} watching`
+    const l = s.latency
+    $('tLatency').textContent = l.detectToSendMs.p50 === undefined ? '–' : `${l.detectToSendMs.p50.toFixed(1)} ms`
+    $('tLatencySub').textContent = l.detectToSendMs.p90 === undefined ? `decide p50 ${l.decideMs.p50 === undefined ? '–' : l.decideMs.p50.toFixed(3) + ' ms'}` : `p90 ${l.detectToSendMs.p90.toFixed(1)} ms · n=${l.detectToSendMs.n}`
+    $('tSlots').textContent = l.slotsAfterLaunch.p50 === undefined ? '–' : `${l.slotsAfterLaunch.p50}`
+    $('tLand').textContent = l.landMs.p50 === undefined ? '' : `land p50 ${Math.round(l.landMs.p50)} ms · p90 ${Math.round(l.landMs.p90)} ms`
+  }
+
+  function renderPositions() {
+    const now = Date.now()
+    const rows = [...state.positions.values()].sort((a, b) => b.openedAt - a.openedAt).map((p) => {
+      const v = pnl(p)
+      const busy = p.status !== 'open'
+      return `<tr>
+        <td>${coinCell(p)}${p.paper ? ' <span class="badge">paper</span>' : ''}</td>
+        <td>${age(now - p.openedAt)}</td>
+        <td class="num">${sol(lam(p.costLamports))}</td>
+        <td class="num">${sol(lam(p.valueLamports))}</td>
+        <td class="num ${cls(p.gainPct)}">${p.tokensBought !== '0' ? signed(p.gainPct, 1) + '%' : '–'}</td>
+        <td class="num">${signed(p.peakGainPct, 1)}%</td>
+        <td class="num ${cls(v)}">${signed(v)}</td>
+        <td><span class="badge ${p.status === 'open' ? 'good' : p.status === 'closing' ? 'warn' : ''}">${esc(p.status)}</span>${p.error ? ` <span class="neg" title="${esc(p.error)}">!</span>` : ''}</td>
+        <td class="row">${[25, 50, 100].map((pct) => `<button class="small" data-sell="${esc(p.mint)}" data-pct="${pct}" ${busy ? 'disabled' : ''}>${pct === 100 ? 'Sell all' : pct + '%'}</button>`).join('')}</td>
+      </tr>`
+    })
+    $('positions').innerHTML = rows.join('') || '<tr><td colspan="9" class="empty">No open positions</td></tr>'
+  }
+
+  function renderLaunches() {
+    const rows = state.launches
+      .filter((l) => state.showRejected || l.verdict !== 'rejected')
+      .slice(0, 150)
+      .map((l) => {
+        const badge = { rejected: '', watching: 'warn', buying: 'good', skipped: 'bad' }[l.verdict] || ''
+        return `<tr>
+          <td class="mono">${time(l.at)}</td>
+          <td>${coinCell(l)}</td>
+          <td class="num">${l.devBuySol.toFixed(2)}</td>
+          <td class="num">${l.mcapSol.toFixed(1)}</td>
+          <td><span class="badge ${badge}">${esc(l.verdict)}</span></td>
+          <td class="reason" title="${esc(l.reason)}">${esc(l.reason)}</td>
+        </tr>`
+      })
+    $('launches').innerHTML = rows.join('') || '<tr><td colspan="6" class="empty">Waiting for launches…</td></tr>'
+  }
+
+  function renderClosed() {
+    const rows = state.closed.slice(0, 100).map((p) => {
+      const v = p.status === 'failed' ? -lam(p.networkFeesLamports) : pnl(p)
+      const held = (p.closedAt || Date.now()) - p.openedAt
+      // Show every exit leg, e.g. a partial take-profit followed by a stop.
+      const legs = [...new Set((p.sells || []).map((s) => s.reason))]
+      const exit = p.status === 'failed' ? `buy failed: ${p.error || ''}` : (legs.length ? legs.join(' → ') : p.closeReason || '')
+      return `<tr>
+        <td>${coinCell(p)}</td>
+        <td class="num ${cls(v)}">${signed(v)}</td>
+        <td class="num">${age(held)}</td>
+        <td class="reason" title="${esc(exit)}">${esc(exit)}${!p.paper && !p.reconciled ? ' <span class="faint" title="awaiting on-chain reconciliation">(est.)</span>' : ''}</td>
+      </tr>`
+    })
+    $('closed').innerHTML = rows.join('') || '<tr><td colspan="4" class="empty">No closed trades yet</td></tr>'
+  }
+
+  function notice(level, message, at = Date.now()) {
+    $('noNotices')?.remove()
+    const el = document.createElement('div')
+    el.className = 'notice ' + (level === 'error' ? 'neg' : level === 'warn' ? 'muted' : '')
+    el.innerHTML = `<time>${time(at)}</time>${esc(message)}`
+    $('notices').prepend(el)
+    while ($('notices').children.length > 60) $('notices').lastChild.remove()
+  }
+
+  let pending = false
+  const schedule = () => {
+    if (pending) return
+    pending = true
+    requestAnimationFrame(() => { pending = false; renderStatus(); renderPositions(); renderLaunches(); renderClosed() })
+  }
+
+  function connect() {
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${token ? '?token=' + encodeURIComponent(token) : ''}`)
+    ws.onmessage = (m) => {
+      const e = JSON.parse(m.data)
+      switch (e.type) {
+        case 'snapshot':
+          state.status = e.data.status
+          state.positions = new Map(e.data.positions.map((p) => [p.mint, p]))
+          state.closed = e.data.closed
+          state.launches = e.data.launches
+          break
+        case 'status': state.status = e.data; break
+        case 'position': if (['opening', 'open', 'closing'].includes(e.data.status)) state.positions.set(e.data.mint, e.data); break
+        case 'closed': state.positions.delete(e.data.mint); state.closed.unshift(e.data); break
+        case 'launch': state.launches.unshift(e.data); if (state.launches.length > 300) state.launches.pop(); break
+        case 'launch-update': { const l = state.launches.find((x) => x.mint === e.data.mint); if (l) Object.assign(l, e.data); break }
+        case 'notice': notice(e.data.level, e.data.message, e.data.at); break
+      }
+      schedule()
+    }
+    ws.onclose = () => { $('feedDot').className = 'dot'; $('feedText').textContent = 'bot offline, reconnecting…'; setTimeout(connect, 1500) }
+  }
+
+  async function post(path, body = {}) {
+    const res = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || data.status || res.statusText)
+    return data
+  }
+
+  document.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-sell]')
+    if (!btn) return
+    btn.disabled = true
+    try { await post('/api/sell', { mint: btn.dataset.sell, pct: Number(btn.dataset.pct) }) }
+    catch (e) { notice('error', `sell failed: ${e.message}`) }
+  })
+  $('sellAllBtn').onclick = async () => {
+    if (!confirm('Market-sell every open position now?')) return
+    try { await post('/api/sell-all'); notice('info', 'sell-all submitted') } catch (e) { notice('error', e.message) }
+  }
+  $('pauseBtn').onclick = async () => {
+    try { await post(state.status?.risk.paused ? '/api/resume' : '/api/pause') } catch (e) { notice('error', e.message) }
+  }
+  $('buyForm').onsubmit = async (ev) => {
+    ev.preventDefault()
+    const mint = $('buyMint').value.trim()
+    const solAmt = $('buySol').value.trim()
+    if (!mint) return
+    notice('info', `manual buy ${mint.slice(0, 6)}… submitted`)
+    try { const p = await post('/api/buy', { mint, sol: solAmt || undefined }); notice('info', `manual buy ${p.symbol}: ${p.status}`); $('buyMint').value = '' }
+    catch (e) { notice('error', `manual buy failed: ${e.message}`) }
+  }
+  $('showRejected').onchange = (e) => { state.showRejected = e.target.checked; schedule() }
+  setInterval(schedule, 1000)
+  connect()
+})()
+</script>
+</body>
+</html>
