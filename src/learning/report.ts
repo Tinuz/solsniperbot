@@ -1,0 +1,100 @@
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import type { LaunchRecord } from './record.js'
+import type { Summary } from './replay.js'
+
+/** Decision-time features plus early-flow features (first seconds after detection). */
+export function features(r: LaunchRecord): Record<string, number> {
+  const buyers3 = new Set<number>()
+  let net3 = 0
+  let sells10 = 0
+  let trades10 = 0
+  for (const [dt, , , side, lamports, wallet] of r.trades) {
+    if (dt <= 3_000) {
+      if (side > 0 && wallet !== 0) buyers3.add(wallet)
+      net3 += side * lamports
+    }
+    if (dt <= 10_000) {
+      trades10++
+      if (side < 0) sells10++
+    }
+  }
+  return {
+    devBuySol: r.devBuyLamports / 1e9,
+    devSupplyPct: (r.devBuyTokens / r.curve.supply) * 100,
+    mcapSol: (r.curve.vq * r.curve.supply) / r.curve.vt / 1e9,
+    creatorLaunches: r.creatorLaunches,
+    nameLength: r.name.length,
+    hourUtc: new Date(r.t).getUTCHours(),
+    buyersFirst3s: buyers3.size,
+    netSolFirst3s: net3 / 1e9,
+    tradesFirst10s: trades10,
+    sellsFirst10s: sells10,
+  }
+}
+
+export const FEATURE_LABELS: Record<string, string> = {
+  devBuySol: 'Dev buy (SOL)',
+  devSupplyPct: 'Dev supply %',
+  mcapSol: 'Mcap at detection (SOL)',
+  creatorLaunches: 'Dev launches in window',
+  nameLength: 'Name length',
+  hourUtc: 'Hour (UTC)',
+  buyersFirst3s: 'Buyers in first 3s',
+  netSolFirst3s: 'Net SOL in first 3s',
+  tradesFirst10s: 'Trades in first 10s',
+  sellsFirst10s: 'Sells in first 10s',
+}
+
+/** Quantile bucket edges (unique, ascending) for `k` buckets. */
+export function quantileEdges(values: number[], k: number): number[] {
+  const sorted = [...values].sort((a, b) => a - b)
+  const edges: number[] = []
+  for (let i = 1; i < k; i++) {
+    const v = sorted[Math.floor((i / k) * sorted.length)]
+    if (v !== undefined && !edges.includes(v)) edges.push(v)
+  }
+  return edges
+}
+
+export const sol = (lamports: number) => `${lamports >= 0 ? '+' : '−'}${Math.abs(lamports / 1e9).toFixed(4)}`
+export const pct = (v: number, digits = 1) => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(digits)}%`
+export const num = (v: number, digits = 2) => (Number.isInteger(v) ? String(v) : v.toFixed(digits))
+
+export function table(headers: string[], rows: (string | number)[][]): string {
+  const line = (cells: (string | number)[]) => `| ${cells.map((c) => String(c).replace(/\|/g, '\\|')).join(' | ')} |`
+  return [line(headers), line(headers.map(() => '---')), ...rows.map(line)].join('\n')
+}
+
+export function summaryRow(label: string, s: Summary): (string | number)[] {
+  return [
+    label,
+    s.trades,
+    s.trades ? `${Math.round(s.winRate * 100)}%` : '–',
+    sol(s.totalPnlLamports),
+    s.trades ? pct(s.meanPnlPct) : '–',
+    s.trades ? pct(s.medianPnlPct) : '–',
+    sol(-s.maxDrawdownLamports),
+    s.trades ? `${Math.round(s.avgHoldMs / 1000)}s` : '–',
+  ]
+}
+
+export const SUMMARY_HEADERS = ['', 'Trades', 'Win rate', 'Total SOL', 'Mean', 'Median', 'Max drawdown', 'Avg hold']
+
+export function parseArgs(argv = process.argv.slice(2)): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const a of argv) {
+    const m = /^--([^=]+)(?:=(.*))?$/.exec(a)
+    if (m) out[m[1]!] = m[2] ?? 'true'
+  }
+  return out
+}
+
+export async function writeReport(dataDir: string, name: string, markdown: string): Promise<string> {
+  const dir = join(dataDir, 'reports')
+  await mkdir(dir, { recursive: true })
+  const stamp = new Date().toISOString().slice(0, 16).replace(':', '')
+  const path = join(dir, `${name}-${stamp}.md`)
+  await writeFile(path, markdown)
+  return path
+}

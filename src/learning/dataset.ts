@@ -1,0 +1,77 @@
+import { createReadStream } from 'node:fs'
+import { readdir } from 'node:fs/promises'
+import { join } from 'node:path'
+import { createInterface } from 'node:readline'
+import { PublicKey } from '@solana/web3.js'
+import type { Launch } from '../feed/market.js'
+import type { LaunchRecord } from './record.js'
+
+/** Loads recorded launches, oldest first. `days` keeps only the most recent N daily files. */
+export async function loadRecords(dataDir: string, opts: { days?: number } = {}): Promise<LaunchRecord[]> {
+  const dir = join(dataDir, 'launches')
+  let files: string[]
+  try {
+    files = (await readdir(dir)).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort()
+  } catch {
+    return []
+  }
+  if (opts.days) files = files.slice(-opts.days)
+  const out: LaunchRecord[] = []
+  for (const f of files) {
+    const lines = createInterface({ input: createReadStream(join(dir, f)), crlfDelay: Number.POSITIVE_INFINITY })
+    for await (const line of lines) {
+      if (!line) continue
+      try {
+        const rec = JSON.parse(line) as LaunchRecord
+        if (rec.v === 1 && Array.isArray(rec.trades)) out.push(rec)
+      } catch {
+        // A torn last line from a crash; skip it.
+      }
+    }
+  }
+  return out.sort((a, b) => a.t - b.t)
+}
+
+/** Chronological split: the most recent `testFrac` of launches is held out. */
+export function splitByTime<T extends { t: number }>(rows: T[], testFrac = 0.3): { train: T[]; test: T[] } {
+  const cut = Math.floor(rows.length * (1 - testFrac))
+  return { train: rows.slice(0, cut), test: rows.slice(cut) }
+}
+
+/** Rebuilds the `Launch` the live filters saw, so current filter settings can be applied offline. */
+export function launchFromRecord(r: LaunchRecord): Launch {
+  const mint = new PublicKey(r.mint)
+  return {
+    mint,
+    mintStr: r.mint,
+    name: r.name,
+    symbol: r.symbol,
+    uri: r.uri,
+    creator: new PublicKey(r.creator),
+    dev: new PublicKey(r.dev),
+    tokenProgram: new PublicKey(r.tokenProgram),
+    isMayhemMode: r.mayhem,
+    isHolderReward: r.holderReward,
+    quoteMint: PublicKey.default,
+    isSolPaired: true,
+    curve: {
+      virtualTokenReserves: BigInt(r.curve.vt),
+      virtualQuoteReserves: BigInt(r.curve.vq),
+      realTokenReserves: BigInt(r.curve.rt),
+      realQuoteReserves: 0n,
+      tokenTotalSupply: BigInt(r.curve.supply),
+      complete: false,
+      creator: new PublicKey(r.creator),
+      isMayhemMode: r.mayhem,
+      creatorFeeBps: 0n,
+    },
+    devBuyLamports: BigInt(r.devBuyLamports),
+    devBuyTokens: BigInt(r.devBuyTokens),
+    signature: '',
+    slot: r.slot,
+    detectedAt: 0,
+    detectedAtWall: r.t,
+    source: r.source,
+    executed: r.executed,
+  }
+}

@@ -8,7 +8,7 @@ import { TOKEN_2022_PROGRAM_ID } from '../src/pump/constants.js'
 import type { CurveState } from '../src/pump/curve.js'
 import { decideExit, type ExitInput } from '../src/strategy/exits.js'
 import { staticFilter } from '../src/strategy/filters.js'
-import { decideMomentum } from '../src/strategy/momentum.js'
+import { decideMomentum, momentumSnapshot } from '../src/strategy/momentum.js'
 import { RiskManager } from '../src/strategy/risk.js'
 
 const baseEnv = { RPC_URL: 'https://rpc.example.com/?api-key=secret' }
@@ -200,40 +200,29 @@ describe('momentum entry', () => {
 
   it('waits for age, buyers and net inflow, then buys', () => {
     const { l, s } = setup()
-    expect(decideMomentum(s, l, c.momentum, c.filters.maxEntryMcapLamports, 10_500).action).toBe('wait')
+    expect(decideMomentum(momentumSnapshot(s, l, 10_500), c.momentum, c.filters.maxEntryMcapLamports).action).toBe('wait')
     for (let i = 0; i < 3; i++) s.buyers.add(Keypair.generate().publicKey.toBase58())
-    expect(decideMomentum(s, l, c.momentum, c.filters.maxEntryMcapLamports, 11_500).action).toBe('wait') // not enough net inflow
+    expect(decideMomentum(momentumSnapshot(s, l, 11_500), c.momentum, c.filters.maxEntryMcapLamports).action).toBe('wait') // not enough net inflow
     s.buyVolume += 1_500_000_000n
-    expect(decideMomentum(s, l, c.momentum, c.filters.maxEntryMcapLamports, 11_500).action).toBe('buy')
+    expect(decideMomentum(momentumSnapshot(s, l, 11_500), c.momentum, c.filters.maxEntryMcapLamports).action).toBe('buy')
   })
 
   it('rejects on dev sell and on expiry', () => {
     const { l, s } = setup()
     s.devSold = true
-    expect(decideMomentum(s, l, c.momentum, c.filters.maxEntryMcapLamports, 11_000)).toMatchObject({ action: 'reject', reason: /dev sold/ })
+    expect(decideMomentum(momentumSnapshot(s, l, 11_000), c.momentum, c.filters.maxEntryMcapLamports)).toMatchObject({ action: 'reject', reason: /dev sold/ })
     s.devSold = false
-    expect(decideMomentum(s, l, c.momentum, c.filters.maxEntryMcapLamports, 30_000)).toMatchObject({ action: 'reject', reason: /expired/ })
+    expect(decideMomentum(momentumSnapshot(s, l, 30_000), c.momentum, c.filters.maxEntryMcapLamports)).toMatchObject({ action: 'reject', reason: /expired/ })
   })
 })
 
 describe('risk manager', () => {
   it('enforces position count and buy rate', () => {
     const r = new RiskManager(cfgWith({ MAX_OPEN_POSITIONS: '2', MAX_BUYS_PER_MINUTE: '2' }))
-    const req = { openPositions: 0, balanceLamports: null, sizeLamports: 1n, priorityLamports: 0n }
-    expect(r.canBuy({ ...req, openPositions: 2 })).toMatchObject({ pass: false, reason: /max open/ })
+    expect(r.canBuy({ openPositions: 2 })).toMatchObject({ pass: false, reason: /max open/ })
     r.recordBuy()
     r.recordBuy()
-    expect(r.canBuy(req)).toMatchObject({ pass: false, reason: /rate limit/ })
-  })
-
-  it('checks balance including overhead and reserve in live mode', () => {
-    const cfg = cfgWith({ DRY_RUN: 'false', PRIVATE_KEY: '[1]', MIN_SOL_RESERVE: '0.05' })
-    const r = new RiskManager(cfg)
-    const size = 100_000_000n
-    const need = size + r.buyOverheadLamports(500_000n) + 50_000_000n
-    expect(r.canBuy({ openPositions: 0, balanceLamports: need - 1n, sizeLamports: size, priorityLamports: 500_000n }).pass).toBe(false)
-    expect(r.canBuy({ openPositions: 0, balanceLamports: need, sizeLamports: size, priorityLamports: 500_000n }).pass).toBe(true)
-    expect(r.canBuy({ openPositions: 0, balanceLamports: null, sizeLamports: size, priorityLamports: 0n })).toMatchObject({ pass: false, reason: /balance unknown/ })
+    expect(r.canBuy({ openPositions: 0 })).toMatchObject({ pass: false, reason: /rate limit/ })
   })
 
   it('pauses when the daily loss limit is hit', () => {
@@ -242,6 +231,6 @@ describe('risk manager', () => {
     expect(r.snapshot().paused).toBe(false)
     r.recordRealized(-250_000_000n)
     expect(r.snapshot()).toMatchObject({ paused: true })
-    expect(r.canBuy({ openPositions: 0, balanceLamports: null, sizeLamports: 1n, priorityLamports: 0n }).pass).toBe(false)
+    expect(r.canBuy({ openPositions: 0 }).pass).toBe(false)
   })
 })

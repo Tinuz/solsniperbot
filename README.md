@@ -54,7 +54,48 @@ npm run dev                 # open http://localhost:8787
 npm run build && npm start
 ```
 
-Open positions are persisted in `data/positions.json` and resume monitoring after a restart. Every buy, sell, close and reconciliation is appended to `data/trades.jsonl`.
+Open positions are persisted in `data/positions.json` and resume monitoring after a restart. Every buy, sell, close and reconciliation is appended to `data/trades.jsonl`, and every launch the bot sees is recorded for later analysis (see [Learning from data](#learning-from-data)).
+
+## Survival: the bot keeps itself alive
+
+The bot is built to protect its own bankroll. It sizes trades to what it can afford, and it stops itself before it bleeds a wallet dry.
+
+- **Sizing follows the bankroll.** With `SIZING=fixed` every trade is `BUY_SOL`. With `SIZING=fraction` every trade is `BUY_FRACTION_PCT` of the free balance, capped at `BUY_SOL`. In both modes a trade shrinks to what is affordable when funds run low.
+- **An exit reserve is never spent.** `MIN_SOL_RESERVE` is kept back so open positions can always pay their sell fees.
+- **Trades that fees would eat are refused.** A trade must be large enough that tips and priority fees for the round trip stay under `MAX_FEE_DRAG_PCT` of it. With the defaults the minimum viable trade is ~0.028 SOL.
+- **Defensive mode.** Once equity (balance plus open positions) falls `DEFENSIVE_DRAWDOWN_PCT` below its peak, trade size is halved until it recovers.
+- **Self-shutdown.** When the wallet can't fund a viable trade, the bot goes *critical* while open positions may still bring money back. Once it is flat and still short, it declares itself **dead**, records why in `data/survival-{paper,live}.json`, and exits with **code 3**. A wallet at 0 counts too.
+- **A dead bot stays dead.** On restart it refuses to run and prints how much SOL it needs. Top up the wallet (or set `PAPER_RESET=true` for paper mode) and it revives by itself. Under systemd use `RestartPreventExitStatus=3` so it isn't restarted in a loop.
+
+Paper mode runs the same rules against a simulated wallet (`PAPER_START_SOL`), so you can watch the bot live and die before it touches real funds. The dashboard's **Vitals** tile shows state, equity, next trade size and runway (how many minimum-size trades are left).
+
+> Survival rules keep the bot from spending money it doesn't have. They don't make it profitable. Only the strategy can do that, and most snipers lose.
+
+## Learning from data
+
+The bot's own trades are a small sample. The launches it *didn't* buy are the bigger lesson. `RECORD_LAUNCHES=true` (the default) writes every launch to `data/launches/<day>.jsonl`, bought or not. Each record holds:
+- the features the bot decided on (dev buy, supply share, curve state, creator history, name, fees);
+- the verdict and reason;
+- every trade on the coin for `RECORD_HORIZON_MIN` minutes;
+- the bot's own result if it traded the coin.
+
+Recording happens after decisions, so it costs no latency. Let the bot collect a few days of data (paper mode is fine), then run:
+
+```bash
+npm run analyze             # report: what works, what doesn't, suggested filter values
+npm run backtest            # grid search over exit settings (TP tiers, SL, trailing, hold, stale)
+```
+
+Both tools replay the recorded launches through the bot's **own** filter, momentum and exit functions, with fills after `PAPER_LATENCY_MS`. `analyze` reports:
+- what the current settings would have made;
+- whether each filter's rejects really were losers (*helps* or *costs you*);
+- which features separate winners from losers;
+- threshold changes that would have done better;
+- how closely the replay matches the bot's actual trades, as a calibration check.
+
+`backtest` ranks hundreds of exit configurations in seconds.
+
+Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings on the newest 30%, which they were never tuned on. Reports are saved to `data/reports/`. Nothing is applied automatically: review a suggestion, try it in paper mode, and analyze again.
 
 ## Strategy
 
@@ -93,7 +134,7 @@ Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` t
 
 ### Risk limits
 
-`MAX_OPEN_POSITIONS`, `MAX_BUYS_PER_MINUTE`, `MIN_SOL_RESERVE` (a balance check that includes tip, priority fee and account rent), and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. None of these can be overridden by a strategy signal.
+`MAX_OPEN_POSITIONS`, `MAX_BUYS_PER_MINUTE`, and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. Balance, trade size and the exit reserve are handled by [survival](#survival-the-bot-keeps-itself-alive). None of these can be overridden by a strategy signal.
 
 ## Dashboard and API
 
@@ -123,13 +164,14 @@ The API binds to `127.0.0.1`. It rejects non-local Host headers (DNS rebinding) 
 src/
   pump/        protocol: constants, PDAs, account/event decoding, curve + fee math, instruction builders
   feed/        log-stream (WS) and Yellowstone gRPC/deshred feeds; live per-coin market book
-  strategy/    launch filters, creator reputation, momentum entry, exit policy, risk limits
+  strategy/    launch filters, creator reputation, momentum entry, exit policy, risk limits, survival
+  learning/    launch recorder, dataset loading, replay engine, report helpers
   trading/     executor (build/sign/land, paper fills, simulation), positions + P&L, PumpSwap sells
   solana/      keep-alive RPC, resilient websocket, blockhash cache, priority fees, landing, confirmation
   api/         local HTTP/WS server and the single-file dashboard
   engine.ts    wires it all together; index.ts is the entrypoint
 test/          protocol checks against the official SDK/IDL, strategy units, end-to-end tests on a mock chain
-scripts/demo.ts  offline demo
+scripts/     demo.ts (offline demo), analyze.ts, backtest.ts
 ```
 
 ## Tests
@@ -140,8 +182,9 @@ npm run typecheck
 ```
 
 - **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
-- **Strategy**: config parsing, filters, exit policy, momentum and risk limits.
-- **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, and the API's security checks.
+- **Strategy**: config parsing, filters, exit policy, momentum, risk limits, and survival (sizing, fee-drag minimum, defensive mode, critical vs dead, persistence and revival).
+- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips and momentum timing.
+- **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 
 **Not covered:** these tests can't prove landing performance or strategy profitability on mainnet. Validate with paper trading and small sizes first.
 

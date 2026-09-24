@@ -35,9 +35,9 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--bad); }
   .dot.up { background: var(--good); }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; }
   .tile .label { color: var(--muted); font-size: 12px; }
-  .tile .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .value { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; white-space: nowrap; }
   .tile .sub { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
   .grid-2 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
   @media (max-width: 980px) { .grid-2 { grid-template-columns: minmax(0, 1fr); } }
@@ -87,6 +87,7 @@
 
 <main>
   <section class="tiles" aria-label="Summary">
+    <div class="panel tile"><div class="label">Vitals <span id="vState" class="badge">–</span></div><div class="value" id="vEquity">–</div><div class="sub" id="vSub"></div></div>
     <div class="panel tile"><div class="label">Realized P&amp;L</div><div class="value" id="tRealized">–</div><div class="sub" id="tToday"></div></div>
     <div class="panel tile"><div class="label">Open P&amp;L</div><div class="value" id="tUnrealized">–</div><div class="sub" id="tOpen"></div></div>
     <div class="panel tile"><div class="label">Win rate</div><div class="value" id="tWin">–</div><div class="sub" id="tWL"></div></div>
@@ -170,7 +171,17 @@
     $('mode').className = 'badge ' + (s.mode === 'live' ? 'bad' : 'accent')
     $('wallet').textContent = s.wallet.slice(0, 4) + '…' + s.wallet.slice(-4)
     $('wallet').title = s.wallet
-    $('balance').textContent = s.balanceSol === null ? 'balance n/a' : `${s.balanceSol.toFixed(4)} SOL`
+    $('balance').textContent = s.balanceSol === null ? 'balance n/a' : `${s.mode === 'paper' ? 'paper ' : ''}${s.balanceSol.toFixed(4)} SOL`
+    const v = s.survival
+    if (v) {
+      $('vState').textContent = v.state
+      $('vState').className = 'badge ' + ({ healthy: 'good', defensive: 'warn', critical: 'bad', dead: 'bad' }[v.state] || '')
+      $('vEquity').textContent = v.equitySol === null ? '–' : `${v.equitySol.toFixed(4)} SOL`
+      $('vSub').textContent = v.state === 'dead' || v.state === 'critical'
+        ? v.reason
+        : `next buy ${v.nextBuySol.toFixed(3)} · runway ${v.runwayTrades} trades · dd ${v.drawdownPct.toFixed(1)}%`
+      $('vSub').title = v.reason
+    }
     const feed = s.feeds[0] || {}
     $('feedDot').className = 'dot' + (feed.connected ? ' up' : '')
     $('feedText').textContent = `${feed.source || 'feed'} · ${(feed.txs || 0).toLocaleString()} txs · ${s.trackedMints} coins`

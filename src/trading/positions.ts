@@ -40,6 +40,8 @@ export interface Position {
   closedAt?: number
   launchSlot?: number
   entrySlot?: number
+  /** Wall-clock time the buy filled. */
+  filledAt?: number
   slotsAfterLaunch?: number
   buySignature?: string
   /** Lamports paid for the tokens, trade fees included. */
@@ -236,6 +238,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
   private applyBuy(pos: Position, req: OpenRequest, r: Extract<TradeResult, { ok: true }>): void {
     pos.status = 'open'
     pos.buySignature = r.signature
+    pos.filledAt = Date.now()
     pos.entrySlot = r.slot
     pos.slotsAfterLaunch = req.launchSlot && r.slot ? r.slot - req.launchSlot : undefined
     pos.tokensBought = r.tokens
