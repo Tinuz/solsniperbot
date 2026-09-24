@@ -21,6 +21,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
   header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 2; }
   h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
@@ -93,6 +94,7 @@
 <main>
   <section class="tiles" aria-label="Summary">
     <div class="panel tile"><div class="label">Vitals <span id="vState" class="badge">–</span></div><div class="value" id="vEquity">–</div><div class="sub" id="vSub"></div></div>
+    <div class="panel tile" id="costTile" hidden><div class="label">Net after costs</div><div class="value" id="cNet">–</div><div class="sub" id="cSub"></div></div>
     <div class="panel tile"><div class="label">Realized P&amp;L</div><div class="value" id="tRealized">–</div><div class="sub" id="tToday"></div></div>
     <div class="panel tile"><div class="label">Open P&amp;L</div><div class="value" id="tUnrealized">–</div><div class="sub" id="tOpen"></div></div>
     <div class="panel tile"><div class="label">Win rate</div><div class="value" id="tWin">–</div><div class="sub" id="tWL"></div></div>
@@ -201,7 +203,14 @@
     }
     const feed = s.feeds[0] || {}
     $('feedDot').className = 'dot' + (feed.connected ? ' up' : '')
-    $('feedText').textContent = `${feed.source || 'feed'} · ${(feed.txs || 0).toLocaleString()} txs · ${s.trackedMints} coins`
+    const u = s.usage
+    const perDay = u ? (u.streamedMbPerDay >= 1024 ? `${(u.streamedMbPerDay / 1024).toFixed(1)} GB/day` : `${Math.round(u.streamedMbPerDay)} MB/day`) : ''
+    $('feedText').textContent = `${feed.source || 'feed'} · ${(feed.txs || 0).toLocaleString()} txs · ${s.trackedMints} coins${u && u.streamedMb > 0 ? ` · ${perDay}` : ''}`
+    $('feedText').title = u
+      ? `Streamed ${u.streamedMb.toFixed(1)} MB, ~${Math.round(u.streamedMbPerDay)} MB/day · ${u.rpcCalls.toLocaleString()} RPC calls, ~${Math.round(u.rpcCallsPerDay).toLocaleString()}/day` +
+        (u.heliusCreditsPerDay !== null ? ` · ≈${u.heliusCreditsPerDay.toLocaleString()} Helius credits/day` : '') +
+        (feed.stalls ? ` · ${feed.stalls} stalled-stream reconnects` : '')
+      : ''
     $('pauseBtn').textContent = s.risk.paused ? 'Resume buying' : 'Pause buying'
     $('pauseBtn').title = s.risk.pauseReason || ''
     const r = s.pnl
@@ -221,6 +230,17 @@
     $('tSlots').textContent = l.slotsAfterLaunch.p50 === undefined ? '–' : `${l.slotsAfterLaunch.p50}`
     $('tLand').textContent = l.landMs.p50 === undefined ? '' : `land p50 ${Math.round(l.landMs.p50)} ms · p90 ${Math.round(l.landMs.p90)} ms`
     renderTuning(s.tuning)
+    const c = s.costs
+    $('costTile').hidden = !c
+    if (c) {
+      const net = c.netLamports / 1e9
+      $('cNet').textContent = signed(net) + ' SOL'
+      $('cNet').className = 'value ' + cls(net)
+      $('cSub').textContent = c.perDaySol === null
+        ? `${c.perMonth} ${c.currency.toUpperCase()}/month · SOL price unknown`
+        : `costs ${c.perDaySol.toFixed(4)} SOL/day · earned ${signed(c.earnedSol)} · spent ${c.accruedSol.toFixed(4)}`
+      $('cSub').title = `${c.perMonth} ${c.currency.toUpperCase()} per month${c.solPrice ? ` at ${c.solPrice[c.currency] ?? ''} ${c.currency.toUpperCase()}/SOL` : ''}; ledger running ${c.sinceDays.toFixed(1)} days`
+    }
   }
 
   const changesText = (changes) => changes.map((c) => `${c.env} ${c.from} → ${c.to}`).join(', ')
@@ -235,8 +255,8 @@
     }
     $('tunePanel').hidden = !t || (t.mode === 'off' && !(edge && edge.required))
     if ($('tunePanel').hidden) return
-    $('tuneMode').textContent = t.adopts ? 'adopts · paper only' : t.mode === 'suggest' ? 'suggests only' : 'autotune off'
-    $('tuneMode').className = 'badge ' + (t.adopts ? 'accent' : '')
+    $('tuneMode').textContent = t.mode === 'live' ? 'adopts · LIVE after shadow test' : t.adopts ? 'adopts · paper only' : t.mode === 'suggest' ? 'suggests only' : 'autotune off'
+    $('tuneMode').className = 'badge ' + (t.mode === 'live' ? 'bad' : t.adopts ? 'accent' : '')
     $('tuneNext').textContent = t.running ? 'checking…' : t.nextRunAt ? `next check in ${age(t.nextRunAt - Date.now())}` : ''
     $('tuneRunBtn').disabled = t.running
     $('tuneRevertBtn').hidden = !(t.adopts && t.overrides.length)
@@ -250,8 +270,12 @@
         parts.push(`<div class="gates">${edge.gates.map((g) => `<span class="badge ${g.pass ? 'good' : 'bad'}" title="${esc(g.detail)}">${g.pass ? '✓' : '✗'} ${esc(g.name)}</span>`).join('')}</div>`)
       }
     }
+    if (t.shadow) {
+      parts.push(`<div><span class="badge accent">shadow test</span> ${esc(changesText(t.shadow.changes))} <span class="muted">· not traded yet · ${t.shadow.trades}/${t.shadow.neededTrades} trades · ${esc(t.shadow.detail)}</span></div>`)
+    }
     if (t.probation) {
-      parts.push(`<div><span class="badge warn">probation</span> ${esc(changesText(t.probation.changes))} <span class="muted">· ${t.probation.trades}/${t.probation.neededTrades} trades · ${esc(t.probation.detail)}</span></div>`)
+      const stake = t.sizeFactor < 1 ? ` · trading at ${Math.round(t.sizeFactor * 100)}% size` : ''
+      parts.push(`<div><span class="badge warn">probation</span> ${esc(changesText(t.probation.changes))} <span class="muted">· ${t.probation.trades}/${t.probation.neededTrades} trades${stake} · ${esc(t.probation.detail)}</span></div>`)
     }
     if (t.cooldownUntil) parts.push(`<div><span class="badge">paused</span> <span class="muted">until ${when(t.cooldownUntil)} · ${esc(t.cooldownReason || '')}</span></div>`)
     const last = t.last

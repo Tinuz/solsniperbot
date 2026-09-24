@@ -157,7 +157,7 @@ const schema = z.object({
   RECORD_MAX_TRADES: num(800, { min: 10, max: 100_000, int: true }),
 
   // Autotuning
-  AUTOTUNE: z.enum(['auto', 'off', 'suggest', 'paper']).default('auto'),
+  AUTOTUNE: z.enum(['auto', 'off', 'suggest', 'paper', 'live']).default('auto'),
   AUTOTUNE_INTERVAL_HOURS: num(6, { min: 0.001, max: 168 }),
   AUTOTUNE_DAYS: num(7, { min: 1, max: 90, int: true }),
   AUTOTUNE_MAX_LAUNCHES: num(30_000, { min: 100, max: 1_000_000, int: true }),
@@ -169,6 +169,11 @@ const schema = z.object({
   AUTOTUNE_PROBATION_TRADES: num(30, { min: 1, int: true }),
   AUTOTUNE_COOLDOWN_HOURS: num(24, { min: 0, max: 720 }),
   REQUIRE_EDGE: z.enum(['auto', 'true', 'false']).default('auto'),
+  LIVE_PROBATION_SIZE_PCT: num(50, { min: 10, max: 100 }),
+
+  // Cost of existence
+  OPERATING_COST_PER_MONTH: num(0, { min: 0 }),
+  OPERATING_COST_CURRENCY: z.enum(['usd', 'eur', 'sol']).default('usd'),
 
   // Risk
   MAX_OPEN_POSITIONS: num(3, { min: 1, int: true }),
@@ -181,6 +186,13 @@ const schema = z.object({
   API_PORT: num(8787, { min: 0, max: 65_535, int: true }),
   API_TOKEN: optionalString,
   DATA_DIR: z.string().default('./data'),
+
+  // Notifications
+  TELEGRAM_BOT_TOKEN: optionalString,
+  TELEGRAM_CHAT_ID: optionalString,
+  TELEGRAM_API_URL: z.string().url().default('https://api.telegram.org'),
+  NOTIFY_TRADES: bool(false),
+  NOTIFY_DAILY_HOUR_UTC: num(7, { min: -1, max: 23, int: true }),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 
@@ -290,8 +302,11 @@ export interface Config {
   recorder: { enabled: boolean; horizonMs: number; maxTrades: number }
 
   autotune: {
-    /** off; suggest = propose only; paper = adopt automatically (paper mode only). */
-    mode: 'off' | 'suggest' | 'paper'
+    /**
+     * off; suggest = propose only; paper = adopt automatically (paper mode
+     * only); live = adopt in live mode after a shadow test, at reduced size.
+     */
+    mode: 'off' | 'suggest' | 'paper' | 'live'
     intervalMs: number
     days: number
     maxLaunches: number
@@ -305,6 +320,19 @@ export interface Config {
     cooldownMs: number
     /** Only buy while the settings in effect make money on recent launches. */
     requireEdge: boolean
+    /** Live autotune: trade size (% of normal) while new settings are on probation. */
+    liveProbationSizePct: number
+  }
+
+  /** What running the bot costs (RPC plan, server); it has to earn at least this. */
+  costs: { perMonth: number; currency: 'usd' | 'eur' | 'sol' }
+
+  notify: {
+    telegram?: { token: string; chatId: string; apiUrl: string }
+    /** Also report every closed trade. */
+    trades: boolean
+    /** UTC hour of the daily summary; -1 disables it. */
+    dailyHourUtc: number
   }
 
   api: { host: string; port: number; token?: string }
@@ -354,6 +382,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
   if (e.AUTOTUNE !== 'off' && e.AUTOTUNE !== 'auto' && !e.RECORD_LAUNCHES) {
     throw new Error('AUTOTUNE needs RECORD_LAUNCHES=true: it learns from recorded launches')
+  }
+  if (e.AUTOTUNE === 'live' && e.DRY_RUN) {
+    throw new Error('AUTOTUNE=live is for live trading (DRY_RUN=false); in paper mode use AUTOTUNE=paper')
+  }
+  if (e.AUTOTUNE === 'live' && e.REQUIRE_EDGE === 'false') {
+    throw new Error('AUTOTUNE=live needs REQUIRE_EDGE: real money is never traded on settings without a proven edge')
   }
   if (e.REQUIRE_EDGE === 'true' && !e.RECORD_LAUNCHES) {
     throw new Error('REQUIRE_EDGE needs RECORD_LAUNCHES=true: the edge is measured on recorded launches')
@@ -470,12 +504,21 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       probationTrades: e.AUTOTUNE_PROBATION_TRADES,
       cooldownMs: Math.round(e.AUTOTUNE_COOLDOWN_HOURS * 3_600_000),
       requireEdge: e.REQUIRE_EDGE === 'auto' ? e.RECORD_LAUNCHES : e.REQUIRE_EDGE === 'true',
+      liveProbationSizePct: e.LIVE_PROBATION_SIZE_PCT,
     },
 
     recorder: {
       enabled: e.RECORD_LAUNCHES,
       horizonMs: Math.round(e.RECORD_HORIZON_MIN * 60_000),
       maxTrades: e.RECORD_MAX_TRADES,
+    },
+
+    costs: { perMonth: e.OPERATING_COST_PER_MONTH, currency: e.OPERATING_COST_CURRENCY },
+
+    notify: {
+      telegram: e.TELEGRAM_BOT_TOKEN && e.TELEGRAM_CHAT_ID ? { token: e.TELEGRAM_BOT_TOKEN, chatId: e.TELEGRAM_CHAT_ID, apiUrl: e.TELEGRAM_API_URL } : undefined,
+      trades: e.NOTIFY_TRADES,
+      dailyHourUtc: e.NOTIFY_DAILY_HOUR_UTC,
     },
 
     api: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN },
@@ -505,6 +548,7 @@ export function publicConfig(c: Config) {
     grpc: grpc ? { url: redact(grpc.url), deshred: grpc.deshred } : undefined,
     jitoAuthUuid: c.jitoAuthUuid ? '***' : undefined,
     api: { host: api.host, port: api.port, tokenSet: Boolean(api.token) },
+    notify: { ...c.notify, telegram: c.notify.telegram ? { configured: true } : undefined },
     filters: {
       ...c.filters,
       nameBlocklist: c.filters.nameBlocklist?.source,

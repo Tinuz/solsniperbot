@@ -2,14 +2,13 @@ import { config as loadDotenv } from 'dotenv'
 import { ApiServer } from './api/server.js'
 import { loadConfig } from './config.js'
 import { Engine } from './engine.js'
+import { Reporter } from './notify/reporter.js'
 import { loadKeypair } from './solana/wallet.js'
 import { DeadError } from './strategy/survival.js'
 import { createLogger } from './util/logger.js'
+import { EXIT_CONFIG, EXIT_DEAD } from './util/restart-policy.js'
 
 loadDotenv({ quiet: true })
-
-/** Exit code when the bot shuts itself down for lack of funds. Process managers should not restart on it. */
-const EXIT_DEAD = 3
 
 async function main(): Promise<void> {
   let cfg
@@ -18,12 +17,19 @@ async function main(): Promise<void> {
   } catch (e) {
     console.error((e as Error).message)
     console.error('\nCopy .env.example to .env and fill in at least RPC_URL.')
-    process.exit(1)
+    process.exit(EXIT_CONFIG)
   }
   const log = createLogger(cfg.logLevel)
-  const wallet = loadKeypair(cfg)
+  let wallet
+  try {
+    wallet = loadKeypair(cfg)
+  } catch (e) {
+    console.error(`Wallet: ${(e as Error).message}`)
+    process.exit(EXIT_CONFIG)
+  }
   const engine = new Engine(cfg, wallet, log)
   const api = new ApiServer(engine, log)
+  const reporter = new Reporter(engine, log)
 
   let stopping = false
   const shutdown = async (signal: string, code = 0) => {
@@ -38,6 +44,7 @@ async function main(): Promise<void> {
     try {
       await api.stop()
       await engine.stop()
+      await reporter.stop(signal)
     } catch (err) {
       log.error({ err }, 'error during shutdown')
     }
@@ -56,7 +63,8 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (err) => log.error({ err }, 'unhandled rejection'))
   process.on('uncaughtException', (err) => {
     log.fatal({ err }, 'uncaught exception')
-    void shutdown('uncaughtException')
+    // Non-zero, so a supervisor restarts it (exit 0 means "stopped on purpose").
+    void shutdown('uncaughtException', 1)
   })
 
   try {
@@ -65,11 +73,22 @@ async function main(): Promise<void> {
     if (err instanceof DeadError) {
       log.fatal(err.message)
       await engine.stop().catch(() => undefined)
+      await reporter.sendNow(`💀 refuses to start: ${err.message}`)
       process.exit(EXIT_DEAD)
     }
+    await reporter.sendNow(`❌ failed to start: ${(err as Error).message}`)
     throw err
   }
   await api.start()
+  await reporter.start()
+  if (reporter.enabled) log.info('telegram notifications on')
+  // Under `npm run supervise`: prove the event loop is alive, so a hung
+  // process gets restarted.
+  if (process.send) {
+    const beat = () => process.send?.({ type: 'heartbeat', at: Date.now() })
+    beat()
+    setInterval(beat, 10_000).unref()
+  }
 }
 
 main().catch((err) => {

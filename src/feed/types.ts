@@ -31,6 +31,10 @@ export interface FeedStats {
   txs: number
   reconnects: number
   lastMessageAt: number
+  /** Bytes received, when the transport reports it. */
+  bytes?: number
+  /** Reconnects forced because the stream went quiet. */
+  stalls?: number
 }
 
 export interface Feed extends EventEmitter {
@@ -41,6 +45,8 @@ export interface Feed extends EventEmitter {
   on(event: 'tx', listener: (tx: FeedTx) => void): this
   on(event: 'preview', listener: (p: LaunchPreview) => void): this
   on(event: 'status', listener: (connected: boolean) => void): this
+  /** Something the owner should know about the feed (it keeps retrying by itself). */
+  on(event: 'problem', listener: (message: string) => void): this
 }
 
 export const mintKey = (k: PublicKey) => k.toBase58()

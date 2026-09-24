@@ -48,6 +48,7 @@ npm run demo                # open http://localhost:8787
 # 2. Paper trading against mainnet
 cp .env.example .env        # set RPC_URL (a paid, low-latency RPC)
 npm run dev                 # open http://localhost:8787
+npm run supervise           # or: unattended, restarted after crashes (see Running unattended)
 
 # 3. Live trading: only after you have watched paper results for a while
 #    set DRY_RUN=false and PRIVATE_KEY (or KEYPAIR_PATH) in .env
@@ -105,7 +106,7 @@ To try other settings on the same data, set them for one run. In PowerShell: `$e
 
 A fresh bot doesn't know whether its settings make money, and blind sniping usually doesn't: on pump.fun most launches never trade again after the first seconds, and every one of those costs the round-trip fees (~8% of a 0.05 SOL trade at the default tips). So with `REQUIRE_EDGE=auto` (the default whenever launches are recorded), the bot only buys while the settings in effect make money on the newest recorded launches.
 - **Until then it observes.** It watches and records every launch, which is how it learns, but spends nothing. The dashboard header shows **observing** or **trading**, and skipped launches say why.
-- **The proof.** Every hour it replays the settings in effect on the newest 30% of the recordings. It needs `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`, enough trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade.
+- **The proof.** Every hour it replays the settings in effect on the newest 30% of the recordings. It needs `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`, enough trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade. With operating costs set (below), the profit must also cover them.
 - **It stops when the edge goes.** If the market turns and the settings stop making money, buying pauses again instead of bleeding the wallet. A proof older than three hours no longer counts.
 - **Settings that change get their own proof.** After a rollback or a revert, the bot checks the new settings before it trades on them. A candidate adopted by autotune is only adopted once it made money on the newest data, so that counts as its proof.
 
@@ -119,9 +120,16 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 | --- | --- |
 | `paper` (default in paper mode) | Adopts a validated candidate straight away, then puts it on probation. |
 | `suggest` (default live) | Only proposes. The candidate shows on the dashboard and in `data/tuning/report.md` as `.env` lines; you decide. |
+| `live` (only when set explicitly) | Live trading. Every candidate is first shadow-tested, then adopted at reduced size until its probation passes (see below). |
 | `off` | Nothing. Also the result when `RECORD_LAUNCHES=false`. |
 
-Automatic adoption only works in paper mode. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, and the tuner checks again before it changes anything.
+`AUTOTUNE=auto` never picks `live`. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, `AUTOTUNE=live` in paper mode, and `AUTOTUNE=live` without the edge gate. The tuner checks again before it changes anything.
+
+**Live autonomy (`AUTOTUNE=live`).** Real money gets extra brakes:
+1. **One change at a time.** A candidate changes one setting, so a loss can be traced to its cause.
+2. **Shadow test.** A validated candidate is not traded at first. It is replayed next to the current settings on launches that arrive after it was found, for `AUTOTUNE_PROBATION_TRADES` trades. If it does worse, it is dropped and never proposed again for `AUTOTUNE_DAYS`.
+3. **Reduced stake.** Once it passes, it goes live at `LIVE_PROBATION_SIZE_PCT`% of the normal trade size (default 50%) and starts a regular probation. If it fails, it is rolled back.
+4. **Its own proof.** The edge gate checks the new settings themselves before the bot trades on them.
 
 **Strict limits.**
 - **What it can change.** Only which coins to buy, when, and when to sell:
@@ -155,6 +163,38 @@ Only one change is on probation at a time.
 Every cycle is logged to `data/tuning/history.jsonl`. `data/tuning/report.md` holds the last decision and the `.env` lines needed to keep the tuned settings, or to use them live.
 
 > Autotune picks the best of the nearby settings on recent data. It can't find an edge that isn't in the data, and a market that changes faster than the tuner can learn will still cost money. That is why it starts in paper mode.
+
+## Running unattended
+
+`npm run supervise` builds the bot and keeps it running:
+- **Restarts.** After a crash, or when it stops responding (no heartbeat for 90 s), it restarts after 5 s, then 10 s, 20 s, and so on up to 5 min. It keeps trying through long network outages, and a stable run resets the delay.
+- **When it stays down.** After Ctrl-C, after the bot declares itself dead (exit code 3: it waits for a top-up), or after a configuration error (exit code 78: fix `.env`).
+- **Autostart on Windows.** Task Scheduler → *Create Task* → trigger *At log on* → action `npm`, arguments `run supervise`, *Start in* the bot's folder.
+- **Linux.** A systemd service with `ExecStart=npm run supervise` (or `node dist/index.js` with `Restart=on-failure` and `RestartPreventExitStatus=3 78`).
+
+Also for long runs:
+- **Stalled streams.** A log stream that answers pings but delivers nothing for 2 minutes is reconnected.
+- **Lean paper mode.** Paper mode polls the blockhash once a minute instead of every second, because paper fills don't need it.
+- **Metered usage.** The dashboard header shows streamed data per day. The tooltip adds RPC calls and, for Helius, the estimated credits per day (about 20 credits per streamed MB plus 1 per request), so you can check your plan covers it.
+
+**Notifications (Telegram).** The bot reports what happens while nobody watches:
+- starts and stops;
+- trading enabled or paused (edge);
+- autotune adoptions, shadow tests and rollbacks;
+- vitals changes and death;
+- feed outages longer than a minute, or a stream that stops delivering (for example when RPC credits run out);
+- a daily summary at `NOTIFY_DAILY_HOUR_UTC`, covering status, the last 24h, costs and usage;
+- with `NOTIFY_TRADES=true`, every closed trade.
+
+Setup:
+1. Create a bot with @BotFather and set `TELEGRAM_BOT_TOKEN`.
+2. Send the bot a message and run `npm run telegram`. It prints your chat id.
+3. Set `TELEGRAM_CHAT_ID` and run it again. It sends a test message.
+
+**Cost of existence.** A bot that has to keep itself alive also has to pay for itself. Set `OPERATING_COST_PER_MONTH` (with `OPERATING_COST_CURRENCY` usd, eur or sol) to what the RPC plan and server cost.
+- **The ledger.** The bot converts the costs to SOL at the current price and accrues them while it runs. It sets them against the P&L of its trades in `data/costs-{paper,live}.json`.
+- **On the dashboard.** The *Net after costs* tile shows the result.
+- **In the edge gate.** The bot only trades while its recent profit, scaled to a day, covers the daily costs.
 
 ## Strategy
 
@@ -231,9 +271,10 @@ src/
   trading/     executor (build/sign/land, paper fills, simulation), positions + P&L, PumpSwap sells
   solana/      keep-alive RPC, resilient websocket, blockhash cache, priority fees, landing, confirmation
   api/         local HTTP/WS server and the single-file dashboard
-  engine.ts    wires it all together; index.ts is the entrypoint
+  notify/      Telegram notifier and the reporter (alerts, daily summary)
+  engine.ts    wires it all together; index.ts is the entrypoint; supervisor.ts restarts it
 test/          protocol checks against the official SDK/IDL, strategy units, end-to-end tests on a mock chain
-scripts/     demo.ts (offline demo), analyze.ts, backtest.ts
+scripts/     demo.ts (offline demo), analyze.ts, backtest.ts, telegram.ts (notification setup)
 ```
 
 ## Tests
@@ -245,7 +286,21 @@ npm run typecheck
 
 - **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
 - **Strategy**: config parsing, filters, exit policy, momentum, risk limits, and survival (sizing, fee-drag minimum, defensive mode, critical vs dead, persistence and revival).
-- **Edge gate**: no buys (but full recording) until the settings are proven; proof per exact settings, restored after restart, stale after 3h, withdrawn when the market turns.
+- **Edge gate**:
+  - no buys (but full recording) until the settings are proven;
+  - the proof is per exact settings, restored after restart, stale after 3h, and withdrawn when the market turns;
+  - operating costs must be covered, with sampled data scaled up.
+- **Live autonomy**:
+  - a candidate is shadow-tested before any real trade;
+  - one change at a time;
+  - half stake during probation, full stake after;
+  - a candidate that fails its shadow test is never traded or proposed again;
+  - config refuses live autotune in paper mode and without the edge gate.
+- **Unattended running**:
+  - restart policy: no restart after a clean stop, death or a config error; growing delays after crashes and hangs, never giving up;
+  - Telegram delivery: in order, waits out rate limits, drops refused messages, token kept out of the API;
+  - the reporter's alerts, trade reports, debounced feed outages and once-a-day summary;
+  - the operating-cost ledger: pricing, accrual while running, and restarts.
 - **Autotune**:
   - every tunable value round-trips through `.env`, momentum and entry mode included;
   - it switches to momentum entry when waiting is what wins out of sample;

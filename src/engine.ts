@@ -24,6 +24,7 @@ import { staticFilter } from './strategy/filters.js'
 import { MetadataFetcher, hasSocials } from './strategy/metadata.js'
 import { decideMomentum, momentumSnapshot } from './strategy/momentum.js'
 import { RiskManager } from './strategy/risk.js'
+import { OperatingCosts } from './strategy/costs.js'
 import { Survival, type Vitals } from './strategy/survival.js'
 import { AmmSeller } from './trading/amm.js'
 import { Executor } from './trading/executor.js'
@@ -86,12 +87,19 @@ const lamportsView = (v: Vitals) => ({
 })
 
 /** Wires feeds, strategy, risk and execution together. */
-export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] }> {
+export class Engine extends EventEmitter<{
+  event: [EngineEvent]
+  dead: [Vitals]
+  /** Something the owner should hear about even when nobody watches the dashboard. */
+  alert: [string]
+  feed: [string, boolean]
+}> {
   readonly rpc: RpcClient
   readonly protocol: PumpProtocol
   readonly market: MarketBook
   readonly risk: RiskManager
   readonly survival: Survival
+  readonly costs: OperatingCosts
   readonly positions: PositionManager
   readonly executor: Executor
   readonly recorder?: LaunchRecorder
@@ -114,6 +122,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
   private vitals?: Vitals
   private timers: NodeJS.Timeout[] = []
   private readonly startedAt = Date.now()
+  private readonly feedProblemAt = new Map<string, number>()
   /** Fingerprint of the strategy settings, recomputed only when the tuner changes them. */
   private settingsFp = { version: -1, value: '' }
 
@@ -128,7 +137,9 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     this.market = new MarketBook(this.protocol)
     this.risk = new RiskManager(cfg)
     this.survival = new Survival(cfg, log)
-    this.blockhash = new BlockhashCache(this.rpc, log)
+    this.costs = new OperatingCosts(cfg, log)
+    // Paper fills need no blockhash; polling one every second would only burn RPC credits.
+    this.blockhash = new BlockhashCache(this.rpc, log, cfg.dryRun && !cfg.simulateDryRun ? 60_000 : 1_000)
     this.fees = new PriorityFees(cfg, this.rpc, log, () => this.protocol.hotAccounts())
     this.lander = cfg.dryRun ? undefined : new Lander(cfg, this.rpc, log)
     this.tracker = new SignatureTracker(
@@ -166,7 +177,9 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       this.recorder = new LaunchRecorder({ dataDir: cfg.dataDir, horizonMs: cfg.recorder.horizonMs, maxTrades: cfg.recorder.maxTrades }, log)
     }
     // Built before anything can change cfg, so it captures the .env settings.
-    if (cfg.autotune.mode !== 'off' || cfg.autotune.requireEdge) this.tuner = new AutoTuner(cfg, log)
+    if (cfg.autotune.mode !== 'off' || cfg.autotune.requireEdge) {
+      this.tuner = new AutoTuner(cfg, log, { costPerDayLamports: () => (this.costs.enabled ? this.costs.perDayLamports() : 0) })
+    }
 
     if (cfg.feed === 'grpc' && cfg.grpc) this.feeds.push(new GrpcFeed(cfg.grpc, log))
     else this.feeds.push(new LogsFeed(cfg.wsUrl, log))
@@ -183,6 +196,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     if (cfg.dryRun && !this.wallet) log.warn('no wallet configured: paper trading with an ephemeral address')
 
     await this.survival.load()
+    await this.costs.load()
     // Tuned settings (paper autotune) are in place before the first launch.
     await this.tuner?.load()
     await this.protocol.start()
@@ -210,6 +224,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     this.positions.on('update', (p) => this.emit('event', { type: 'position', data: p }))
     this.positions.on('closed', (p) => {
       this.survival.bookClosed(p)
+      this.costs.bookClosed(p)
       this.recorder?.position(p)
       this.emit('event', { type: 'closed', data: p })
       if (!cfg.dryRun) void this.refreshBalance()
@@ -225,7 +240,18 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     for (const feed of this.feeds) {
       feed.on('tx', (tx) => this.onFeedTx(tx))
       feed.on('preview', (p) => this.market.ingestPreview(p))
-      feed.on('status', (up) => this.notice(up ? 'info' : 'warn', `${feed.name} feed ${up ? 'connected' : 'disconnected'}`))
+      feed.on('problem', (message) => {
+        this.notice('warn', `${feed.name} feed: ${message}`)
+        // At most one push per feed every 30 minutes: a dead stream would otherwise repeat this.
+        const last = this.feedProblemAt.get(feed.name) ?? 0
+        if (Date.now() - last < 30 * 60_000) return
+        this.feedProblemAt.set(feed.name, Date.now())
+        this.emit('alert', `⚠️ ${feed.name} feed: ${message}`)
+      })
+      feed.on('status', (up) => {
+        this.notice(up ? 'info' : 'warn', `${feed.name} feed ${up ? 'connected' : 'disconnected'}`)
+        this.emit('feed', feed.name, up)
+      })
       await feed.start()
     }
 
@@ -239,8 +265,18 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       this.timers.push(setInterval(() => recorder.tick(), 1_000))
     }
     if (!cfg.dryRun) this.timers.push(setInterval(() => void this.refreshBalance(), 15_000))
+    if (this.costs.enabled) {
+      this.costs.start()
+      this.timers.push(setInterval(() => {
+        this.costs.accrue()
+        void this.costs.persist()
+      }, 60_000))
+    }
     if (this.tuner) {
-      this.tuner.on('notice', (level, message) => this.notice(level, message))
+      this.tuner.on('notice', (level, message) => {
+        this.notice(level, message)
+        this.emit('alert', message)
+      })
       this.tuner.start()
     }
     log.info('engine running')
@@ -259,6 +295,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     await this.creators.flush()
     await this.recorder?.flush()
     await this.survival.flush()
+    await this.costs.stop()
   }
 
   // Stream handling -----------------------------------------------------------
@@ -375,6 +412,13 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
         return
       }
 
+      // Live autotune: new settings trade smaller until their probation is over.
+      const factor = this.tuner?.sizeFactor() ?? 1
+      let lamports = vitals.nextBuyLamports
+      if (factor < 1) {
+        const reduced = (lamports * BigInt(Math.round(factor * 100))) / 100n
+        lamports = reduced > vitals.minViableBuyLamports ? reduced : vitals.minViableBuyLamports
+      }
       const sendStart = nowMs()
       this.counters.entries++
       const pos = await this.positions.open({
@@ -383,7 +427,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
         creator: state.curve.creator,
         isMayhemMode: launch.isMayhemMode,
         curve: state.curve,
-        lamports: vitals.nextBuyLamports,
+        lamports,
         slippageBps: this.cfg.buySlippageBps,
         name: launch.name,
         symbol: launch.symbol,
@@ -459,6 +503,8 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       balanceSol: vitals.balanceLamports === null ? null : lamportsToSol(vitals.balanceLamports),
       survival: lamportsView(vitals),
       recorder: this.recorder?.stats() ?? null,
+      usage: this.usage(),
+      costs: this.costs.enabled ? this.costs.status() : null,
       tuning: this.tuner?.status() ?? { mode: 'off' as const },
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
       feeds: this.feeds.map((f) => f.stats()),
@@ -486,6 +532,25 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
         landMs: this.latency.land.summary(),
         slotsAfterLaunch: this.latency.slots.summary(),
       },
+    }
+  }
+
+  /**
+   * Data and request volume since start, extrapolated per day: what a metered
+   * RPC provider bills. Helius: ~20 credits per streamed MB, ~1 per request.
+   */
+  usage() {
+    const days = Math.max((Date.now() - this.startedAt) / 86_400_000, 1 / 1440)
+    const bytes = this.feeds.reduce((n, f) => n + (f.stats().bytes ?? 0), 0)
+    const mb = bytes / 1_048_576
+    const calls = this.rpc.calls
+    const helius = /helius/i.test(this.cfg.rpcUrl) || /helius/i.test(this.cfg.wsUrl)
+    return {
+      streamedMb: mb,
+      streamedMbPerDay: mb / days,
+      rpcCalls: calls,
+      rpcCallsPerDay: calls / days,
+      heliusCreditsPerDay: helius ? Math.round((mb / days) * 20 + calls / days) : null,
     }
   }
 
@@ -546,6 +611,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     this.vitals = this.survival.check({ ...this.survivalInput(), busy })
     if (prev && prev !== this.vitals.state && this.vitals.state !== 'dead') {
       this.notice(this.vitals.state === 'healthy' ? 'info' : 'warn', `vitals: ${this.vitals.state} (${this.vitals.reason})`)
+      this.emit('alert', `vitals ${prev} → ${this.vitals.state}: ${this.vitals.reason}`)
       this.log.warn(lamportsView(this.vitals), 'vitals changed')
     }
   }
@@ -555,6 +621,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     this.risk.pause(`dead: ${v.reason}`)
     this.momentum.clear()
     this.notice('error', `bot died: ${v.reason}`)
+    this.emit('alert', `bot died: ${v.reason}`)
     this.emit('dead', v)
   }
 

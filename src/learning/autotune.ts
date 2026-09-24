@@ -66,6 +66,19 @@ interface TuningState {
   active: TunableParams
   adoptions: Adoption[]
   probation?: { adoptionId: number; since: number; neededTrades: number; last?: ProbationResult }
+  /**
+   * Live mode: a candidate being paper-tested on launches that arrive after
+   * it was found, before any real money trades on it.
+   */
+  shadow?: {
+    since: number
+    neededTrades: number
+    from: TunableParams
+    to: TunableParams
+    changes: ParamChange[]
+    test: Adoption['test']
+    last?: ProbationResult
+  }
   cooldownUntil?: number
   cooldownReason?: string
   /** Settings that failed probation, not adopted again for a while. */
@@ -83,6 +96,8 @@ interface TuningState {
 export interface AutoTunerOptions {
   /** Run cycles on the calling thread (tests). Default: a worker thread. */
   inline?: boolean
+  /** Operating cost per day the edge must cover (null: not priced yet). */
+  costPerDayLamports?: () => number | null
   /** Delay before the first cycle after start. */
   startDelayMs?: number
   now?: () => number
@@ -96,9 +111,11 @@ export interface TradingGate {
 const describe = (changes: ParamChange[]) => changes.map((c) => `${c.env} ${c.from} → ${c.to}`).join(', ')
 const iso = (t: number) => new Date(t).toISOString().slice(0, 16).replace('T', ' ')
 
+const adoptsIn = (cfg: Config) => (cfg.autotune.mode === 'paper' && cfg.dryRun) || (cfg.autotune.mode === 'live' && !cfg.dryRun)
+
 const stateFile = (cfg: Config) => {
-  const adopts = cfg.autotune.mode === 'paper' && cfg.dryRun
-  return join(cfg.dataDir, 'tuning', `state-${adopts ? 'paper' : `${cfg.autotune.mode}-${cfg.dryRun ? 'paper' : 'live'}`}.json`)
+  const name = adoptsIn(cfg) ? (cfg.dryRun ? 'paper' : 'live') : `${cfg.autotune.mode}-${cfg.dryRun ? 'paper' : 'live'}`
+  return join(cfg.dataDir, 'tuning', `state-${name}.json`)
 }
 
 /**
@@ -107,7 +124,7 @@ const stateFile = (cfg: Config) => {
  * the .env settings changed since.
  */
 export async function loadTunedParams(cfg: Config): Promise<{ params: TunableParams; changes: ParamChange[] } | undefined> {
-  if (!(cfg.autotune.mode === 'paper' && cfg.dryRun)) return undefined
+  if (!adoptsIn(cfg)) return undefined
   const saved = await readJson<TuningState>(stateFile(cfg)).catch(() => undefined)
   if (!saved || saved.v !== 1) return undefined
   const baseline = paramsFromConfig(cfg)
@@ -170,7 +187,17 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
   /** True when this tuner may change the running bot's settings. */
   get adopts(): boolean {
-    return this.cfg.autotune.mode === 'paper' && this.cfg.dryRun
+    return adoptsIn(this.cfg)
+  }
+
+  /** Live autotune: real money, so every candidate is shadow-tested first. */
+  get live(): boolean {
+    return this.cfg.autotune.mode === 'live' && !this.cfg.dryRun
+  }
+
+  /** Share of the normal trade size to use now: reduced while live settings are on probation. */
+  sizeFactor(): number {
+    return this.live && this.state.probation ? this.cfg.autotune.liveProbationSizePct / 100 : 1
   }
 
   get busy(): boolean {
@@ -269,6 +296,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const o = this.cfg.autotune
     const current = paramsFromConfig(this.cfg)
     const probationAdoption = this.adopts && st.probation ? this.adoption(st.probation.adoptionId) : undefined
+    const shadow = this.live && !probationAdoption ? st.shadow : undefined
     const coolingDown = (st.cooldownUntil ?? 0) > at
     // Hourly checks are cheap; the search itself runs every AUTOTUNE_INTERVAL_HOURS,
     // or with every check while data is still short (then it returns at once).
@@ -285,13 +313,17 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
         minTrainTrades: o.minTrainTrades,
         minTestTrades: o.minTestTrades,
         minEdgePct: o.minEdgePct,
-        maxChanges: o.maxChanges,
+        // Live: one change at a time, so a loss can be traced to its cause.
+        maxChanges: this.live ? 1 : o.maxChanges,
         exclude: this.recentRollbacks(at).map((r) => r.key),
+        costPerDayLamports: this.opts.costPerDayLamports?.(),
       },
-      propose: o.mode !== 'off' && !probationAdoption && !coolingDown && searchDue,
+      propose: o.mode !== 'off' && !probationAdoption && !shadow && !coolingDown && searchDue,
       probation: probationAdoption && st.probation
         ? { adopted: probationAdoption.to, previous: probationAdoption.from, since: st.probation.since, neededTrades: st.probation.neededTrades }
-        : undefined,
+        : shadow
+          ? { adopted: shadow.to, previous: shadow.from, since: shadow.since, neededTrades: shadow.neededTrades }
+          : undefined,
       edge: o.requireEdge,
       now: at,
     }
@@ -356,10 +388,11 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
   /** Back to the .env settings; tuning pauses for the cooldown. */
   async revert(): Promise<ParamChange[]> {
-    if (!this.adopts) throw new Error('nothing to revert: settings are only tuned automatically in paper mode')
+    if (!this.adopts) throw new Error('nothing to revert: settings are only tuned automatically with AUTOTUNE=paper or live')
     if (this.running) throw new Error('a tuning cycle is running; try again when it finishes')
     const undone = diffParams(this.state.active, this.baseline)
-    if (!undone.length && !this.state.probation) return []
+    if (!undone.length && !this.state.probation && !this.state.shadow) return []
+    this.state.shadow = undefined
     this.endProbation('reverted', 'reverted by hand')
     this.setActive(this.baseline)
     this.startCooldown('reverted by hand')
@@ -407,6 +440,16 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
               changes: probationAdoption.changes,
             }
           : null,
+      shadow: st.shadow
+        ? {
+            since: st.shadow.since,
+            neededTrades: st.shadow.neededTrades,
+            trades: st.shadow.last?.trades ?? 0,
+            detail: st.shadow.last?.detail ?? 'waiting for new launches',
+            changes: st.shadow.changes,
+          }
+        : null,
+      sizeFactor: this.sizeFactor(),
       cooldownUntil: (st.cooldownUntil ?? 0) > at ? st.cooldownUntil! : null,
       cooldownReason: (st.cooldownUntil ?? 0) > at ? (st.cooldownReason ?? null) : null,
       last: st.lastRun ?? null,
@@ -435,7 +478,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
   private intervalMs(): number {
     const o = this.cfg.autotune
-    const frequent = o.requireEdge || (this.adopts && this.state.probation)
+    const frequent = o.requireEdge || (this.adopts && (this.state.probation || this.state.shadow))
     return frequent ? Math.min(o.intervalMs, CHECK_MS) : o.intervalMs
   }
 
@@ -514,6 +557,22 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       return { ...base, decision: 'skipped', reason: `probation ${pr.status}: ${pr.detail}`, changes: [], gates: [], probation: pr }
     }
 
+    if (res.probation && st.shadow) {
+      const pr = res.probation
+      const sh = st.shadow
+      sh.last = pr
+      if (pr.status === 'passed') {
+        st.shadow = undefined
+        this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`)
+      } else if (pr.status === 'failed') {
+        st.shadow = undefined
+        st.rolledBack = [...this.recentRollbacks(at), { key: paramsKey(sh.to), at }]
+        void this.journal.append({ type: 'shadow-failed', at, changes: sh.changes, probation: pr })
+        this.notice('warn', `autotune: shadow test failed, not adopting ${describe(sh.changes)} (${pr.detail})`)
+      }
+      return { ...base, decision: 'skipped', reason: `shadow test ${pr.status}: ${pr.detail}`, changes: [], gates: [], probation: pr }
+    }
+
     const p = res.proposal
     if (!p) {
       const o = this.cfg.autotune
@@ -538,7 +597,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const failed = this.recentRollbacks(at).find((r) => r.key === paramsKey(p.candidate!))
     const guard: Gate = failed
       ? { name: 'not rolled back before', pass: false, detail: `these settings failed probation on ${iso(failed.at)}` }
-      : !withinLimits(p.candidate, job.current) || p.changes.length > this.cfg.autotune.maxChanges
+      : !withinLimits(p.candidate, job.current) || p.changes.length > (this.live ? 1 : this.cfg.autotune.maxChanges)
         ? { name: 'within limits', pass: false, detail: 'candidate outside the tuning limits' }
         : { name: 'within limits', pass: true, detail: `${p.changes.length} change(s), all within bounds and step limits` }
     out.gates = [...p.gates, guard]
@@ -556,32 +615,38 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       return out
     }
 
-    const test = p.metrics!
-    const adoption: Adoption = {
-      id: (st.adoptions.at(-1)?.id ?? 0) + 1,
-      at,
-      changes: p.changes,
-      from: job.current,
-      to: p.candidate,
-      test: {
-        trades: test.candidate?.test.trades ?? 0,
-        currentLamports: test.current.test.totalPnlLamports,
-        candidateLamports: test.candidate?.test.totalPnlLamports ?? 0,
-      },
-      status: 'probation',
+    const metrics = p.metrics!
+    const test = {
+      trades: metrics.candidate?.test.trades ?? 0,
+      currentLamports: metrics.current.test.totalPnlLamports,
+      candidateLamports: metrics.candidate?.test.totalPnlLamports ?? 0,
     }
-    this.setActive(p.candidate)
+    if (this.live) {
+      // Real money: first prove it forward on launches nobody has seen yet, without trading it.
+      st.shadow = { since: at, neededTrades: this.cfg.autotune.probationTrades, from: job.current, to: p.candidate, changes: p.changes, test }
+      void this.journal.append({ type: 'shadow', at, changes: p.changes, test })
+      this.notice('info', `autotune: shadow-testing ${describe(p.changes)} on new launches before trading it live (${this.cfg.autotune.probationTrades} trades)`)
+      out.reason = `all ${out.gates.length} gates passed; shadow test started`
+      if (this.timer) this.schedule(this.intervalMs())
+      return out
+    }
+    this.adopt(job.current, p.candidate, p.changes, test, at, `(test ${sol(test.currentLamports)} → ${sol(test.candidateLamports)} SOL)`)
+    return out
+  }
+
+  /** Puts adopted settings into effect and on probation. */
+  private adopt(from: TunableParams, to: TunableParams, changes: ParamChange[], test: Adoption['test'], at: number, why: string): void {
+    const st = this.state
+    const adoption: Adoption = { id: (st.adoptions.at(-1)?.id ?? 0) + 1, at, changes, from, to, test, status: 'probation' }
+    this.setActive(to)
     st.adoptions = [...st.adoptions, adoption].slice(-MAX_ADOPTIONS_KEPT)
     st.probation = { adoptionId: adoption.id, since: at, neededTrades: this.cfg.autotune.probationTrades }
-    void this.journal.append({ type: 'adopt', at, adoption: adoption.id, changes: p.changes, test: adoption.test })
-    this.notice(
-      'info',
-      `autotune adopted ${describe(p.changes)} (test ${sol(adoption.test.currentLamports)} → ${sol(adoption.test.candidateLamports)} SOL); on probation for ${this.cfg.autotune.probationTrades} trades`,
-    )
-    this.log.warn({ changes: describe(p.changes), test: adoption.test }, 'autotune: adopted new settings (paper)')
+    void this.journal.append({ type: 'adopt', at, adoption: adoption.id, changes, test, live: this.live })
+    const stake = this.live ? `; trading at ${this.cfg.autotune.liveProbationSizePct}% size` : ''
+    this.notice('info', `autotune adopted ${describe(changes)} ${why}; on probation for ${this.cfg.autotune.probationTrades} trades${stake}`)
+    this.log.warn({ changes: describe(changes), test, live: this.live }, `autotune: adopted new settings (${this.live ? 'LIVE' : 'paper'})`)
     // Probation is checked more often than regular cycles.
     if (this.timer) this.schedule(this.intervalMs())
-    return out
   }
 
   /** Puts `p` into effect on the running bot. */
@@ -658,7 +723,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const lines: string[] = [
       '# Autotune report',
       '',
-      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.adopts ? ' (adopts automatically, paper only)' : ' (proposes only)'}.`,
+      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.live ? ' (adopts in LIVE trading after a shadow test, at reduced size during probation)' : this.adopts ? ' (adopts automatically, paper only)' : ' (proposes only)'}.`,
       '',
     ]
     if (this.cfg.autotune.requireEdge) {
@@ -679,6 +744,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     }
     if (s.gates.length) {
       lines.push('## Gates', '', table(['Gate', 'Result', 'Detail'], s.gates.map((g) => [g.name, g.pass ? 'pass' : 'FAIL', g.detail])), '')
+    }
+    if (st.shadow) {
+      lines.push('## Shadow test', '', `${describe(st.shadow.changes)} since ${iso(st.shadow.since)}, not traded yet: ${st.shadow.last?.detail ?? 'waiting for new launches'}.`, '')
     }
     if (st.probation) {
       const a = this.adoption(st.probation.adoptionId)
