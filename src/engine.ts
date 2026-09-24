@@ -5,6 +5,7 @@ import { GrpcFeed } from './feed/grpc-feed.js'
 import { LogsFeed } from './feed/logs-feed.js'
 import { type Launch, MarketBook, type MintState } from './feed/market.js'
 import type { Feed, FeedTx } from './feed/types.js'
+import { AutoTuner } from './learning/autotune.js'
 import { LaunchRecorder } from './learning/recorder.js'
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from './pump/constants.js'
 import { curveFromAccount, curveProgressBps, feeRates, marketCapLamports, spotPriceLamports } from './pump/curve.js'
@@ -93,6 +94,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
   readonly positions: PositionManager
   readonly executor: Executor
   readonly recorder?: LaunchRecorder
+  readonly tuner?: AutoTuner
   private readonly blockhash: BlockhashCache
   private readonly fees: PriorityFees
   private readonly lander?: Lander
@@ -160,6 +162,8 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     if (cfg.recorder.enabled) {
       this.recorder = new LaunchRecorder({ dataDir: cfg.dataDir, horizonMs: cfg.recorder.horizonMs, maxTrades: cfg.recorder.maxTrades }, log)
     }
+    // Built before anything can change cfg, so it captures the .env settings.
+    if (cfg.autotune.mode !== 'off') this.tuner = new AutoTuner(cfg, log)
 
     if (cfg.feed === 'grpc' && cfg.grpc) this.feeds.push(new GrpcFeed(cfg.grpc, log))
     else this.feeds.push(new LogsFeed(cfg.wsUrl, log))
@@ -176,6 +180,8 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
     if (cfg.dryRun && !this.wallet) log.warn('no wallet configured: paper trading with an ephemeral address')
 
     await this.survival.load()
+    // Tuned settings (paper autotune) are in place before the first launch.
+    await this.tuner?.load()
     await this.protocol.start()
     log.info(
       { feeTiers: this.protocol.feeConfig?.feeTiers.length ?? 0, createV2: this.protocol.global?.createV2Enabled },
@@ -230,11 +236,16 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       this.timers.push(setInterval(() => recorder.tick(), 1_000))
     }
     if (!cfg.dryRun) this.timers.push(setInterval(() => void this.refreshBalance(), 15_000))
+    if (this.tuner) {
+      this.tuner.on('notice', (level, message) => this.notice(level, message))
+      this.tuner.start()
+    }
     log.info('engine running')
   }
 
   async stop(): Promise<void> {
     for (const t of this.timers) clearInterval(t)
+    await this.tuner?.stop()
     for (const f of this.feeds) f.stop()
     this.fees.stop()
     this.lander?.stop()
@@ -439,6 +450,7 @@ export class Engine extends EventEmitter<{ event: [EngineEvent]; dead: [Vitals] 
       balanceSol: vitals.balanceLamports === null ? null : lamportsToSol(vitals.balanceLamports),
       survival: lamportsView(vitals),
       recorder: this.recorder?.stats() ?? null,
+      tuning: this.tuner?.status() ?? { mode: 'off' as const },
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
       feeds: this.feeds.map((f) => f.stats()),
       landing: this.lander ? { mode: this.cfg.landing, targets: this.lander.targetNames } : null,

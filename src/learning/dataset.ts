@@ -6,8 +6,12 @@ import { PublicKey } from '@solana/web3.js'
 import type { Launch } from '../feed/market.js'
 import type { LaunchRecord } from './record.js'
 
-/** Loads recorded launches, oldest first. `days` keeps only the most recent N daily files. */
-export async function loadRecords(dataDir: string, opts: { days?: number } = {}): Promise<LaunchRecord[]> {
+/**
+ * Loads recorded launches, oldest first. `days` keeps only the most recent N
+ * daily files. Beyond `max` launches an even sample across the whole period
+ * is kept (not just the newest), and only sampled lines are parsed.
+ */
+export async function loadRecords(dataDir: string, opts: { days?: number; max?: number } = {}): Promise<LaunchRecord[]> {
   const dir = join(dataDir, 'launches')
   let files: string[]
   try {
@@ -16,11 +20,21 @@ export async function loadRecords(dataDir: string, opts: { days?: number } = {})
     return []
   }
   if (opts.days) files = files.slice(-opts.days)
+  let stride = 1
+  if (opts.max) {
+    let total = 0
+    for (const f of files) total += await countLines(join(dir, f))
+    if (total > opts.max) stride = total / opts.max
+  }
   const out: LaunchRecord[] = []
+  let index = 0
+  let next = 0
   for (const f of files) {
     const lines = createInterface({ input: createReadStream(join(dir, f)), crlfDelay: Number.POSITIVE_INFINITY })
     for await (const line of lines) {
       if (!line) continue
+      if (index++ < next) continue
+      next += stride
       try {
         const rec = JSON.parse(line) as LaunchRecord
         if (rec.v === 1 && Array.isArray(rec.trades)) out.push(rec)
@@ -30,6 +44,15 @@ export async function loadRecords(dataDir: string, opts: { days?: number } = {})
     }
   }
   return out.sort((a, b) => a.t - b.t)
+}
+
+async function countLines(path: string): Promise<number> {
+  let n = 0
+  for await (const chunk of createReadStream(path)) {
+    const buf = chunk as Buffer
+    for (let i = buf.indexOf(10); i !== -1; i = buf.indexOf(10, i + 1)) n++
+  }
+  return n
 }
 
 /** Chronological split: the most recent `testFrac` of launches is held out. */

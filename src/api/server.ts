@@ -149,6 +149,8 @@ export class ApiServer {
             return send(res, 200, this.engine.recentLaunches())
           case '/api/config':
             return send(res, 200, publicConfig(this.engine.cfg))
+          case '/api/tuning':
+            return send(res, 200, this.engine.tuner?.status() ?? { mode: 'off' })
         }
         throw new HttpError(404, 'not found')
       }
@@ -184,6 +186,23 @@ export class ApiServer {
               return send(res, pos.status === 'failed' ? 409 : 200, pos)
             } catch (e) {
               throw new HttpError(400, (e as Error).message)
+            }
+          }
+          case '/api/tuning/run': {
+            const tuner = this.engine.tuner
+            if (!tuner) throw new HttpError(409, 'autotune is off')
+            if (tuner.busy) throw new HttpError(409, 'a tuning cycle is already running')
+            // A cycle can take a while; the dashboard follows it through status updates.
+            tuner.run('manual').catch((err: Error) => this.log.warn({ err }, 'manual tuning cycle failed'))
+            return send(res, 202, { started: true })
+          }
+          case '/api/tuning/revert': {
+            const tuner = this.engine.tuner
+            if (!tuner) throw new HttpError(409, 'autotune is off')
+            try {
+              return send(res, 200, { undone: await tuner.revert() })
+            } catch (e) {
+              throw new HttpError(409, (e as Error).message)
             }
           }
         }

@@ -156,6 +156,19 @@ const schema = z.object({
   RECORD_HORIZON_MIN: num(15, { min: 0.001, max: 240 }),
   RECORD_MAX_TRADES: num(800, { min: 10, max: 100_000, int: true }),
 
+  // Autotuning
+  AUTOTUNE: z.enum(['auto', 'off', 'suggest', 'paper']).default('auto'),
+  AUTOTUNE_INTERVAL_HOURS: num(6, { min: 0.001, max: 168 }),
+  AUTOTUNE_DAYS: num(7, { min: 1, max: 90, int: true }),
+  AUTOTUNE_MAX_LAUNCHES: num(30_000, { min: 100, max: 1_000_000, int: true }),
+  AUTOTUNE_MIN_LAUNCHES: num(2_000, { min: 10, int: true }),
+  AUTOTUNE_MIN_HOURS: num(24, { min: 0, max: 2_000 }),
+  AUTOTUNE_MIN_TRADES: num(60, { min: 5, int: true }),
+  AUTOTUNE_MIN_EDGE_PCT: num(1, { min: 0, max: 100 }),
+  AUTOTUNE_MAX_CHANGES: num(3, { min: 1, max: 11, int: true }),
+  AUTOTUNE_PROBATION_TRADES: num(30, { min: 1, int: true }),
+  AUTOTUNE_COOLDOWN_HOURS: num(24, { min: 0, max: 720 }),
+
   // Risk
   MAX_OPEN_POSITIONS: num(3, { min: 1, int: true }),
   MAX_BUYS_PER_MINUTE: num(6, { min: 1, int: true }),
@@ -275,6 +288,22 @@ export interface Config {
 
   recorder: { enabled: boolean; horizonMs: number; maxTrades: number }
 
+  autotune: {
+    /** off; suggest = propose only; paper = adopt automatically (paper mode only). */
+    mode: 'off' | 'suggest' | 'paper'
+    intervalMs: number
+    days: number
+    maxLaunches: number
+    minLaunches: number
+    minHours: number
+    minTrainTrades: number
+    minTestTrades: number
+    minEdgePct: number
+    maxChanges: number
+    probationTrades: number
+    cooldownMs: number
+  }
+
   api: { host: string; port: number; token?: string }
   dataDir: string
   logLevel: Env['LOG_LEVEL']
@@ -317,6 +346,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
   if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
+  if (e.AUTOTUNE === 'paper' && !e.DRY_RUN) {
+    throw new Error('AUTOTUNE=paper only works in paper mode (DRY_RUN=true); use AUTOTUNE=suggest for proposals in live mode')
+  }
+  if (e.AUTOTUNE !== 'off' && e.AUTOTUNE !== 'auto' && !e.RECORD_LAUNCHES) {
+    throw new Error('AUTOTUNE needs RECORD_LAUNCHES=true: it learns from recorded launches')
+  }
   if (!e.DRY_RUN && !e.PRIVATE_KEY && !e.KEYPAIR_PATH) {
     throw new Error('Live trading (DRY_RUN=false) requires PRIVATE_KEY or KEYPAIR_PATH')
   }
@@ -412,6 +447,22 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxFeeDragPct: e.MAX_FEE_DRAG_PCT,
       defensiveDrawdownPct: e.DEFENSIVE_DRAWDOWN_PCT,
       shutdown: e.SURVIVAL_SHUTDOWN,
+    },
+
+    autotune: {
+      // Automatic adoption is paper-only; live mode can at most suggest.
+      mode: e.AUTOTUNE === 'auto' ? (!e.RECORD_LAUNCHES ? 'off' : e.DRY_RUN ? 'paper' : 'suggest') : e.AUTOTUNE,
+      intervalMs: Math.round(e.AUTOTUNE_INTERVAL_HOURS * 3_600_000),
+      days: e.AUTOTUNE_DAYS,
+      maxLaunches: e.AUTOTUNE_MAX_LAUNCHES,
+      minLaunches: e.AUTOTUNE_MIN_LAUNCHES,
+      minHours: e.AUTOTUNE_MIN_HOURS,
+      minTrainTrades: e.AUTOTUNE_MIN_TRADES,
+      minTestTrades: Math.max(5, Math.ceil(e.AUTOTUNE_MIN_TRADES * 0.4)),
+      minEdgePct: e.AUTOTUNE_MIN_EDGE_PCT,
+      maxChanges: e.AUTOTUNE_MAX_CHANGES,
+      probationTrades: e.AUTOTUNE_PROBATION_TRADES,
+      cooldownMs: Math.round(e.AUTOTUNE_COOLDOWN_HOURS * 3_600_000),
     },
 
     recorder: {
