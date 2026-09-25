@@ -65,6 +65,10 @@ describe('tunable settings', () => {
     expect(at({ momentumMinBuyers: 10 })).toBe(false) // 6 → 10: more than ±3
     expect(at({ momentumMinAgeMs: 3_000, momentumMaxAgeMs: 3_000 })).toBe(false) // window must stay open
     expect(at({ entryMode: 'momentum', exitOnDevSell: false })).toBe(true) // switches are single steps
+    expect(at({ momentumMaxTopBuyerPct: 5 })).toBe(true) // off → on
+    expect(at({ momentumMaxTopBuyerPct: 25 })).toBe(false) // on, but past the bound
+    expect(at({ momentumMaxTopBuyerPct: 0 }, { momentumMaxTopBuyerPct: 5 })).toBe(true) // on → off
+    expect(at({ momentumMaxTopBuyerPct: 11 }, { momentumMaxTopBuyerPct: 5 })).toBe(false) // more than 2x
   })
 
   it('can only reach entry, filters and exits, never trade size, fees or risk limits', () => {
@@ -501,6 +505,34 @@ describe('AutoTuner', () => {
     // Not proposed again.
     const next = await a.t.run()
     expect(next.changes).not.toEqual(found.changes)
+  })
+
+  it('explores the whole range while observing, and adopts what holds up (paper)', async () => {
+    // Settings so strict that no nearby step makes a single trade.
+    const strict = { ENTRY_MODE: 'momentum', MOMENTUM_MIN_BUYERS: '30', MOMENTUM_MIN_NET_BUY_SOL: '20', REQUIRE_EDGE: 'true' }
+    const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
+    dirs.push(dir)
+    await writeRecords(dir, momentumMarket(600))
+    const env = { ...BASE_ENV, ...strict, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    const a = tuner(env, { now: START + 51 * HOUR })
+    await a.t.load()
+    expect(a.t.tradingGate().allowed).toBe(false)
+    const run = await a.t.run()
+    expect(run.decision).toBe('adopt')
+    expect(run.reason).toMatch(/^exploration: makes/)
+    expect(run.exploration?.decision).toBe('found')
+    // A jump no step limit would allow, taken because nothing was being traded on it.
+    expect(a.cfg.momentum.minBuyers).toBeLessThan(27)
+    expect(a.t.status().probation).not.toBeNull()
+    expect(a.t.tradingGate().allowed).toBe(true) // the found strategy carries its own proof
+    expect(a.notices.some((n) => /adopted .* after exploring/.test(n))).toBe(true)
+
+    // Without the edge gate the bot might be trading, so it never jumps.
+    const b = tuner({ ...env, REQUIRE_EDGE: 'false' }, { now: START + 51 * HOUR })
+    await b.t.load()
+    const nearby = await b.t.run()
+    expect(nearby.exploration).toBeUndefined()
+    expect(nearby.decision).not.toBe('adopt')
   })
 
   it('runs the search in a worker thread', async () => {

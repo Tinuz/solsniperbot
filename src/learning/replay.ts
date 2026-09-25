@@ -1,6 +1,6 @@
 import type { Config } from '../config.js'
 import { type ExitDecision, decideExit } from '../strategy/exits.js'
-import { type MomentumSnapshot, decideMomentum } from '../strategy/momentum.js'
+import { EARLY_WINDOW_MS, type MomentumSnapshot, decideMomentum } from '../strategy/momentum.js'
 import type { LaunchRecord } from './record.js'
 
 export interface ReplayConfig {
@@ -97,21 +97,40 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
   let decisionMs = 0
   if (c.entry === 'momentum') {
     const buyers = new Set<number>()
+    // Net tokens per wallet: each row's reserves move by exactly the tokens traded.
+    const holdings = new Map<number, number>()
+    let lastVt = rec.curve.vt
+    let top = 0
     let buys = 0
     let sells = 0
+    let early = 0
     let devSold = false
     let i = 0
     let decided = false
     // Check at every trade and on a 250ms clock, like the live engine.
     for (let t = 0; t <= Math.min(c.momentum.maxAgeMs + 250, end); t += 250) {
       while (i < trades.length && trades[i]![0] <= t) {
-        const [, , , side, lamports, wallet] = trades[i]!
+        const [dt, , vtAfter, side, lamports, wallet] = trades[i]!
+        const tokens = Math.abs(lastVt - vtAfter)
+        lastVt = vtAfter
         if (side > 0) {
           buys += lamports
-          if (wallet !== 0) buyers.add(wallet)
+          if (wallet !== 0) {
+            buyers.add(wallet)
+            if (dt <= EARLY_WINDOW_MS) early += lamports
+          }
         } else {
           sells += lamports
           if (wallet === 0) devSold = true
+        }
+        if (wallet !== 0) {
+          const held = Math.max(0, (holdings.get(wallet) ?? 0) + side * tokens)
+          holdings.set(wallet, held)
+          if (held > top) top = held
+          else if (side < 0) {
+            top = 0
+            for (const h of holdings.values()) if (h > top) top = h
+          }
         }
         i++
       }
@@ -126,6 +145,8 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
         mcapLamports: BigInt(Math.round((vq * rec.curve.supply) / vt)),
         devSold,
         complete: false,
+        earlyBuyLamports: BigInt(Math.round(early)),
+        topBuyerPct: rec.curve.supply > 0 ? Math.floor((top / rec.curve.supply) * 1_000_000) / 10_000 : 0,
       }
       const d = decideMomentum(snap, c.momentum, c.maxEntryMcapLamports)
       if (d.action === 'reject') return none(d.reason)

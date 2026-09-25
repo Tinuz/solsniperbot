@@ -108,6 +108,8 @@ const schema = z.object({
   MOMENTUM_MIN_BUYERS: num(6, { min: 0, int: true }),
   MOMENTUM_MIN_NET_BUY_SOL: num(2, { min: 0 }),
   MOMENTUM_MAX_SELL_RATIO: num(0.4, { min: 0, max: 10 }),
+  MOMENTUM_MAX_EARLY_BUY_SOL: num(0, { min: 0 }),
+  MOMENTUM_MAX_TOP_BUYER_PCT: num(0, { min: 0, max: 100 }),
 
   // Filters
   ALLOW_MAYHEM: bool(false),
@@ -243,6 +245,10 @@ export interface Config {
     minBuyers: number
     minNetBuyLamports: bigint
     maxSellRatio: number
+    /** Skip coins where other wallets bought more than this in the first 0.5s (bundled insiders). 0 = off. */
+    maxEarlyBuyLamports: bigint
+    /** Skip coins where one wallet (not the dev) holds more than this % of the supply. 0 = off. */
+    maxTopBuyerPct: number
   }
 
   filters: {
@@ -435,6 +441,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       minBuyers: e.MOMENTUM_MIN_BUYERS,
       minNetBuyLamports: solToLamports(e.MOMENTUM_MIN_NET_BUY_SOL),
       maxSellRatio: e.MOMENTUM_MAX_SELL_RATIO,
+      maxEarlyBuyLamports: solToLamports(e.MOMENTUM_MAX_EARLY_BUY_SOL),
+      maxTopBuyerPct: e.MOMENTUM_MAX_TOP_BUYER_PCT,
     },
 
     filters: {

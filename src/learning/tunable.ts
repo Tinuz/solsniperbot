@@ -14,6 +14,10 @@ export interface TunableParams {
   momentumMaxSellRatio: number
   momentumMinAgeMs: number
   momentumMaxAgeMs: number
+  /** 0 = off. */
+  momentumMaxEarlyBuySol: number
+  /** 0 = off. */
+  momentumMaxTopBuyerPct: number
   takeProfit: { gainPct: number; sellPct: number }[]
   stopLossPct: number
   trailingStopPct: number
@@ -37,6 +41,8 @@ export const BOUNDS: Record<ScalarKey, [number, number]> = {
   momentumMaxSellRatio: [0.05, 1.5],
   momentumMinAgeMs: [500, 10_000],
   momentumMaxAgeMs: [3_000, 60_000],
+  momentumMaxEarlyBuySol: [0.2, 50],
+  momentumMaxTopBuyerPct: [0.5, 20],
   stopLossPct: [10, 60],
   trailingStopPct: [0, 50],
   trailingArmPct: [10, 300],
@@ -61,6 +67,8 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
   momentumMaxSellRatio: { abs: 0.2 },
   momentumMinAgeMs: { factor: 2 },
   momentumMaxAgeMs: { factor: 2 },
+  momentumMaxEarlyBuySol: { factor: 2 },
+  momentumMaxTopBuyerPct: { factor: 2 },
   stopLossPct: { abs: 10 },
   trailingStopPct: { abs: 10 },
   trailingArmPct: { abs: 40 },
@@ -74,6 +82,9 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
 }
 const TP_STEP_FACTOR = 2
 
+/** Settings where 0 means "off": switching on (to any in-bounds value) or off counts as one step. */
+const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct'])
+
 export const ENV_NAMES: Record<keyof TunableParams, string> = {
   entryMode: 'ENTRY_MODE',
   momentumMinBuyers: 'MOMENTUM_MIN_BUYERS',
@@ -81,6 +92,8 @@ export const ENV_NAMES: Record<keyof TunableParams, string> = {
   momentumMaxSellRatio: 'MOMENTUM_MAX_SELL_RATIO',
   momentumMinAgeMs: 'MOMENTUM_MIN_AGE_MS',
   momentumMaxAgeMs: 'MOMENTUM_MAX_AGE_MS',
+  momentumMaxEarlyBuySol: 'MOMENTUM_MAX_EARLY_BUY_SOL',
+  momentumMaxTopBuyerPct: 'MOMENTUM_MAX_TOP_BUYER_PCT',
   takeProfit: 'TAKE_PROFIT',
   stopLossPct: 'STOP_LOSS_PCT',
   trailingStopPct: 'TRAILING_STOP_PCT',
@@ -105,6 +118,8 @@ export function paramsFromConfig(cfg: Config): TunableParams {
     momentumMaxSellRatio: cfg.momentum.maxSellRatio,
     momentumMinAgeMs: cfg.momentum.minAgeMs,
     momentumMaxAgeMs: cfg.momentum.maxAgeMs,
+    momentumMaxEarlyBuySol: Number(cfg.momentum.maxEarlyBuyLamports) / 1e9,
+    momentumMaxTopBuyerPct: cfg.momentum.maxTopBuyerPct,
     takeProfit: cfg.exits.takeProfit.map((t) => ({ ...t })),
     stopLossPct: cfg.exits.stopLossPct,
     trailingStopPct: cfg.exits.trailingStopPct,
@@ -132,6 +147,8 @@ export function withParams(cfg: Config, p: TunableParams): Config {
       maxSellRatio: p.momentumMaxSellRatio,
       minAgeMs: Math.round(p.momentumMinAgeMs),
       maxAgeMs: Math.round(p.momentumMaxAgeMs),
+      maxEarlyBuyLamports: solToLamports(p.momentumMaxEarlyBuySol),
+      maxTopBuyerPct: p.momentumMaxTopBuyerPct,
     },
     exits: {
       ...cfg.exits,
@@ -202,6 +219,11 @@ export function withinLimits(p: TunableParams, origin: TunableParams): boolean {
     const [lo, hi] = BOUNDS[key]
     const v = p[key]
     const o = origin[key]
+    if (OPTIONAL.has(key) && (v === 0 || o === 0)) {
+      // Off, or switched on/off: only the bounds of the "on" value apply.
+      if (v !== 0 && v !== o && (v < lo || v > hi)) return false
+      continue
+    }
     // An out-of-bounds .env value may stay where the user put it, but the tuner never moves outside.
     if ((v < lo || v > hi) && v !== o) return false
     const step = STEP_LIMITS[key]
@@ -225,6 +247,27 @@ export function withinLimits(p: TunableParams, origin: TunableParams): boolean {
 }
 
 /**
+ * True when `p` is inside the absolute bounds, ignoring step limits: what an
+ * exploration (while the bot is not trading) may reach.
+ */
+export function withinBounds(p: TunableParams): boolean {
+  for (const key of Object.keys(BOUNDS) as ScalarKey[]) {
+    const [lo, hi] = BOUNDS[key]
+    const v = p[key]
+    if (OPTIONAL.has(key) && v === 0) continue
+    if (v < lo || v > hi) return false
+  }
+  if (p.momentumMaxAgeMs <= p.momentumMinAgeMs) return false
+  if (p.takeProfit.length > 3) return false
+  for (const t of p.takeProfit) {
+    if (t.gainPct < TP_GAIN_BOUNDS[0] || t.gainPct > TP_GAIN_BOUNDS[1]) return false
+    if (t.sellPct < TP_SELL_BOUNDS[0] || t.sellPct > TP_SELL_BOUNDS[1]) return false
+  }
+  for (let i = 1; i < p.takeProfit.length; i++) if (p.takeProfit[i]!.gainPct <= p.takeProfit[i - 1]!.gainPct) return false
+  return true
+}
+
+/**
  * Candidate values for one group of settings, around the current value.
  * The search tries these one group at a time.
  */
@@ -239,6 +282,9 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
     for (const d of [-2, -1, 1, 2]) set('momentum buyers', { momentumMinBuyers: p.momentumMinBuyers + d })
     for (const v of scale(p.momentumMinNetBuySol, [0.5, 0.75, 1.5, 2])) set('momentum net buy', { momentumMinNetBuySol: v })
     for (const d of [-0.2, -0.1, 0.1, 0.2]) set('momentum sell ratio', { momentumMaxSellRatio: round(p.momentumMaxSellRatio + d, 2) })
+    const optional = (v: number, on: number[]) => (v === 0 ? on : [0, ...scale(v, [0.5, 0.75, 1.5, 2], 2)])
+    for (const v of optional(p.momentumMaxEarlyBuySol, [0.5, 1, 2, 5])) set('insider buys', { momentumMaxEarlyBuySol: v })
+    for (const v of optional(p.momentumMaxTopBuyerPct, [2, 3, 5, 8])) set('top holder', { momentumMaxTopBuyerPct: v })
     for (const mn of [p.momentumMinAgeMs, Math.round(p.momentumMinAgeMs / 2), p.momentumMinAgeMs * 2]) {
       for (const mx of [p.momentumMaxAgeMs, Math.round(p.momentumMaxAgeMs / 2), p.momentumMaxAgeMs * 2]) {
         if (mn !== p.momentumMinAgeMs || mx !== p.momentumMaxAgeMs) set('momentum window', { momentumMinAgeMs: mn, momentumMaxAgeMs: mx })
@@ -290,7 +336,16 @@ export const replayKey = (p: TunableParams) =>
   JSON.stringify([
     p.entryMode,
     p.entryMode === 'momentum'
-      ? [p.momentumMinBuyers, p.momentumMinNetBuySol, p.momentumMaxSellRatio, p.momentumMinAgeMs, p.momentumMaxAgeMs, p.maxEntryMcapSol]
+      ? [
+          p.momentumMinBuyers,
+          p.momentumMinNetBuySol,
+          p.momentumMaxSellRatio,
+          p.momentumMinAgeMs,
+          p.momentumMaxAgeMs,
+          p.momentumMaxEarlyBuySol,
+          p.momentumMaxTopBuyerPct,
+          p.maxEntryMcapSol,
+        ]
       : null,
     p.takeProfit,
     p.stopLossPct,

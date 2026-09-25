@@ -85,6 +85,7 @@ Recording happens after decisions, so it costs no latency. Let the bot collect a
 ```bash
 npm run analyze             # report: what works, what doesn't, suggested filter values
 npm run backtest            # grid search over exit settings (TP tiers, SL, trailing, hold, stale)
+npm run research            # is there a profitable strategy at all, anywhere within the bounds?
 ```
 
 Both tools replay the recorded launches through the bot's **own** filter, momentum and exit functions, with fills after `PAPER_LATENCY_MS`. `analyze` reports:
@@ -99,6 +100,17 @@ Both tools replay the recorded launches through the bot's **own** filter, moment
 Every suggestion is validated against overfitting. Settings are chosen on the older 70% of the data and only recommended if they also beat the current settings **and make money** on the newest 30%, which they were never tuned on. A setting that merely loses less, usually by trading less, is reported as such and not recommended. Reports are saved to `data/reports/`.
 
 Both tools replay what the bot actually runs with, autotuned settings included. The replay-vs-bot check only compares trades the bot made with the same settings. Features like "net SOL in first 3s" are marked ⏱: they are only known seconds after launch, so they point towards momentum entry rather than being usable by an instant buy.
+
+### Research: is there an edge at all?
+
+`analyze` and `backtest` look at the settings you have and what is near them. `npm run research` asks the bigger question: does *any* strategy within the bounds make money on this data? It searches entry mode, momentum thresholds, insider filters, launch filters and exits together, starting from six very different strategies (blind sniping, patient momentum, strict momentum with insider filters, quick exits, slow exits) and improving each step by step. It takes up to 10 minutes by default (`-- --budget=20` for more, `-- --days=3` for recent data only).
+
+The search is honest by construction. The recordings are split by time into three parts:
+1. **Search (oldest 60%).** Strategies are found here. Each one is scored *without its single best trade*, so a strategy that lives off one lucky coin scores low.
+2. **Validation (next 20%).** The ten strongest compete here; the best one is chosen.
+3. **Test (newest 20%).** The winner must make money here, in both halves, and without its best trade. Neither the search nor the choice ever saw this part.
+
+The report (in `data/reports/`) gives the verdict, the current settings next to the best candidate on all three parts, every gate, and the `.env` lines to use it. *None held up* is a real answer: it means no strategy within the bounds made money on data it wasn't chosen on, and the bot is right to keep observing.
 
 To try other settings on the same data, set them for one run. In PowerShell: `$env:ENTRY_MODE="momentum"; npm run analyze` (and `Remove-Item Env:ENTRY_MODE` afterwards). In bash: `ENTRY_MODE=momentum npm run analyze`. These tools never change settings; the autotuner below does, in paper mode only.
 
@@ -125,6 +137,8 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 
 `AUTOTUNE=auto` never picks `live`. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, `AUTOTUNE=live` in paper mode, and `AUTOTUNE=live` without the edge gate. The tuner checks again before it changes anything.
 
+**Exploring while observing.** A nearby step can't help when the current settings are far from anything that works. So while the edge gate holds the bot back (nothing is traded on the settings), each cycle whose regular search finds nothing also runs the full `npm run research` search for up to 3 minutes. If it finds a strategy that passes every gate on the validation and test parts, `paper` adopts it in one jump, beyond the usual step and change limits but within the hard bounds, and it goes on probation like any other adoption; `suggest` proposes it. Its test result counts as its proof, so the bot starts trading on it. Exploration never runs once the bot is trading, never in `AUTOTUNE=live`, and never without the edge gate. The dashboard and `data/tuning/report.md` show the last exploration (how many strategies it tried, and the verdict).
+
 **Live autonomy (`AUTOTUNE=live`).** Real money gets extra brakes:
 1. **One change at a time.** A candidate changes one setting, so a loss can be traced to its cause.
 2. **Shadow test.** A validated candidate is not traded at first. It is replayed next to the current settings on launches that arrive after it was found, for `AUTOTUNE_PROBATION_TRADES` trades. If it does worse, it is dropped and never proposed again for `AUTOTUNE_DAYS`.
@@ -133,11 +147,11 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 
 **Strict limits.**
 - **What it can change.** Only which coins to buy, when, and when to sell:
-  - entry: `ENTRY_MODE` (instant or momentum) and the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`;
+  - entry: `ENTRY_MODE` (instant or momentum), the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`, and the insider filters `MOMENTUM_MAX_EARLY_BUY_SOL`, `MOMENTUM_MAX_TOP_BUYER_PCT` (each can also be switched off);
   - filters: `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`;
   - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`.
 - **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
-- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode or the dev-sell exit counts as one step. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
+- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit or an insider filter counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
 
 **Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
 1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
@@ -203,7 +217,7 @@ Setup:
 | Mode | Behaviour |
 | --- | --- |
 | `ENTRY_MODE=instant` | Buy the moment a launch passes the filters (block-0 sniping). Fastest; most exposed to bundled launches and instant rugs. |
-| `ENTRY_MODE=momentum` | Watch a passing launch and buy only once it has `MOMENTUM_MIN_BUYERS` distinct buyers, `MOMENTUM_MIN_NET_BUY_SOL` net inflow excluding the dev, a sell/buy ratio under `MOMENTUM_MAX_SELL_RATIO`, and the dev has not sold, all within `MOMENTUM_MAX_AGE_MS`. |
+| `ENTRY_MODE=momentum` | Watch a passing launch and buy only once it has `MOMENTUM_MIN_BUYERS` distinct buyers, `MOMENTUM_MIN_NET_BUY_SOL` net inflow excluding the dev, a sell/buy ratio under `MOMENTUM_MAX_SELL_RATIO`, and the dev has not sold, all within `MOMENTUM_MAX_AGE_MS`. Optional insider filters skip it when non-dev wallets bought more than `MOMENTUM_MAX_EARLY_BUY_SOL` in the first 0.5s (bundled with the launch) or one wallet other than the dev holds more than `MOMENTUM_MAX_TOP_BUYER_PCT`% of the supply. |
 
 ### Filters
 
@@ -310,8 +324,10 @@ npm run typecheck
   - adopted settings survive a restart and are dropped when `.env` changes;
   - a rollback pauses tuning, and the failed settings are skipped afterwards;
   - suggest mode never changes anything;
-  - the search runs in a real worker thread.
-- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips and momentum timing.
+  - the search runs in a real worker thread;
+  - while observing, it explores the whole bounded range and adopts a strategy far beyond one step when it holds up, but never while trading or without the edge gate.
+- **Strategy research**: finds a profitable strategy far from the current settings and proves it on the newest 20% it never used; finds nothing on a market of dead coins and rugs; needs enough data; never picks excluded settings; respects its time budget.
+- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing and the insider signals (early bundled buys, biggest holder).
 - **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 
 **Not covered:** these tests can't prove landing performance or strategy profitability on mainnet. Validate with paper trading and small sizes first.

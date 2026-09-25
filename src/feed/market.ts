@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { EARLY_WINDOW_MS } from '../strategy/momentum.js'
 import { PublicKey } from '@solana/web3.js'
 import { type CurveState, buyCostForTokens, feeRates, quoteBuyExactIn } from '../pump/curve.js'
 import type { CreateEvent, TradeEvent } from '../pump/events.js'
@@ -56,6 +57,8 @@ export interface MintState {
   buyers: Set<string>
   /** Net token balance per wallet from observed trades (bounded). */
   holders: Map<string, bigint>
+  /** Lamports other wallets bought within EARLY_WINDOW_MS of detection (bundled with the launch). */
+  earlyBuyVolume: bigint
   devStr?: string
   devSold: boolean
   watched: boolean
@@ -308,6 +311,7 @@ export class MarketBook extends EventEmitter<MarketEvents> {
       sellVolume: 0n,
       buyers: new Set(),
       holders: new Map(),
+      earlyBuyVolume: 0n,
       devSold: false,
       watched: false,
     }
@@ -334,6 +338,7 @@ export class MarketBook extends EventEmitter<MarketEvents> {
     if (ev.isBuy) {
       state.buys++
       state.buyVolume += ev.solAmount
+      if (user !== state.devStr && state.launch && Date.now() - state.launch.detectedAtWall <= EARLY_WINDOW_MS) state.earlyBuyVolume += ev.solAmount
       if (state.buyers.size < MAX_WALLETS_PER_MINT) state.buyers.add(user)
       if (state.holders.size < MAX_WALLETS_PER_MINT || state.holders.has(user)) state.holders.set(user, prev + ev.tokenAmount)
     } else {

@@ -6,12 +6,19 @@ import type { Summary } from './replay.js'
 /** Decision-time features plus early-flow features (first seconds after detection). */
 export function features(r: LaunchRecord): Record<string, number> {
   const buyers3 = new Set<number>()
+  const holdings3 = new Map<number, number>()
+  let lastVt = r.curve.vt
   let net3 = 0
+  let early = 0
   let sells10 = 0
   let trades10 = 0
-  for (const [dt, , , side, lamports, wallet] of r.trades) {
+  for (const [dt, , vt, side, lamports, wallet] of r.trades) {
+    const tokens = Math.abs(lastVt - vt)
+    lastVt = vt
+    if (dt <= 500 && side > 0 && wallet !== 0) early += lamports
     if (dt <= 3_000) {
       if (side > 0 && wallet !== 0) buyers3.add(wallet)
+      if (wallet !== 0) holdings3.set(wallet, Math.max(0, (holdings3.get(wallet) ?? 0) + side * tokens))
       net3 += side * lamports
     }
     if (dt <= 10_000) {
@@ -30,6 +37,8 @@ export function features(r: LaunchRecord): Record<string, number> {
     netSolFirst3s: net3 / 1e9,
     tradesFirst10s: trades10,
     sellsFirst10s: sells10,
+    insiderBuySol: early / 1e9,
+    topBuyerPct3s: (Math.max(0, ...holdings3.values()) / r.curve.supply) * 100,
   }
 }
 
@@ -44,10 +53,14 @@ export const FEATURE_LABELS: Record<string, string> = {
   netSolFirst3s: 'Net SOL in first 3s',
   tradesFirst10s: 'Trades in first 10s',
   sellsFirst10s: 'Sells in first 10s',
+  insiderBuySol: 'Insider buys, first 0.5s (SOL)',
+  topBuyerPct3s: 'Biggest holder at 3s (% of supply, dev aside)',
 }
 
 /** Features only known this many seconds after detection: an instant buy cannot use them. */
 export const LOOKAHEAD_SECONDS: Record<string, number> = {
+  insiderBuySol: 0.5,
+  topBuyerPct3s: 3,
   buyersFirst3s: 3,
   netSolFirst3s: 3,
   tradesFirst10s: 10,
