@@ -44,7 +44,7 @@ const VALIDATION = 0.2
 const MAX_ROUNDS = 5
 const FINALISTS = 10
 
-const MOONBAG: Partial<TunableParams> = { moonbagPct: 25, moonbagSecurePct: 10, moonbagStopBufferPct: 5, moonbagTrailingPct: 40, moonbagMaxHoldSec: 900 }
+const MOONBAG: Partial<TunableParams> = { moonbagPct: 25, moonbagSecurePct: 10, moonbagStopBufferPct: 5, moonbagTrailingPct: 40 }
 
 /**
  * Starting points far apart, so the search does not only explore around the

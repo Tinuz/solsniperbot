@@ -73,8 +73,8 @@ describe('tunable settings', () => {
     expect(at({ moonbagPct: 25 })).toBe(true) // moonbag off → on
     expect(at({ moonbagPct: 60 })).toBe(false) // past its bound
     expect(at({ moonbagPct: 25, moonbagSecurePct: 30 }, { moonbagPct: 25 })).toBe(false) // secured profit: ±10 per step
-    expect(at({ moonbagPct: 25, moonbagMaxHoldSec: 1_200 }, { moonbagPct: 25, moonbagMaxHoldSec: 900 })).toBe(false) // beyond the recordings
-    expect(at({ moonbagMaxHoldSec: 5_000 })).toBe(true) // irrelevant while the moonbag is off
+    expect(at({ moonbagPct: 25, moonbagTrailingPct: 80 }, { moonbagPct: 25, moonbagTrailingPct: 70 })).toBe(false) // past its bound
+    expect(at({ moonbagTrailingPct: 90 })).toBe(true) // irrelevant while the moonbag is off
   })
 
   it('keys settings without a moonbag exactly as before moonbags existed', () => {
@@ -350,7 +350,7 @@ describe('AutoTuner', () => {
     const b = tuner(env, clock)
     await b.t.load()
     expect(b.t.status().overrides).toEqual(first.changes)
-    expect(b.cfg.exits.moonbag).toMatchObject({ pct: 0, securePct: 10, maxHoldMs: 900_000 })
+    expect(b.cfg.exits.moonbag).toMatchObject({ pct: 0, securePct: 10, trailingPct: 40, maxHoldMs: 0 })
     expect((await loadTunedParams(loadConfig(env)))?.changes).toEqual(first.changes)
   })
 

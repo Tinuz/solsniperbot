@@ -36,7 +36,6 @@ export interface TunableParams {
   moonbagStopBufferPct: number
   /** 0 = off. */
   moonbagTrailingPct: number
-  moonbagMaxHoldSec: number
 }
 
 export type ScalarKey = Exclude<keyof TunableParams, 'takeProfit' | 'entryMode' | 'exitOnDevSell'>
@@ -64,8 +63,6 @@ export const BOUNDS: Record<ScalarKey, [number, number]> = {
   moonbagSecurePct: [0, 50],
   moonbagStopBufferPct: [0, 30],
   moonbagTrailingPct: [15, 70],
-  // Within the default recording horizon (15 min), so replays can follow a moonbag to the end.
-  moonbagMaxHoldSec: [60, 900],
 }
 export const TP_GAIN_BOUNDS: [number, number] = [15, 500]
 export const TP_SELL_BOUNDS: [number, number] = [25, 100]
@@ -96,14 +93,13 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
   moonbagSecurePct: { abs: 10 },
   moonbagStopBufferPct: { abs: 5 },
   moonbagTrailingPct: { abs: 15 },
-  moonbagMaxHoldSec: { factor: 2 },
 }
 const TP_STEP_FACTOR = 2
 
 /** Settings where 0 means "off": switching on (to any in-bounds value) or off counts as one step. */
 const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct', 'moonbagPct', 'moonbagTrailingPct'])
 /** Only in effect while the moonbag is on: their bounds and steps don't apply while it is off. */
-const MOONBAG_ONLY: ReadonlySet<ScalarKey> = new Set(['moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct', 'moonbagMaxHoldSec'])
+const MOONBAG_ONLY: ReadonlySet<ScalarKey> = new Set(['moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct'])
 
 export const ENV_NAMES: Record<keyof TunableParams, string> = {
   entryMode: 'ENTRY_MODE',
@@ -131,7 +127,6 @@ export const ENV_NAMES: Record<keyof TunableParams, string> = {
   moonbagSecurePct: 'MOONBAG_SECURE_PCT',
   moonbagStopBufferPct: 'MOONBAG_STOP_BUFFER_PCT',
   moonbagTrailingPct: 'MOONBAG_TRAILING_PCT',
-  moonbagMaxHoldSec: 'MOONBAG_MAX_HOLD_SECONDS',
 }
 
 const round = (v: number, d = 3) => Math.round(v * 10 ** d) / 10 ** d
@@ -162,7 +157,6 @@ export function paramsFromConfig(cfg: Config): TunableParams {
     moonbagSecurePct: cfg.exits.moonbag.securePct,
     moonbagStopBufferPct: cfg.exits.moonbag.stopBufferPct,
     moonbagTrailingPct: cfg.exits.moonbag.trailingPct,
-    moonbagMaxHoldSec: cfg.exits.moonbag.maxHoldMs / 1000,
   }
 }
 
@@ -202,7 +196,6 @@ export function withParams(cfg: Config, p: TunableParams): Config {
         securePct: p.moonbagSecurePct,
         stopBufferPct: p.moonbagStopBufferPct,
         trailingPct: p.moonbagTrailingPct,
-        maxHoldMs: Math.round(p.moonbagMaxHoldSec * 1000),
       },
     },
     filters: {
@@ -376,7 +369,6 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
     for (const d of [-5, -2, 2, 5]) set('moonbag stop', { moonbagStopBufferPct: p.moonbagStopBufferPct + d })
     const trail = p.moonbagTrailingPct === 0 ? [25, 40, 55] : [0, p.moonbagTrailingPct - 15, p.moonbagTrailingPct - 10, p.moonbagTrailingPct + 10, p.moonbagTrailingPct + 15]
     for (const v of trail) set('moonbag trailing stop', { moonbagTrailingPct: v })
-    for (const v of scale(p.moonbagMaxHoldSec, [0.5, 0.75, 1.5, 2], 0)) set('moonbag hold', { moonbagMaxHoldSec: v })
   }
   return out
 }
@@ -387,7 +379,7 @@ export const paramsKey = (p: TunableParams) => {
   if (!p.moonbagPct) for (const key of MOONBAG_KEYS) delete env[ENV_NAMES[key]]
   return JSON.stringify(env)
 }
-const MOONBAG_KEYS: (keyof TunableParams)[] = ['moonbagPct', 'moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct', 'moonbagMaxHoldSec']
+const MOONBAG_KEYS: (keyof TunableParams)[] = ['moonbagPct', 'moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct']
 
 /** Short id of a set of settings, stored with each recorded launch. */
 export const settingsFingerprint = (p: TunableParams) => createHash('sha1').update(paramsKey(p)).digest('hex').slice(0, 12)
@@ -418,7 +410,7 @@ export const replayKey = (p: TunableParams) =>
     p.maxHoldSec,
     p.staleSec,
     p.exitOnDevSell,
-    p.moonbagPct ? [p.moonbagPct, p.moonbagSecurePct, p.moonbagStopBufferPct, p.moonbagTrailingPct, p.moonbagMaxHoldSec] : 0,
+    p.moonbagPct ? [p.moonbagPct, p.moonbagSecurePct, p.moonbagStopBufferPct, p.moonbagTrailingPct] : 0,
   ])
 
 /** What the static filters depend on. */
