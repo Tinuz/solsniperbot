@@ -13,8 +13,10 @@ import {
   diffParams,
   paramsFromConfig,
   paramsKey,
+  withinBounds,
   withinLimits,
 } from './tunable.js'
+import type { StrategySearchResult } from './search.js'
 import type { EdgeResult, Gate, ProbationResult, TuningResult } from './tuner.js'
 import { type TuningJob, type TuningJobResult, runTuningJob } from './tuning-job.js'
 
@@ -29,6 +31,12 @@ const WORKER_TIMEOUT_MS = 15 * 60_000
 /** Heap cap for the worker: running out stops the cycle, never the bot. */
 const WORKER_HEAP_MB = 2_048
 const MAX_ADOPTIONS_KEPT = 50
+/** Time the wide search may take in one cycle (in the worker, off the trading loop). */
+const EXPLORE_BUDGET_MS = 3 * 60_000
+
+type ExplorationSummary = Omit<StrategySearchResult, 'finalists' | 'best'> & {
+  best?: Omit<NonNullable<StrategySearchResult['best']>, 'params'>
+}
 
 export interface Adoption {
   id: number
@@ -56,6 +64,8 @@ export interface CycleSummary {
   data?: TuningResult['data']
   metrics?: TuningResult['metrics']
   probation?: ProbationResult
+  /** The wide search, when the nearby one found nothing while the bot was not trading. */
+  exploration?: ExplorationSummary
 }
 
 interface TuningState {
@@ -195,6 +205,16 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     return this.cfg.autotune.mode === 'live' && !this.cfg.dryRun
   }
 
+  /**
+   * Wide jumps are only safe while nothing is traded on the result: the
+   * edge gate must be holding the bot back, and never in live autotune.
+   */
+  private mayExplore(): boolean {
+    const o = this.cfg.autotune
+    const mode = (o.mode === 'paper' && this.adopts) || o.mode === 'suggest'
+    return mode && !this.live && o.requireEdge && !this.tradingGate().allowed
+  }
+
   /** Share of the normal trade size to use now: reduced while live settings are on probation. */
   sizeFactor(): number {
     return this.live && this.state.probation ? this.cfg.autotune.liveProbationSizePct / 100 : 1
@@ -325,6 +345,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? { adopted: shadow.to, previous: shadow.from, since: shadow.since, neededTrades: shadow.neededTrades }
           : undefined,
       edge: o.requireEdge,
+      explore: this.mayExplore() ? { budgetMs: EXPLORE_BUDGET_MS } : undefined,
       now: at,
     }
 
@@ -589,6 +610,28 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     void this.journal.append({ type: 'cycle', mode: this.cfg.autotune.mode, ...out })
 
     if (p.decision !== 'adopt' || !p.candidate) {
+      const ex = res.exploration
+      if (ex) {
+        const { finalists: _f, best, ...rest } = ex
+        out.exploration = { ...rest, best: best ? { changes: best.changes, train: best.train, validation: best.validation, test: best.test } : undefined }
+        void this.journal.append({ type: 'exploration', at, decision: ex.decision, reason: ex.reason, evaluated: ex.evaluated, changes: best?.changes })
+        if (ex.decision === 'found' && best && best.changes.length && withinBounds(best.params) && !this.tradingGate().allowed) {
+          out.decision = 'adopt'
+          out.changes = best.changes
+          out.gates = ex.gates
+          out.metrics = undefined
+          out.reason = `exploration: ${ex.reason}`
+          if (!this.adopts) {
+            st.suggestion = { at, changes: best.changes, gates: ex.gates }
+            this.notice('info', `autotune exploration suggests ${describe(best.changes)} (see ${this.reportPath})`)
+            return out
+          }
+          const test = { trades: best.test.trades, currentLamports: ex.current?.test.totalPnlLamports ?? 0, candidateLamports: best.test.totalPnlLamports }
+          this.adopt(job.current, best.params, best.changes, test, at, `after exploring ${ex.evaluated.toLocaleString()} strategies (${ex.reason})`)
+          return out
+        }
+        out.reason = `${out.reason}; exploration: ${ex.reason}`
+      }
       if (p.decision !== 'insufficient-data') st.suggestion = undefined
       return out
     }
@@ -744,6 +787,24 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     }
     if (s.gates.length) {
       lines.push('## Gates', '', table(['Gate', 'Result', 'Detail'], s.gates.map((g) => [g.name, g.pass ? 'pass' : 'FAIL', g.detail])), '')
+    }
+    const ex = s.exploration
+    if (ex) {
+      lines.push(
+        '## Exploration',
+        '',
+        `The nearby search found nothing to adopt, so ${ex.evaluated.toLocaleString()} strategies across the whole bounded range were tried: searched on the oldest ${ex.data.train}, compared on the next ${ex.data.validation}, tested on the newest ${ex.data.test} launches.`,
+        '',
+        `**${ex.decision === 'found' ? 'Found' : 'Nothing held up'}:** ${ex.reason}`,
+        '',
+      )
+      if (ex.best) {
+        if (ex.best.changes.length) lines.push(table(['Setting', 'Current', 'Candidate'], ex.best.changes.map((c) => [c.env, c.from, c.to])), '')
+        const rows = [summaryRow('Candidate: search', ex.best.train), summaryRow('Candidate: validation', ex.best.validation), summaryRow('Candidate: test', ex.best.test)]
+        if (ex.current) rows.unshift(summaryRow('Current: test', ex.current.test))
+        lines.push(table(SUMMARY_HEADERS, rows), '')
+        if (ex.decision !== 'found' && ex.gates.length) lines.push(table(['Gate', 'Result', 'Detail'], ex.gates.map((g) => [g.name, g.pass ? 'pass' : 'FAIL', g.detail])), '')
+      }
     }
     if (st.shadow) {
       lines.push('## Shadow test', '', `${describe(st.shadow.changes)} since ${iso(st.shadow.since)}, not traded yet: ${st.shadow.last?.detail ?? 'waiting for new launches'}.`, '')

@@ -191,6 +191,7 @@ describe('momentum entry', () => {
       sellVolume: 0n,
       buyers: new Set([l.dev.toBase58()]),
       holders: new Map(),
+      earlyBuyVolume: 0n,
       devStr: l.dev.toBase58(),
       devSold: false,
       watched: false,
@@ -213,6 +214,20 @@ describe('momentum entry', () => {
     expect(decideMomentum(momentumSnapshot(s, l, 11_000), c.momentum, c.filters.maxEntryMcapLamports)).toMatchObject({ action: 'reject', reason: /dev sold/ })
     s.devSold = false
     expect(decideMomentum(momentumSnapshot(s, l, 30_000), c.momentum, c.filters.maxEntryMcapLamports)).toMatchObject({ action: 'reject', reason: /expired/ })
+  })
+
+  it('skips coins with bundled insiders or one big holder (the dev aside)', () => {
+    const strict = cfgWith({ ENTRY_MODE: 'momentum', MOMENTUM_MAX_EARLY_BUY_SOL: '1', MOMENTUM_MAX_TOP_BUYER_PCT: '5' }).momentum
+    const { l, s } = setup()
+    const decide = () => decideMomentum(momentumSnapshot(s, l, 11_000), strict, c.filters.maxEntryMcapLamports)
+    s.earlyBuyVolume = 1_500_000_000n
+    expect(decide()).toMatchObject({ action: 'reject', reason: /insiders bought 1.50 SOL in the first 0.5s/ })
+    s.earlyBuyVolume = 500_000_000n
+    s.holders.set(l.dev.toBase58(), (s.curve.tokenTotalSupply * 40n) / 100n) // the dev's own bag is a separate filter
+    s.holders.set(Keypair.generate().publicKey.toBase58(), (s.curve.tokenTotalSupply * 6n) / 100n)
+    expect(decide()).toMatchObject({ action: 'reject', reason: /one wallet holds 6.0% of the supply/ })
+    // Off by default.
+    expect(decideMomentum(momentumSnapshot(s, l, 11_000), c.momentum, c.filters.maxEntryMcapLamports).action).not.toBe('reject')
   })
 })
 

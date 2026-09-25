@@ -138,3 +138,33 @@ describe('replay', () => {
     expect(s).toMatchObject({ trades: 5, wins: 3, totalPnlLamports: 150, maxDrawdownLamports: 350 })
   })
 })
+
+describe('replay: insider signals', () => {
+  const base = { ENTRY_MODE: 'momentum', MOMENTUM_MIN_AGE_MS: '1000', MOMENTUM_MIN_BUYERS: '3', MOMENTUM_MIN_NET_BUY_SOL: '1' }
+  const cfgOf = (env: Record<string, string>) => replayConfigFrom(loadConfig({ RPC_URL: 'https://rpc.example.com', ...base, ...env }))
+  const organic: Step[] = [
+    { dt: 1_200, buy: 0.6e9 },
+    { dt: 1_400, buy: 0.6e9 },
+    { dt: 1_600, buy: 0.6e9 },
+  ]
+
+  it('sees buys bundled with the launch like the live engine', () => {
+    const rec = record([{ dt: 200, buy: 2e9, wallet: 9 }, ...organic])
+    expect(replayLaunch(rec, cfgOf({})).entered).toBe(true)
+    const r = replayLaunch(rec, cfgOf({ MOMENTUM_MAX_EARLY_BUY_SOL: '1' }))
+    expect(r.entered).toBe(false)
+    expect(r.skipReason).toMatch(/insiders bought 1\.9\d SOL in the first 0.5s/) // 2 SOL spent, ~1.98 into the curve after fees
+    // Later buys by the same amount are not "early".
+    expect(replayLaunch(record([{ dt: 900, buy: 2e9, wallet: 9 }, ...organic]), cfgOf({ MOMENTUM_MAX_EARLY_BUY_SOL: '1' })).entered).toBe(true)
+  })
+
+  it('tracks the biggest holder from the reserves, and lets a sold bag go', () => {
+    // One wallet buys ~8% of the supply.
+    const whale = record([{ dt: 800, buy: 3e9, wallet: 9 }, ...organic])
+    expect(replayLaunch(whale, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '5' })).skipReason).toMatch(/one wallet holds [0-9.]+% of the supply/)
+    expect(replayLaunch(whale, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '12' })).entered).toBe(true)
+    // It sells most of it before the bot decides: no longer a big holder.
+    const sold = record([{ dt: 800, buy: 3e9, wallet: 9 }, { dt: 900, sellTokens: 60e12, wallet: 9 }, ...organic, { dt: 1_700, buy: 0.6e9 }])
+    expect(replayLaunch(sold, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '5' })).skipReason ?? '').not.toMatch(/one wallet/)
+  })
+})

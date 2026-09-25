@@ -284,6 +284,8 @@
       parts.push(`<div><span class="badge ${badge}">${esc(last.decision)}</span> ${esc(last.reason)} <span class="faint">· ${when(last.at)}${last.records ? ` · ${last.records.toLocaleString()} launches` : ''}</span></div>`)
       // Adopted or suggested changes show below; a rejected candidate only here.
       if (last.decision === 'reject' && last.changes.length) parts.push(`<div class="mono muted">tried: ${esc(changesText(last.changes))}</div>`)
+      const ex = last.exploration
+      if (ex && ex.evaluated) parts.push(`<div class="muted">explored ${ex.evaluated.toLocaleString()} strategies across the whole range in ${Math.round(ex.ms / 1000)}s${ex.best && ex.decision !== 'found' ? ` · best tried: ${esc(changesText(ex.best.changes))}` : ''}</div>`)
       if (last.gates.length > 1) {
         parts.push(`<div class="gates">${last.gates.map((g) => `<span class="badge ${g.pass ? 'good' : 'bad'}" title="${esc(g.detail)}">${g.pass ? '✓' : '✗'} ${esc(g.name)}</span>`).join('')}</div>`)
       }
