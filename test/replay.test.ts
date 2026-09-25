@@ -1,9 +1,17 @@
+import { mkdtemp, readFile, readdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Keypair } from '@solana/web3.js'
-import { describe, expect, it } from 'vitest'
+import { pino } from 'pino'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { loadConfig } from '../src/config.js'
 import type { LaunchRecord, TradeRow } from '../src/learning/record.js'
 import { summarize } from '../src/learning/record.js'
+import { LaunchRecorder } from '../src/learning/recorder.js'
+import type { TradeEvent } from '../src/pump/events.js'
 import { type ReplayConfig, replayConfigFrom, replayLaunch, summarizeResults } from '../src/learning/replay.js'
+import { paramsFromConfig } from '../src/learning/tunable.js'
+import { Evaluator } from '../src/learning/tuner.js'
 import {
   type CurveState,
   applyBuy,
@@ -166,5 +174,102 @@ describe('replay: insider signals', () => {
     // It sells most of it before the bot decides: no longer a big holder.
     const sold = record([{ dt: 800, buy: 3e9, wallet: 9 }, { dt: 900, sellTokens: 60e12, wallet: 9 }, ...organic, { dt: 1_700, buy: 0.6e9 }])
     expect(replayLaunch(sold, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '5' })).skipReason ?? '').not.toMatch(/one wallet/)
+  })
+})
+
+describe('replay: moonbag', () => {
+  const env = {
+    RPC_URL: 'https://rpc.example.com', TAKE_PROFIT: '60:50,150:100', STOP_LOSS_PCT: '30', TRAILING_STOP_PCT: '20', TRAILING_ARM_PCT: '30',
+    MAX_HOLD_SECONDS: '180', STALE_SECONDS: '30', PAPER_LATENCY_MS: '300', BUY_SOL: '0.1',
+  }
+  const off = loadConfig(env)
+  const on = loadConfig({ ...env, MOONBAG_PCT: '25' })
+  const run = (rec: LaunchRecord, c = on) => replayLaunch(rec, replayConfigFrom(c, { entry: 'instant' }))
+  // Buyers push it past 8x over 90s, then it bleeds back.
+  const runner = (t = 1_000) => {
+    const steps: Step[] = []
+    for (let i = 0; i < 30; i++) steps.push({ dt: 1_000 + i * 3_000, buy: 2e9 })
+    for (let i = 0; i < 12; i++) steps.push({ dt: 100_000 + i * 5_000, sellTokens: 25e12 })
+    return record(steps, { t })
+  }
+
+  it('lets a runner ride instead of selling out at the last take-profit', () => {
+    const plain = run(runner(), off)
+    expect(plain.exits).toEqual([expect.stringMatching(/tier 1/), expect.stringMatching(/tier 2/)])
+    const r = run(runner())
+    expect(r.moonbag).toBe(true)
+    expect(r.exits[0]).toMatch(/^free ride at \+5\d\.\d%/)
+    expect(r.exits[1]).toMatch(/^moonbag trailing stop/)
+    expect(r.peakGainPct).toBeGreaterThan(600)
+    expect(r.pnlLamports).toBeGreaterThan(plain.pnlLamports)
+    // Its slot was free again once the moonbag started riding.
+    expect(r.slotMs).toBeLessThan(r.holdMs)
+  })
+
+  it('keeps the trade profitable when the coin crashes after the free ride', () => {
+    // Pump to about +65%, then one wallet dumps: the moonbag is sold far below its stop.
+    const steps: Step[] = []
+    for (let i = 0; i < 6; i++) steps.push({ dt: 1_000 + i * 2_000, buy: 1.5e9 })
+    steps.push({ dt: 20_000, sellTokens: 240e12, wallet: 7 })
+    const r = run(record(steps))
+    expect(r.exits).toEqual([expect.stringMatching(/^free ride/), expect.stringMatching(/^moonbag stop/)])
+    expect(r.peakGainPct).toBeGreaterThan(50)
+    // Stake, every fee and the secured 10% came out before the crash.
+    expect(r.pnlLamports).toBeGreaterThan(0.1 * r.costLamports)
+  })
+
+  it('frees the position slot when the moonbag starts, so the next launch is not missed', () => {
+    const one = { ...env, MAX_OPEN_POSITIONS: '1' }
+    const recs = [runner(1_000), runner(21_000)]
+    const count = (c: typeof on) => new Evaluator(recs, c).results(paramsFromConfig(c)).length
+    expect(count(loadConfig(one))).toBe(1)
+    expect(count(loadConfig({ ...one, MOONBAG_PCT: '25' }))).toBe(2)
+  })
+})
+
+describe('recorder: runners stay replayable', () => {
+  afterEach(() => vi.useRealTimers())
+
+  it('keeps a thinned price path past the trade cap, and every dev trade', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(1_000_000)
+    const dir = await mkdtemp(join(tmpdir(), 'recorder-'))
+    const rec = new LaunchRecorder({ dataDir: dir, horizonMs: 900_000, maxTrades: 10 }, pino({ level: 'silent' }))
+    const mint = Keypair.generate().publicKey
+    const dev = Keypair.generate().publicKey
+    const curve: CurveState = {
+      virtualTokenReserves: 1_073_000_000_000_000n, virtualQuoteReserves: 30_000_000_000n, realTokenReserves: 793_100_000_000_000n,
+      realQuoteReserves: 0n, tokenTotalSupply: 1_000_000_000_000_000n, complete: false, creator: dev, isMayhemMode: false, creatorFeeBps: 0n,
+    }
+    const launch = {
+      mint, mintStr: mint.toBase58(), name: 'x', symbol: 'X', uri: 'u', creator: dev, dev, tokenProgram: dev, isMayhemMode: false, isHolderReward: false,
+      quoteMint: dev, isSolPaired: true, curve, devBuyLamports: 0n, devBuyTokens: 0n, signature: 's', slot: 1, detectedAt: 0, detectedAtWall: Date.now(),
+      source: 'ws' as const, executed: true,
+    }
+    rec.start(launch, { verdict: 'rejected', reason: '', creatorLaunches: 1, feeBps: { protocol: 95n, creator: 30n }, tokenOffset: OFFSET, initialRealTokenReserves: 793_100_000_000_000n })
+    let vq = 30_000_000_000n
+    const trade = (dtMs: number, dq: bigint, user = Keypair.generate().publicKey) => {
+      vi.setSystemTime(Date.now() + dtMs)
+      vq += dq
+      const ev = { mint, user, isBuy: dq > 0n, solAmount: dq > 0n ? dq : -dq, virtualSolReserves: vq, virtualTokenReserves: (30_000_000_000n * 1_073_000_000_000_000n) / vq }
+      rec.trade(ev as unknown as TradeEvent)
+    }
+    for (let i = 0; i < 10; i++) trade(100, 100_000_000n) // the first 10 trades, all kept
+    for (let i = 0; i < 50; i++) trade(10, 1_000_000n) // 0.5s of tiny trades: none kept
+    trade(10, -1_000_000n, dev) // the dev sells: kept
+    trade(10, 3_000_000_000n) // a 20% jump: kept
+    for (let i = 0; i < 3; i++) trade(1_000, 1_000_000n) // one per second: kept
+    for (let i = 0; i < 40; i++) trade(1_000, 1_000_000n) // past 4x the cap: truncated
+    await rec.flush()
+    const [file] = await readdir(join(dir, 'launches'))
+    const r = JSON.parse((await readFile(join(dir, 'launches', file!), 'utf8')).trim()) as LaunchRecord
+    expect(r.thinnedFrom).toBe(10)
+    expect(r.skippedTrades).toBe(50)
+    expect(r.trades[10]![5]).toBe(0) // the dev's sell
+    expect(r.trades).toHaveLength(40)
+    expect(r.truncated).toBe(true)
+    expect(r.summary.trades).toBe(90)
+    // Nothing is known after the last row of a truncated recording: the replay stops there.
+    expect(replayLaunch(r, rc()).holdMs).toBeLessThanOrEqual(r.trades[r.trades.length - 1]![0])
   })
 })

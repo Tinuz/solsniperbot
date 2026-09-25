@@ -10,6 +10,7 @@ import {
   type ParamChange,
   type TunableParams,
   applyParams,
+  completeParams,
   diffParams,
   paramsFromConfig,
   paramsKey,
@@ -123,6 +124,18 @@ const iso = (t: number) => new Date(t).toISOString().slice(0, 16).replace('T', '
 
 const adoptsIn = (cfg: Config) => (cfg.autotune.mode === 'paper' && cfg.dryRun) || (cfg.autotune.mode === 'live' && !cfg.dryRun)
 
+/** State saved by an older version: settings it did not know yet take their value from `base`. */
+function upgradeState(s: TuningState, base: TunableParams): TuningState {
+  const fill = (p: TunableParams) => completeParams(p, base)
+  return {
+    ...s,
+    baseline: fill(s.baseline),
+    active: fill(s.active),
+    adoptions: (s.adoptions ?? []).map((a) => ({ ...a, from: fill(a.from), to: fill(a.to) })),
+    shadow: s.shadow ? { ...s.shadow, from: fill(s.shadow.from), to: fill(s.shadow.to) } : undefined,
+  }
+}
+
 const stateFile = (cfg: Config) => {
   const name = adoptsIn(cfg) ? (cfg.dryRun ? 'paper' : 'live') : `${cfg.autotune.mode}-${cfg.dryRun ? 'paper' : 'live'}`
   return join(cfg.dataDir, 'tuning', `state-${name}.json`)
@@ -135,9 +148,10 @@ const stateFile = (cfg: Config) => {
  */
 export async function loadTunedParams(cfg: Config): Promise<{ params: TunableParams; changes: ParamChange[] } | undefined> {
   if (!adoptsIn(cfg)) return undefined
-  const saved = await readJson<TuningState>(stateFile(cfg)).catch(() => undefined)
-  if (!saved || saved.v !== 1) return undefined
+  const raw = await readJson<TuningState>(stateFile(cfg)).catch(() => undefined)
+  if (!raw || raw.v !== 1) return undefined
   const baseline = paramsFromConfig(cfg)
+  const saved = upgradeState(raw, baseline)
   if (paramsKey(saved.baseline) !== paramsKey(baseline)) return undefined
   const changes = diffParams(baseline, saved.active)
   return changes.length ? { params: saved.active, changes } : undefined
@@ -243,8 +257,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
 
   /** Restores earlier adoptions (paper mode). Call before trading starts. */
   async load(): Promise<void> {
-    const saved = await readJson<TuningState>(this.path)
-    if (saved && saved.v === 1) {
+    const raw = await readJson<TuningState>(this.path)
+    if (raw && raw.v === 1) {
+      const saved = upgradeState(raw, this.baseline)
       this.state = { ...this.freshState(), ...saved, rolledBack: saved.rolledBack ?? [] }
       if (paramsKey(saved.baseline) !== paramsKey(this.baseline)) {
         // The user changed .env: their settings win, earlier overrides are stale.

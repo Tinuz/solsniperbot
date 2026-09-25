@@ -77,7 +77,7 @@ Paper mode runs the same rules against a simulated wallet (`PAPER_START_SOL`), s
 The bot's own trades are a small sample. The launches it *didn't* buy are the bigger lesson. `RECORD_LAUNCHES=true` (the default) writes every launch to `data/launches/<day>.jsonl`, bought or not. Each record holds:
 - the features the bot decided on (dev buy, supply share, curve state, creator history, name, fees);
 - the verdict and reason;
-- every trade on the coin for `RECORD_HORIZON_MIN` minutes;
+- every trade on the coin for `RECORD_HORIZON_MIN` minutes (past `RECORD_MAX_TRADES`, a thinned price path: one trade per second, every 2% move and every dev trade, so runners stay replayable to the end);
 - the bot's own result if it traded the coin.
 
 Recording happens after decisions, so it costs no latency. Let the bot collect a few days of data (paper mode is fine), then run:
@@ -103,7 +103,7 @@ Both tools replay what the bot actually runs with, autotuned settings included. 
 
 ### Research: is there an edge at all?
 
-`analyze` and `backtest` look at the settings you have and what is near them. `npm run research` asks the bigger question: does *any* strategy within the bounds make money on this data? It searches entry mode, momentum thresholds, insider filters, launch filters and exits together, starting from six very different strategies (blind sniping, patient momentum, strict momentum with insider filters, quick exits, slow exits) and improving each step by step. It takes up to 10 minutes by default (`-- --budget=20` for more, `-- --days=3` for recent data only).
+`analyze` and `backtest` look at the settings you have and what is near them. `npm run research` asks the bigger question: does *any* strategy within the bounds make money on this data? It searches entry mode, momentum thresholds, insider filters, launch filters and exits together, starting from eight very different strategies (blind sniping, patient momentum, strict momentum with insider filters, quick exits, slow exits, and your settings and patient momentum with a moonbag) and improving each step by step. It takes up to 10 minutes by default (`-- --budget=20` for more, `-- --days=3` for recent data only).
 
 The search is honest by construction. The recordings are split by time into three parts:
 1. **Search (oldest 60%).** Strategies are found here. Each one is scored *without its single best trade*, so a strategy that lives off one lucky coin scores low.
@@ -149,9 +149,9 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 - **What it can change.** Only which coins to buy, when, and when to sell:
   - entry: `ENTRY_MODE` (instant or momentum), the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`, and the insider filters `MOMENTUM_MAX_EARLY_BUY_SOL`, `MOMENTUM_MAX_TOP_BUYER_PCT` (each can also be switched off);
   - filters: `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`;
-  - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`.
+  - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`, and the moonbag: `MOONBAG_PCT` (on or off), `MOONBAG_SECURE_PCT`, `MOONBAG_STOP_BUFFER_PCT`, `MOONBAG_TRAILING_PCT`, `MOONBAG_MAX_HOLD_SECONDS`.
 - **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
-- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit or an insider filter counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
+- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%, moonbag 10–50% with a hold of at most 900s so recordings can follow it), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit, an insider filter or the moonbag counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
 
 **Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
 1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
@@ -243,11 +243,29 @@ Checked on every trade of the coin and once per second. The order is: protective
 5. **Max hold** (`MAX_HOLD_SECONDS`) and **stale** (`STALE_SECONDS` without any trades).
 6. **Graduation**: when the curve completes, the position is sold on PumpSwap through the official SDK.
 
+#### Moonbag: a free ride on runners
+
+Without a moonbag, the last take-profit tier, the trailing stop and the time exits all sell everything, so a coin that turns into a runner is gone after a few minutes. With `MOONBAG_PCT=25`:
+
+1. **Free ride.** The bot watches when selling all but 25% of the bought tokens would bring back the stake, every fee (buy, sells, tips, and the later sale of the moonbag itself) and `MOONBAG_SECURE_PCT`% profit (default 10). The moment it would, it sells exactly that. With the defaults that is at about +50%. Take-profit tiers below that point still sell first and count towards it; a stop loss or dev dump before it sells everything as usual.
+2. **The moonbag rides on its own rules.** It is sold:
+   - back at entry + `MOONBAG_STOP_BUFFER_PCT` (default 5%), plus what the sell transaction costs;
+   - `MOONBAG_TRAILING_PCT` (default 40%) off its peak, so a runner at 5x is cashed well above entry;
+   - after `MOONBAG_MAX_HOLD_SECONDS` (default 900, from opening);
+   - when the dev sells (with `EXIT_ON_DEV_SELL`), or at graduation.
+
+   No stale exit (runners pause), and take-profit tiers no longer apply.
+3. **It never blocks a trade.** Moonbags don't count against `MAX_OPEN_POSITIONS`; at most `MAX_MOONBAGS` (default 10) ride at once. When they are all taken, the free ride is skipped and the normal rules apply.
+
+The guarantee comes from the free-ride sale, not the stop: a stop is a trigger, not a price, and a rug can drop 80% in one trade before the sell lands. Because stake, fees and the secured profit are already in, the trade as a whole stays in profit even if the moonbag goes to zero.
+
+It is a trade-off. A moonbag gives up some profit on medium winners (the free ride sells earlier than a 50% tier would) for far more on real runners. Whether that pays depends on how often coins run after you enter: `npm run research` compares both on your own recordings, and autotune can switch the moonbag on or off and tune it.
+
 Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` to `SELL_MAX_SLIPPAGE_BPS`. After that, the exit policy retries with backoff. Full exits also close the token account to reclaim its rent.
 
 ### Risk limits
 
-`MAX_OPEN_POSITIONS`, `MAX_BUYS_PER_MINUTE`, and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. Balance, trade size and the exit reserve are handled by [survival](#survival-the-bot-keeps-itself-alive). None of these can be overridden by a strategy signal.
+`MAX_OPEN_POSITIONS` (moonbags excluded, see above), `MAX_BUYS_PER_MINUTE`, and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. Balance, trade size and the exit reserve are handled by [survival](#survival-the-bot-keeps-itself-alive). None of these can be overridden by a strategy signal.
 
 ## Dashboard and API
 
@@ -300,6 +318,13 @@ npm run typecheck
 
 - **Protocol**: instruction bytes, event/account decoding and curve math are checked against `@pump-fun/pump-sdk` and the published IDL (`test/fixtures`).
 - **Strategy**: config parsing, filters, exit policy, momentum, risk limits, and survival (sizing, fee-drag minimum, defensive mode, critical vs dead, persistence and revival).
+- **Moonbag**:
+  - the free-ride sale brings back stake, every fee and the secured profit, counting earlier take-profits;
+  - never at a loss, and not when every moonbag slot is taken;
+  - the moonbag's own rules (break-even stop with its fee, wide trailing stop, own hold time, no stale exit);
+  - in the replay, a runner rides further and a crash after the free ride still leaves the trade in profit;
+  - end to end, the moonbag frees its position slot and is stopped above entry;
+  - recordings of busy coins thin out instead of stopping, and tuned settings saved before moonbags existed still load.
 - **Edge gate**:
   - no buys (but full recording) until the settings are proven;
   - the proof is per exact settings, restored after restart, stale after 3h, and withdrawn when the market turns;
@@ -327,8 +352,8 @@ npm run typecheck
   - the search runs in a real worker thread;
   - while observing, it explores the whole bounded range and adopts a strategy far beyond one step when it holds up, but never while trading or without the edge gate.
 - **Strategy research**: finds a profitable strategy far from the current settings and proves it on the newest 20% it never used; finds nothing on a market of dead coins and rugs; needs enough data; never picks excluded settings; respects its time budget.
-- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing and the insider signals (early bundled buys, biggest holder).
-- **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
+- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing the insider signals (early bundled buys, biggest holder) and moonbags.
+- **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, a moonbag free ride, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 
 **Not covered:** these tests can't prove landing performance or strategy profitability on mainnet. Validate with paper trading and small sizes first.
 

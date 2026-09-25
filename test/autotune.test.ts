@@ -4,12 +4,13 @@ import { join } from 'node:path'
 import { pino } from 'pino'
 import { afterEach, describe, expect, it } from 'vitest'
 import { loadConfig } from '../src/config.js'
-import { AutoTuner } from '../src/learning/autotune.js'
+import { AutoTuner, loadTunedParams } from '../src/learning/autotune.js'
 import { loadRecords } from '../src/learning/dataset.js'
 import type { LaunchRecord } from '../src/learning/record.js'
 import {
   type TunableParams,
   applyParams,
+  diffParams,
   neighbors,
   paramsFromConfig,
   paramsKey,
@@ -69,6 +70,21 @@ describe('tunable settings', () => {
     expect(at({ momentumMaxTopBuyerPct: 25 })).toBe(false) // on, but past the bound
     expect(at({ momentumMaxTopBuyerPct: 0 }, { momentumMaxTopBuyerPct: 5 })).toBe(true) // on → off
     expect(at({ momentumMaxTopBuyerPct: 11 }, { momentumMaxTopBuyerPct: 5 })).toBe(false) // more than 2x
+    expect(at({ moonbagPct: 25 })).toBe(true) // moonbag off → on
+    expect(at({ moonbagPct: 60 })).toBe(false) // past its bound
+    expect(at({ moonbagPct: 25, moonbagSecurePct: 30 }, { moonbagPct: 25 })).toBe(false) // secured profit: ±10 per step
+    expect(at({ moonbagPct: 25, moonbagMaxHoldSec: 1_200 }, { moonbagPct: 25, moonbagMaxHoldSec: 900 })).toBe(false) // beyond the recordings
+    expect(at({ moonbagMaxHoldSec: 5_000 })).toBe(true) // irrelevant while the moonbag is off
+  })
+
+  it('keys settings without a moonbag exactly as before moonbags existed', () => {
+    expect(paramsKey(current)).not.toMatch(/MOONBAG/)
+    expect(paramsKey({ ...current, moonbagSecurePct: 30 })).toBe(paramsKey(current)) // off: its settings don't matter
+    const on = { ...current, moonbagPct: 25 }
+    expect(paramsKey(on)).toMatch(/"MOONBAG_PCT":"25"/)
+    expect(diffParams(current, on)).toEqual([{ key: 'moonbagPct', env: 'MOONBAG_PCT', from: '0', to: '25' }])
+    expect(neighbors(current).some((n) => n.params.moonbagPct === 25)).toBe(true)
+    expect(neighbors(on).some((n) => n.params.moonbagTrailingPct !== on.moonbagTrailingPct)).toBe(true)
   })
 
   it('can only reach entry, filters and exits, never trade size, fees or risk limits', () => {
@@ -313,6 +329,29 @@ describe('AutoTuner', () => {
     expect(again.decision).not.toBe('skipped')
     expect(again.changes.map((c) => c.to)).not.toContain(first.changes[0]!.to)
     expect(paramsKey(paramsFromConfig(b.cfg))).not.toBe(paramsKey(adopted))
+  })
+
+  it('restores tuned settings saved before moonbags existed', async () => {
+    const { dir, env } = await setup()
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    const first = await a.t.run()
+    expect(first.decision).toBe('adopt')
+    // Strip the moonbag settings, as an older version saved them.
+    const path = join(dir, 'tuning', 'state-paper.json')
+    const strip = (p: Record<string, unknown>) => Object.fromEntries(Object.entries(p).filter(([k]) => !k.startsWith('moonbag')))
+    const saved = JSON.parse(await readFile(path, 'utf8'))
+    saved.baseline = strip(saved.baseline)
+    saved.active = strip(saved.active)
+    saved.adoptions = saved.adoptions.map((x: { from: Record<string, unknown>; to: Record<string, unknown> }) => ({ ...x, from: strip(x.from), to: strip(x.to) }))
+    await writeFile(path, JSON.stringify(saved))
+
+    const b = tuner(env, clock)
+    await b.t.load()
+    expect(b.t.status().overrides).toEqual(first.changes)
+    expect(b.cfg.exits.moonbag).toMatchObject({ pct: 0, securePct: 10, maxHoldMs: 900_000 })
+    expect((await loadTunedParams(loadConfig(env)))?.changes).toEqual(first.changes)
   })
 
   it('drops tuned overrides when the .env settings change', async () => {

@@ -6,7 +6,7 @@ import { type Config, loadConfig } from '../src/config.js'
 import type { Launch, MintState } from '../src/feed/market.js'
 import { TOKEN_2022_PROGRAM_ID } from '../src/pump/constants.js'
 import type { CurveState } from '../src/pump/curve.js'
-import { decideExit, type ExitInput } from '../src/strategy/exits.js'
+import { type ExitInput, type PositionBooks, decideExit, freeRide, moonbagFloorPct } from '../src/strategy/exits.js'
 import { staticFilter } from '../src/strategy/filters.js'
 import { decideMomentum, momentumSnapshot } from '../src/strategy/momentum.js'
 import { RiskManager } from '../src/strategy/risk.js'
@@ -169,6 +169,83 @@ describe('exit policy', () => {
   it('closes stale and overdue positions', () => {
     expect(decideExit(x({ ageMs: e.maxHoldMs }), e)).toMatchObject({ action: 'sell', reason: 'max hold time' })
     expect(decideExit(x({ idleMs: e.staleMs }), e)).toMatchObject({ action: 'sell', reason: 'no trading activity' })
+  })
+})
+
+describe('moonbag (free ride)', () => {
+  const e = cfgWith({ TAKE_PROFIT: '60:50,150:100', MOONBAG_PCT: '25', MOONBAG_SECURE_PCT: '10', MOONBAG_STOP_BUFFER_PCT: '5', MOONBAG_TRAILING_PCT: '40' }).exits
+  // 0.05 SOL stake, 0.001 SOL paid in network fees so far, 0.0005 SOL per sell.
+  const books = (over: Partial<PositionBooks> = {}): PositionBooks => ({
+    heldFraction: 1,
+    costLamports: 50_000_000,
+    realizedLamports: 0,
+    networkLamports: 1_000_000,
+    sellNetworkLamports: 500_000,
+    ...over,
+  })
+  const x = (over: Partial<ExitInput>): ExitInput => ({ gainPct: 0, peakGainPct: 0, ageMs: 1_000, idleMs: 0, devSold: false, tiersDone: 0, books: books(), ...over })
+
+  it('is off by default: nothing changes', () => {
+    const off = cfgWith({ TAKE_PROFIT: '60:50,150:100' }).exits
+    expect(off.moonbag).toMatchObject({ pct: 0, securePct: 10, stopBufferPct: 5, trailingPct: 40, maxHoldMs: 900_000, max: 10 })
+    expect(decideExit(x({ gainPct: 160, peakGainPct: 160, tiersDone: 1 }), off)).toMatchObject({ action: 'sell', pct: 100, tier: 1 })
+  })
+
+  it('sells all but the moonbag once that brings back the stake, every fee and the secured profit', () => {
+    // Needed: 0.05 * 1.10 + 0.001 + 2 sells * 0.0005 = 0.057 SOL; 75% of the tokens fetch that at +52%.
+    expect(decideExit(x({ gainPct: 51, peakGainPct: 51 }), e)).toEqual({ action: 'hold' })
+    const d = decideExit(x({ gainPct: 53, peakGainPct: 53 }), e)
+    expect(d).toMatchObject({ action: 'sell', pct: 75, moonbag: true, urgent: false })
+    expect(d.action === 'sell' && d.reason).toMatch(/^free ride at \+53\.0%/)
+    // By construction the moonbag is free: the sale alone covers stake, fees and profit.
+    for (let gain = 0; gain <= 500; gain += 7) {
+      const b = books()
+      const ride = freeRide({ gainPct: gain, books: b }, e.moonbag)
+      if (!ride) continue
+      const proceeds = (ride / 100) * b.heldFraction * b.costLamports * (1 + gain / 100)
+      expect(proceeds).toBeGreaterThanOrEqual(b.costLamports * 1.1 + b.networkLamports + 2 * b.sellNetworkLamports - 1)
+    }
+  })
+
+  it('counts what earlier take-profits already brought in', () => {
+    // Tier 1 sold half at +60% (0.04 SOL); selling another quarter must bring the rest.
+    const after = books({ heldFraction: 0.5, realizedLamports: 40_000_000, networkLamports: 1_500_000 })
+    expect(decideExit(x({ gainPct: 35, peakGainPct: 60, tiersDone: 1, books: after }), e)).toEqual({ action: 'hold' })
+    expect(decideExit(x({ gainPct: 45, peakGainPct: 60, tiersDone: 1, books: after }), e)).toMatchObject({ action: 'sell', pct: 50, moonbag: true })
+    // Already down to the moonbag's size and paid for: switch to the moonbag rules without selling.
+    const small = books({ heldFraction: 0.2, realizedLamports: 60_000_000, networkLamports: 1_500_000 })
+    expect(decideExit(x({ gainPct: 20, peakGainPct: 60, tiersDone: 1, books: small }), e)).toMatchObject({ action: 'moonbag' })
+  })
+
+  it('never starts one at a loss, without books, or when every moonbag slot is taken', () => {
+    expect(decideExit(x({ gainPct: -30 }), e)).toMatchObject({ action: 'sell', pct: 100, reason: 'stop loss -30.0%' })
+    expect(decideExit(x({ gainPct: 70, peakGainPct: 70, books: undefined }), e)).toMatchObject({ action: 'sell', pct: 50, tier: 0 })
+    expect(decideExit(x({ gainPct: 70, peakGainPct: 70, moonbagsFull: true }), e)).toMatchObject({ action: 'sell', pct: 50, tier: 0 })
+    expect(decideExit(x({ gainPct: 160, peakGainPct: 160, tiersDone: 1, moonbagsFull: true }), e)).toMatchObject({ action: 'sell', pct: 100 })
+  })
+
+  it('rides the moonbag on its own rules: break-even stop, wide trailing stop, own hold time', () => {
+    // A quarter of the tokens: cost 0.0125 SOL, the sell's 0.0005 SOL fee is 4% of it, so the stop sits at +9%.
+    const bag = (over: Partial<ExitInput>) => x({ moonbag: true, books: books({ heldFraction: 0.25, realizedLamports: 57_000_000, networkLamports: 1_500_000 }), ...over })
+    expect(moonbagFloorPct(bag({}).books, e.moonbag)).toBeCloseTo(9)
+    expect(decideExit(bag({ gainPct: 9.5, peakGainPct: 60 }), e)).toEqual({ action: 'hold' })
+    expect(decideExit(bag({ gainPct: 8.9, peakGainPct: 60 }), e)).toMatchObject({ action: 'sell', pct: 100, urgent: true, reason: 'moonbag stop at +9.0%' })
+    // Peak 4x, now 2.5x: 37.5% off, keeps riding; at 2.4x (40% off) it is sold.
+    expect(decideExit(bag({ gainPct: 150, peakGainPct: 300 }), e)).toEqual({ action: 'hold' })
+    expect(decideExit(bag({ gainPct: 140, peakGainPct: 300 }), e)).toMatchObject({ action: 'sell', pct: 100, reason: /^moonbag trailing stop/ })
+    // Take-profit tiers, the normal stop, hold time and stale exits no longer apply: runners pause.
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, idleMs: 600_000, ageMs: 600_000 }), e)).toEqual({ action: 'hold' })
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, ageMs: 900_000 }), e)).toMatchObject({ action: 'sell', reason: 'moonbag max hold time' })
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, devSold: true }), e)).toMatchObject({ action: 'sell', pct: 100, reason: 'moonbag: dev sold' })
+    const noTrail = { ...e, moonbag: { ...e.moonbag, trailingPct: 0 } }
+    expect(decideExit(bag({ gainPct: 20, peakGainPct: 900 }), noTrail)).toEqual({ action: 'hold' })
+  })
+
+  it('refuses a moonbag that outlives the recordings', () => {
+    expect(() => cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '1800' })).toThrow(/raise RECORD_HORIZON_MIN/)
+    expect(() => cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '0' })).toThrow(/no limit/)
+    expect(cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '1800', RECORD_HORIZON_MIN: '30' }).exits.moonbag.maxHoldMs).toBe(1_800_000)
+    expect(cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '0', RECORD_LAUNCHES: 'false' }).exits.moonbag.maxHoldMs).toBe(0)
   })
 })
 

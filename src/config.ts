@@ -138,6 +138,12 @@ const schema = z.object({
   MAX_HOLD_SECONDS: num(180, { min: 0, int: true }),
   STALE_SECONDS: num(45, { min: 0, int: true }),
   EXIT_ON_DEV_SELL: bool(true),
+  MOONBAG_PCT: num(0, { min: 0, max: 90 }),
+  MOONBAG_SECURE_PCT: num(10, { min: 0, max: 500 }),
+  MOONBAG_STOP_BUFFER_PCT: num(5, { min: 0, max: 100 }),
+  MOONBAG_TRAILING_PCT: num(40, { min: 0, max: 100 }),
+  MOONBAG_MAX_HOLD_SECONDS: num(900, { min: 0, int: true }),
+  MAX_MOONBAGS: num(10, { min: 0, int: true }),
   SELL_SLIPPAGE_BPS: num(2_500, { min: 0, max: 9_900, int: true }),
   SELL_MAX_SLIPPAGE_BPS: num(6_000, { min: 0, max: 10_000, int: true }),
   SELL_RETRIES: num(3, { min: 0, max: 20, int: true }),
@@ -279,6 +285,23 @@ export interface Config {
     maxHoldMs: number
     staleMs: number
     exitOnDevSell: boolean
+    /**
+     * Free ride: once selling all but `pct`% of the bought tokens returns the
+     * stake, every fee and `securePct`% profit, sell that and let the rest run
+     * under its own rules. `pct` 0 = off.
+     */
+    moonbag: {
+      pct: number
+      securePct: number
+      /** The moonbag is sold at entry + this % (+ the sell's own network fee). */
+      stopBufferPct: number
+      /** Sell the moonbag this far off its peak; 0 = off. */
+      trailingPct: number
+      /** From the position's opening; 0 = no limit. */
+      maxHoldMs: number
+      /** Most moonbags held at once (they don't count against MAX_OPEN_POSITIONS). */
+      max: number
+    }
     sellSlippageBps: number
     sellMaxSlippageBps: number
     sellRetries: number
@@ -383,6 +406,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
   if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
+  const moonbagHold = e.MOONBAG_MAX_HOLD_SECONDS
+  if (e.MOONBAG_PCT > 0 && e.RECORD_LAUNCHES && (moonbagHold === 0 || moonbagHold > e.RECORD_HORIZON_MIN * 60)) {
+    throw new Error(
+      `MOONBAG_MAX_HOLD_SECONDS (${moonbagHold || 'no limit'}) outlasts RECORD_HORIZON_MIN (${e.RECORD_HORIZON_MIN} min): raise RECORD_HORIZON_MIN so recordings (and every replay) can follow a moonbag to the end`,
+    )
+  }
   if (e.AUTOTUNE === 'paper' && !e.DRY_RUN) {
     throw new Error('AUTOTUNE=paper only works in paper mode (DRY_RUN=true); use AUTOTUNE=suggest for proposals in live mode')
   }
@@ -473,6 +502,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxHoldMs: e.MAX_HOLD_SECONDS * 1_000,
       staleMs: e.STALE_SECONDS * 1_000,
       exitOnDevSell: e.EXIT_ON_DEV_SELL,
+      moonbag: {
+        pct: e.MOONBAG_PCT,
+        securePct: e.MOONBAG_SECURE_PCT,
+        stopBufferPct: e.MOONBAG_STOP_BUFFER_PCT,
+        trailingPct: e.MOONBAG_TRAILING_PCT,
+        maxHoldMs: e.MOONBAG_MAX_HOLD_SECONDS * 1_000,
+        max: e.MAX_MOONBAGS,
+      },
       sellSlippageBps: e.SELL_SLIPPAGE_BPS,
       sellMaxSlippageBps: e.SELL_MAX_SLIPPAGE_BPS,
       sellRetries: e.SELL_RETRIES,

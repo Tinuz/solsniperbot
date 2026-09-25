@@ -114,7 +114,8 @@ export class Reporter {
       const p = e.data
       const pnl = tradePnl(p)
       const exit = p.status === 'failed' ? `buy failed: ${p.error ?? ''}` : (p.closeReason ?? '')
-      this.send(`${pnl >= 0n ? '🟢' : '🔴'} ${p.symbol} ${sol(pnl)} (${exit})`)
+      const ride = p.moonbag ? ` · moonbag rode ${Math.round(((p.closedAt ?? p.moonbagAt ?? 0) - (p.moonbagAt ?? 0)) / 1000)}s` : ''
+      this.send(`${pnl >= 0n ? '🟢' : '🔴'} ${p.symbol} ${sol(pnl)} (${exit})${ride}`)
     })
     const restarts = Number(process.env.SUPERVISOR_RESTARTS ?? 0)
     this.send(`▶️ started${restarts ? ` (restart #${restarts})` : ''} · ${tradingLine(this.engine.status())}`)

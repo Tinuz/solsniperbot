@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Keypair } from '@solana/web3.js'
+import { Keypair, PublicKey } from '@solana/web3.js'
 import bs58 from 'bs58'
 import pino from 'pino'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -100,6 +100,31 @@ describe('paper trading end to end', () => {
     // What a metered RPC provider would bill is visible.
     expect(engine.status().usage.streamedMb).toBeGreaterThan(0)
     expect(engine.status().usage.rpcCalls).toBeGreaterThan(0)
+  })
+
+  it('takes a free ride: sells all but the moonbag, frees the slot, and stops the moonbag above entry', async () => {
+    const { chain, engine } = await boot({ TAKE_PROFIT: '60:50,150:100', BUY_SOL: '0.1', MOONBAG_PCT: '25', MAX_OPEN_POSITIONS: '1' })
+    const a = chain.launch({ symbol: 'RIDE', devBuyLamports: 500_000_000n }).mint.toBase58()
+    await waitFor(() => engine.positions.get(a)?.status === 'open', 5_000, 'paper position')
+
+    // Buyers push it past the free-ride point: 75% is sold, a quarter rides.
+    for (let i = 0; i < 8; i++) chain.trade(new PublicKey(a), { buyLamports: 2_000_000_000n })
+    const bag = await waitFor(() => engine.positions.get(a)?.moonbag && engine.positions.get(a), 8_000, 'moonbag')
+    expect(bag.sells[0]!.reason).toMatch(/^free ride/)
+    expect(Number(bag.tokensHeld) / Number(bag.tokensBought)).toBeCloseTo(0.25, 2)
+    // Stake, fees and the secured profit are in: the moonbag is free.
+    expect(bag.realizedLamports - bag.costLamports - bag.networkFeesLamports > 10_000_000n).toBe(true)
+    // It no longer takes up the only position slot: the next launch is bought.
+    expect(engine.positions.openCount).toBe(0)
+    expect(engine.positions.moonbagCount).toBe(1)
+    const b = chain.launch({ symbol: 'NEXT', devBuyLamports: 500_000_000n }).mint.toBase58()
+    await waitFor(() => engine.positions.get(b)?.status === 'open', 5_000, 'second position')
+
+    // A big holder dumps: the moonbag is sold at its break-even stop, and the trade as a whole made money.
+    chain.trade(new PublicKey(a), { sellTokens: 300_000_000_000_000n })
+    const closed = await waitFor(() => engine.positions.history().find((p) => p.mint === a && p.status === 'closed'), 8_000, 'moonbag stop')
+    expect(closed.closeReason).toMatch(/^moonbag stop at \+\d+\.\d%/)
+    expect(positionPnl(closed) > 10_000_000n).toBe(true)
   })
 
   it('rejects launches that fail the filters and never buys them', async () => {
