@@ -11,6 +11,7 @@ import { loadConfig, publicConfig } from '../src/config.js'
 import type { Engine } from '../src/engine.js'
 import { paramsFromConfig } from '../src/learning/tunable.js'
 import { evaluateEdge } from '../src/learning/tuner.js'
+import { TradeLedger } from '../src/notify/ledger.js'
 import { Reporter, summaryText } from '../src/notify/reporter.js'
 import { TelegramNotifier } from '../src/notify/telegram.js'
 import { SolanaWs } from '../src/solana/ws.js'
@@ -80,7 +81,7 @@ async function fakeTelegram(opts: { rateLimitFirst?: boolean; fail?: boolean; ou
         return res.end(JSON.stringify({ ok: false, description: 'Too Many Requests', parameters: { retry_after: 1 } }))
       }
       if (req.url?.endsWith('/sendMessage')) messages.push(JSON.parse(body))
-      res.end(JSON.stringify({ ok: true, result: {} }))
+      res.end(JSON.stringify({ ok: true, result: req.url?.endsWith('/getUpdates') ? [] : {} }))
     })
   })
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
@@ -178,15 +179,17 @@ describe('operating costs', () => {
 })
 
 /** Just enough of an Engine for the reporter. */
-function fakeEngine(cfg = loadConfig({ ...BASE, DATA_DIR: tmp(), TELEGRAM_BOT_TOKEN: 'T', TELEGRAM_CHAT_ID: '42', NOTIFY_TRADES: 'true' })) {
+function fakeEngine(cfg = loadConfig({ ...BASE, DATA_DIR: tmp(), TELEGRAM_BOT_TOKEN: 'T', TELEGRAM_CHAT_ID: '42', NOTIFY_TRADES: 'true', NOTIFY_COMMANDS: 'false' })) {
   const engine = new EventEmitter() as EventEmitter & Record<string, unknown>
   const closed: Position[] = []
   engine.cfg = cfg
-  engine.positions = { history: () => closed }
+  engine.positions = { history: () => closed, list: () => [] }
+  engine.risk = { snapshot: () => ({ paused: false }), pause: () => {}, resume: () => {} }
+  engine.survival = { paperRealizedLamports: 0n }
   engine.status = () => ({
     uptimeSec: 2 * 86_400,
     risk: { paused: false },
-    survival: { state: 'healthy', equitySol: 1.0234, drawdownPct: 1.5, runwayTrades: 18 },
+    survival: { state: 'healthy', equitySol: 1.0234, peakEquitySol: 1.04, drawdownPct: 1.5, runwayTrades: 18 },
     tuning: { mode: 'paper', edge: { required: true, allowed: false, reason: 'collecting data: 120 launches over 1.0h (need 2000 over 24h)' }, last: null, probation: null, overrides: [] },
     costs: { perMonth: 69, currency: 'usd', perDaySol: 0.0123, accruedSol: 0.05, netLamports: -20_000_000 },
     recorder: { written: 25_123 },
@@ -196,18 +199,22 @@ function fakeEngine(cfg = loadConfig({ ...BASE, DATA_DIR: tmp(), TELEGRAM_BOT_TO
 }
 
 describe('reporter', () => {
-  it('writes a daily summary with status, results, costs and usage', () => {
+  it('writes a daily summary in Dutch with status, results, costs and usage', () => {
     const now = 10 * 86_400_000
-    const { engine, closed } = fakeEngine()
-    closed.push(
-      { symbol: 'WIN', status: 'closed', closedAt: now - 3_600_000, realizedLamports: 80_000_000n, costLamports: 50_000_000n, networkFeesLamports: 0n, valueLamports: 0n, reconciled: false } as Position,
-      { symbol: 'OLD', status: 'closed', closedAt: now - 2 * 86_400_000, realizedLamports: 0n, costLamports: 50_000_000n, networkFeesLamports: 0n, valueLamports: 0n, reconciled: false } as Position,
-    )
-    const text = summaryText(engine, now)
-    expect(text).toContain('observing, not buying: collecting data')
-    expect(text).toContain('Last 24h: 1 trades, 100% wins, +0.0300 SOL')
-    expect(text).toContain('net after costs −0.0200 SOL ❌')
-    expect(text).toContain('Recorded 25,123 launches · stream 3.2 GB/day (≈70,000 Helius credits/day)')
+    const { engine } = fakeEngine()
+    const ledger = new TradeLedger()
+    const trade = (symbol: string, at: number, realized: bigint) =>
+      ledger.add({ mint: symbol, symbol, status: 'closed', closedAt: at, realizedLamports: realized, costLamports: 50_000_000n, networkFeesLamports: 0n, valueLamports: 0n, reconciled: false } as Position)
+    trade('WIN', now - 3_600_000, 80_000_000n)
+    trade('MEH', now - 1_800_000, 45_000_000n)
+    trade('OLD', now - 2 * 86_400_000, 0n)
+    const text = summaryText(engine, ledger, now)
+    expect(text).toContain('📊 Dagoverzicht')
+    expect(text).toContain('observeert, koopt niet: verzamelt data: 120 launches in 1.0 u (nodig: 2000 in 24 u)')
+    expect(text).toContain('Laatste 24 uur: 2 trades · 50% winst · +0,0250 SOL')
+    expect(text).toContain('Zonder beste trade: −0,0050 SOL ❌')
+    expect(text).toContain('netto na kosten −0,0200 SOL ❌')
+    expect(text).toContain('Opgenomen: 25.123 launches · stream 3,2 GB/dag (≈70.000 Helius-credits/dag)')
   })
 
   it('reports alerts, closed trades, feed outages that last, and one summary a day', async () => {
@@ -218,19 +225,19 @@ describe('reporter', () => {
     const r = new Reporter(engine, log, () => clock.now)
     await r.start()
     engine.emit('alert', 'autotune adopted ENTRY_MODE instant → momentum')
-    engine.emit('event', { type: 'closed', data: { symbol: 'MOON', status: 'closed', closedAt: clock.now, closeReason: 'take profit 60%', realizedLamports: 70_000_000n, costLamports: 50_000_000n, networkFeesLamports: 0n, valueLamports: 0n, reconciled: false } as Position })
+    engine.emit('event', { type: 'closed', data: { mint: 'M', symbol: 'MOON', status: 'closed', openedAt: clock.now - 95_000, closedAt: clock.now, closeReason: 'take profit +62.0% (tier 1)', realizedLamports: 70_000_000n, costLamports: 50_000_000n, networkFeesLamports: 0n, valueLamports: 0n, reconciled: false } as Position })
     engine.emit('feed', 'ws', false)
     engine.emit('feed', 'ws', true) // a quick reconnect is routine: no message
     expect(await r.maybeSummary()).toBe(true)
     expect(await r.maybeSummary()).toBe(false) // once per day
     await r.stop('SIGINT')
     const texts = tg.messages.map((m) => m.text)
-    expect(texts[0]).toMatch(/^\[paper\] ▶️ started · observing/)
-    expect(texts).toContain('[paper] autotune adopted ENTRY_MODE instant → momentum')
-    expect(texts).toContain('[paper] 🟢 MOON +0.0200 SOL (take profit 60%)')
-    expect(texts.some((t) => t.includes('📊 Daily summary'))).toBe(true)
-    expect(texts.at(-1)).toBe('[paper] ⏹ stopped (SIGINT)')
-    expect(texts.some((t) => t.includes('feed'))).toBe(false)
+    expect(texts[0]).toMatch(/^\[paper\] ▶️ Gestart · observeert/)
+    expect(texts).toContain('[paper] ⚙️ Autotune nam over: ENTRY_MODE instant → momentum')
+    expect(texts).toContain('[paper] 🟢 MOON +0,0200 SOL (+40,0%) · winst genomen op +62.0% (trede 1) · 2m')
+    expect(texts.some((t) => t.includes('📊 Dagoverzicht'))).toBe(true)
+    expect(texts.at(-1)).toBe('[paper] ⏹ Gestopt (handmatig gestopt)')
+    expect(texts.some((t) => /stream (ligt|is terug)/.test(t))).toBe(false)
     await tg.close()
   }, 20_000)
 })

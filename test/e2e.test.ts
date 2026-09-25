@@ -1,4 +1,6 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Keypair, PublicKey } from '@solana/web3.js'
@@ -9,6 +11,7 @@ import { ApiServer } from '../src/api/server.js'
 import { loadConfig } from '../src/config.js'
 import { Engine, type EngineEvent } from '../src/engine.js'
 import type { LaunchRecord } from '../src/learning/record.js'
+import { Reporter } from '../src/notify/reporter.js'
 import { DeadError } from '../src/strategy/survival.js'
 import { PUMP_PROGRAM_ID } from '../src/pump/constants.js'
 import { positionPnl } from '../src/trading/positions.js'
@@ -306,6 +309,47 @@ describe('launch recording', () => {
     expect(b.position?.exits).toEqual(['max hold time'])
     expect(b.trades.length).toBeGreaterThanOrEqual(1)
   }, 20_000)
+})
+
+describe('telegram (real engine)', () => {
+  it('reports in Dutch and answers /status and /posities from the owner’s chat', async () => {
+    // A minimal Bot API: records messages, hands out one queued command at a time.
+    const sent: string[] = []
+    const queue: Record<string, unknown>[] = []
+    const server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        const reply = (result: unknown) => res.end(JSON.stringify({ ok: true, result }))
+        if (req.url?.endsWith('/sendMessage')) sent.push(JSON.parse(body).text)
+        if (!req.url?.endsWith('/getUpdates')) return reply(true)
+        const next = queue.shift()
+        if (next) return reply([next])
+        setTimeout(() => reply([]), 30)
+      })
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const { chain, engine } = await boot({ TAKE_PROFIT: '400:100', BUY_SOL: '0.1', TELEGRAM_BOT_TOKEN: 'T', TELEGRAM_CHAT_ID: '7', TELEGRAM_API_URL: url })
+    const reporter = new Reporter(engine, log)
+    await reporter.start()
+    try {
+      await waitFor(() => sent.some((t) => t.startsWith('[paper] ▶️ Gestart · handelt')), 5_000, 'started message')
+      const mint = chain.launch({ symbol: 'TGRM', devBuyLamports: 500_000_000n }).mint.toBase58()
+      await waitFor(() => engine.positions.get(mint)?.status === 'open', 5_000, 'position')
+      const ask = (text: string) => queue.push({ update_id: queue.length + sent.length + 1, message: { date: Math.floor(Date.now() / 1000), text, chat: { id: 7 } } })
+      ask('/status')
+      const status = await waitFor(() => sent.find((t) => t.includes('🤖 Status')), 5_000, '/status reply')
+      expect(status).toContain('Open: 1 positie · 0 moonbags')
+      expect(status).toContain('Vermogen 1,0000 SOL')
+      ask('/posities')
+      const list = await waitFor(() => sent.find((t) => t.includes('📂 Open posities')), 5_000, '/posities reply')
+      expect(list).toContain('• TGRM')
+    } finally {
+      await reporter.stop('SIGINT')
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
 })
 
 describe('control API', () => {

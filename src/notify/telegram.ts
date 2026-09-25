@@ -15,12 +15,18 @@ const TIMEOUT_MS = 10_000
 const RETRY_DELAYS_MS = [5_000, 15_000, 45_000]
 
 /** Calls a Bot API method. Throws with Telegram's own description on failure. */
-export async function telegramCall<T>(t: Pick<TelegramTarget, 'token' | 'apiUrl'>, method: string, body: Record<string, unknown>): Promise<T> {
+export async function telegramCall<T>(
+  t: Pick<TelegramTarget, 'token' | 'apiUrl'>,
+  method: string,
+  body: Record<string, unknown>,
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<T> {
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS)
   const res = await fetch(`${t.apiUrl.replace(/\/$/, '')}/bot${t.token}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
   })
   const data = (await res.json().catch(() => ({}))) as { ok?: boolean; result?: T; description?: string; parameters?: { retry_after?: number } }
   if (!data.ok) {
@@ -38,7 +44,7 @@ export async function telegramCall<T>(t: Pick<TelegramTarget, 'token' | 'apiUrl'
  * failing Telegram never delays trading.
  */
 export class TelegramNotifier {
-  private readonly queue: string[] = []
+  private readonly queue: { text: string; extra?: Record<string, unknown> }[] = []
   private draining?: Promise<void>
   private lastSentAt = 0
   sent = 0
@@ -52,8 +58,9 @@ export class TelegramNotifier {
     private readonly retryDelaysMs = RETRY_DELAYS_MS,
   ) {}
 
-  send(text: string): void {
-    this.queue.push(this.tag ? `${this.tag} ${text}` : text)
+  /** `extra` goes into the sendMessage call as is, e.g. `reply_markup` for buttons. */
+  send(text: string, extra?: Record<string, unknown>): void {
+    this.queue.push({ text: this.tag ? `${this.tag} ${text}` : text, extra })
     if (this.queue.length > MAX_QUEUE) this.queue.splice(0, this.queue.length - MAX_QUEUE)
     this.draining ??= this.drain().finally(() => {
       this.draining = undefined
@@ -71,9 +78,9 @@ export class TelegramNotifier {
     while (this.queue.length) {
       const wait = this.lastSentAt + MIN_GAP_MS - Date.now()
       if (wait > 0) await sleep(wait)
-      const text = this.queue[0]!
+      const { text, extra } = this.queue[0]!
       try {
-        await telegramCall(this.target, 'sendMessage', { chat_id: this.target.chatId, text, disable_web_page_preview: true })
+        await telegramCall(this.target, 'sendMessage', { chat_id: this.target.chatId, text, disable_web_page_preview: true, ...extra })
         this.queue.shift()
         this.sent++
         attempt = 0
