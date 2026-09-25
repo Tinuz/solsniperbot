@@ -54,7 +54,8 @@ export class SolanaWs extends EventEmitter {
   private backoffMs = 250
   private stopped = true
   private heartbeat?: NodeJS.Timeout
-  private awaitingPong = false
+  /** Last time anything arrived: data or a pong. */
+  private lastSeenAt = 0
   private reconnectTimer?: NodeJS.Timeout
 
   readonly stats: WsStats = { connected: false, reconnects: 0, messages: 0, bytes: 0, lastMessageAt: 0, lastNotificationAt: 0, connectedAt: 0, stalls: 0 }
@@ -69,6 +70,7 @@ export class SolanaWs extends EventEmitter {
      * Only for streams that are never quiet that long.
      */
     private readonly stallMs?: number,
+    private readonly heartbeatMs = 10_000,
   ) {
     super()
   }
@@ -129,7 +131,7 @@ export class SolanaWs extends EventEmitter {
 
     ws.on('message', (raw: WebSocket.RawData) => this.onMessage(raw))
     ws.on('pong', () => {
-      this.awaitingPong = false
+      this.lastSeenAt = Date.now()
     })
     ws.on('error', (err) => this.log.warn({ ws: this.name, err: err.message }, 'websocket error'))
     ws.on('close', (code) => {
@@ -146,12 +148,19 @@ export class SolanaWs extends EventEmitter {
     })
   }
 
+  /**
+   * Pings every `heartbeatMs` and drops the socket only when nothing at all
+   * (no data, no pong) arrived for three intervals. Data counts as a sign of
+   * life: on a busy stream the server's pong can queue behind notifications,
+   * and cutting a working socket would lose launches while it reconnects.
+   */
   private startHeartbeat(ws: WebSocket): void {
     clearInterval(this.heartbeat)
-    this.awaitingPong = false
+    this.lastSeenAt = Date.now()
     this.heartbeat = setInterval(() => {
-      if (this.awaitingPong) {
-        this.log.warn({ ws: this.name }, 'websocket heartbeat missed, terminating')
+      const silentMs = Date.now() - this.lastSeenAt
+      if (silentMs > this.heartbeatMs * 3) {
+        this.log.warn({ ws: this.name, silentSec: Math.round(silentMs / 1000) }, 'websocket silent (no data, no pong), terminating')
         ws.terminate()
         return
       }
@@ -163,9 +172,8 @@ export class SolanaWs extends EventEmitter {
         ws.terminate()
         return
       }
-      this.awaitingPong = true
       ws.ping()
-    }, 10_000)
+    }, this.heartbeatMs)
   }
 
   private sendSubscribe(sub: Subscription): void {
@@ -182,6 +190,7 @@ export class SolanaWs extends EventEmitter {
     this.stats.messages++
     this.stats.bytes += byteLength(raw)
     this.stats.lastMessageAt = Date.now()
+    this.lastSeenAt = this.stats.lastMessageAt
     let msg: RpcMessage
     try {
       msg = JSON.parse(raw.toString()) as RpcMessage

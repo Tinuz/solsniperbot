@@ -59,15 +59,21 @@ describe('restart policy', () => {
 })
 
 /** A fake Telegram Bot API that records messages and can answer 429 once. */
-async function fakeTelegram(opts: { rateLimitFirst?: boolean; fail?: boolean } = {}) {
+async function fakeTelegram(opts: { rateLimitFirst?: boolean; fail?: boolean; outages?: number } = {}) {
   const messages: { chat_id: string; text: string }[] = []
   let limited = !opts.rateLimitFirst
+  let outages = opts.outages ?? 0
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
       res.setHeader('content-type', 'application/json')
       if (opts.fail) return res.end(JSON.stringify({ ok: false, description: 'Bad Request: chat not found' }))
+      if (outages > 0) {
+        outages--
+        res.statusCode = 502
+        return res.end('bad gateway')
+      }
       if (!limited) {
         limited = true
         res.statusCode = 429
@@ -94,6 +100,16 @@ describe('telegram notifier', () => {
     expect(n.sent).toBe(2)
     await tg.close()
   }, 15_000)
+
+  it('retries through a network hiccup or Telegram outage instead of losing the message', async () => {
+    const tg = await fakeTelegram({ outages: 2 })
+    const n = new TelegramNotifier({ token: 'T', chatId: '42', apiUrl: tg.url }, log, '', [20, 20, 20])
+    n.send('▶️ started')
+    await n.flush()
+    expect(tg.messages.map((m) => m.text)).toEqual(['▶️ started'])
+    expect(n.failed).toBe(0)
+    await tg.close()
+  })
 
   it('drops a message Telegram refuses instead of blocking the queue', async () => {
     const tg = await fakeTelegram({ fail: true })
@@ -220,6 +236,26 @@ describe('reporter', () => {
 })
 
 describe('websocket feed health', () => {
+  it('keeps a busy socket whose pongs are late, and drops one that goes silent', async () => {
+    // autoPong off: the server never answers pings, like a pong stuck behind queued data.
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1', autoPong: false })
+    await new Promise<void>((r) => wss.once('listening', () => r()))
+    let streaming = true
+    wss.on('connection', (sock) => {
+      const timer = setInterval(() => streaming && sock.send('{"jsonrpc":"2.0","method":"x"}'), 20)
+      sock.on('close', () => clearInterval(timer))
+    })
+    const ws = new SolanaWs(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, log, 'test', undefined, 50)
+    ws.start()
+    await new Promise((r) => setTimeout(r, 500))
+    expect(ws.stats.reconnects).toBe(0) // data flows: alive, however late the pongs
+    streaming = false
+    await new Promise((r) => setTimeout(r, 400))
+    expect(ws.stats.reconnects).toBeGreaterThan(0) // nothing at all for 3 intervals: dead
+    ws.stop()
+    await new Promise<void>((r) => wss.close(() => r()))
+  })
+
   it('counts streamed bytes and reports a refused subscription', async () => {
     const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' })
     await new Promise<void>((r) => wss.once('listening', () => r()))
