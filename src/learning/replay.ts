@@ -29,6 +29,13 @@ export interface ReplayResult {
   pnlPct: number
   exits: string[]
   holdMs: number
+  /**
+   * How long the trade took up a MAX_OPEN_POSITIONS slot: until its moonbag
+   * started riding, or the whole hold.
+   */
+  slotMs: number
+  /** Part of the position rode as a moonbag. */
+  moonbag: boolean
   peakGainPct: number
 }
 
@@ -79,11 +86,12 @@ function sellQuote(vq: number, vt: number, tokens: number, pBps: number, cBps: n
 export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
   const none = (skipReason: string): ReplayResult => ({
     entered: false, skipReason, costLamports: 0, proceedsLamports: 0, networkLamports: 0,
-    pnlLamports: 0, pnlPct: 0, exits: [], holdMs: 0, peakGainPct: 0,
+    pnlLamports: 0, pnlPct: 0, exits: [], holdMs: 0, slotMs: 0, moonbag: false, peakGainPct: 0,
   })
   const { protocol: pBps, creator: cBps } = rec.feeBps
   const trades = rec.trades
-  const end = rec.partial && trades.length ? trades[trades.length - 1]![0] : rec.horizonMs
+  // A recording cut short (restart, or the trade cap of older recordings) says nothing after its last trade.
+  const end = (rec.partial || rec.truncated) && trades.length ? trades[trades.length - 1]![0] : rec.horizonMs
 
   // Curve (and last trade index) as of time `t`.
   let cursor = -1
@@ -177,6 +185,7 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
   let network = c.buyNetworkLamports
   let peak = 0
   let tiersDone = 0
+  let moonbagAt: number | undefined
   const exits: string[] = []
   let devSold = trades.some((r) => r[0] <= entryMs && r[3] < 0 && r[5] === 0)
   let lastTradeMs = fill.idx >= 0 ? trades[fill.idx]![0] : 0
@@ -231,13 +240,30 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
     const cur = at(t)
     const gain = gainAt(cur.vq, cur.vt)
     if (gain > peak) peak = gain
-    const d: ExitDecision = decideExit(
-      { gainPct: gain, peakGainPct: peak, ageMs: t - decisionMs, idleMs: t - lastTradeMs, devSold, tiersDone },
-      c.exits,
-    )
+    const decide = (): ExitDecision =>
+      decideExit(
+        {
+          gainPct: gain,
+          peakGainPct: peak,
+          ageMs: t - decisionMs,
+          idleMs: t - lastTradeMs,
+          devSold,
+          tiersDone,
+          moonbag: moonbagAt !== undefined,
+          books: { heldFraction: held / bought.tokens, costLamports: cost, realizedLamports: proceeds, networkLamports: network, sellNetworkLamports: c.sellNetworkLamports },
+        },
+        c.exits,
+      )
+    let d = decide()
+    if (d.action === 'moonbag') {
+      moonbagAt = t
+      exits.push(d.reason)
+      d = decide()
+    }
     if (d.action === 'sell') {
       const filled = sellAt(t, d.pct, d.reason)
       if (d.tier !== undefined) tiersDone = d.tier + 1
+      if (d.moonbag && held > 0 && moonbagAt === undefined) moonbagAt = filled
       // The live bot ignores new signals while a sell is in flight.
       while (i < trades.length && trades[i]![0] <= filled) {
         const row = trades[i]!
@@ -264,6 +290,8 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
     pnlPct: (pnl / cost) * 100,
     exits,
     holdMs: exitedAt - entryMs,
+    slotMs: (moonbagAt ?? exitedAt) - entryMs,
+    moonbag: moonbagAt !== undefined,
     peakGainPct: peak,
   }
 }

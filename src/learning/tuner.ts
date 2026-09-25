@@ -57,10 +57,10 @@ export interface TuningResult {
 }
 
 /** The part of a replay the tuner needs, kept small: many are cached. */
-export type Outcome = Pick<ReplayResult, 'entered' | 'entryMs' | 'holdMs' | 'pnlLamports' | 'pnlPct'>
-const NOT_ENTERED: Outcome = { entered: false, holdMs: 0, pnlLamports: 0, pnlPct: 0 }
+export type Outcome = Pick<ReplayResult, 'entered' | 'entryMs' | 'holdMs' | 'slotMs' | 'pnlLamports' | 'pnlPct'>
+const NOT_ENTERED: Outcome = { entered: false, holdMs: 0, slotMs: 0, pnlLamports: 0, pnlPct: 0 }
 const outcome = (r: ReplayResult): Outcome =>
-  r.entered ? { entered: true, entryMs: r.entryMs, holdMs: r.holdMs, pnlLamports: r.pnlLamports, pnlPct: r.pnlPct } : NOT_ENTERED
+  r.entered ? { entered: true, entryMs: r.entryMs, holdMs: r.holdMs, slotMs: r.slotMs, pnlLamports: r.pnlLamports, pnlPct: r.pnlPct } : NOT_ENTERED
 
 interface Row {
   rec: LaunchRecord
@@ -98,7 +98,8 @@ export class Evaluator {
   /**
    * Trades the settings would have made, in time order, respecting
    * MAX_OPEN_POSITIONS: a launch arriving while every slot is taken is skipped,
-   * as it would be live.
+   * as it would be live. A moonbag frees its slot when it starts riding
+   * (MAX_MOONBAGS is not modelled: at its default it is rarely reached).
    */
   results(p: TunableParams): Outcome[] {
     const c = withParams(this.cfg, p)
@@ -116,7 +117,7 @@ export class Evaluator {
       const start = this.rows[i]!.rec.t + (res.entryMs ?? 0)
       for (let j = openUntil.length - 1; j >= 0; j--) if (openUntil[j]! <= start) openUntil.splice(j, 1)
       if (openUntil.length >= maxOpen) continue
-      openUntil.push(start + res.holdMs)
+      openUntil.push(start + res.slotMs)
       out.push(res)
     }
     return out

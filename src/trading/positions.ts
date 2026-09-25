@@ -9,7 +9,7 @@ import { decodeBondingCurve } from '../pump/layouts.js'
 import { bondingCurvePda } from '../pump/pda.js'
 import type { PumpProtocol } from '../pump/protocol.js'
 import type { RpcClient } from '../solana/rpc.js'
-import { type ExitDecision, decideExit } from '../strategy/exits.js'
+import { type ExitDecision, type PositionBooks, decideExit } from '../strategy/exits.js'
 import type { RiskManager } from '../strategy/risk.js'
 import type { Logger } from '../util/logger.js'
 import { DebouncedWriter, Journal, readJson } from '../util/persist.js'
@@ -61,6 +61,9 @@ export interface Position {
   /** P&L already booked into the totals (adjusted when reconciliation lands later). */
   bookedPnlLamports?: bigint
   tiersDone: number
+  /** Down to its moonbag: stake, fees and a profit are secured, the rest rides (see MOONBAG_PCT). */
+  moonbag?: boolean
+  moonbagAt?: number
   gainPct: number
   peakGainPct: number
   valueLamports: bigint
@@ -161,9 +164,15 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     return this.active.get(mint)
   }
 
-  /** Positions that count against MAX_OPEN_POSITIONS. */
+  /** Positions that count against MAX_OPEN_POSITIONS: moonbags don't, they have their own limit. */
   get openCount(): number {
-    return this.active.size
+    let n = 0
+    for (const p of this.active.values()) if (!p.moonbag) n++
+    return n
+  }
+
+  get moonbagCount(): number {
+    return this.active.size - this.openCount
   }
 
   list(): Position[] {
@@ -323,17 +332,47 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
           idleMs: state ? now - state.lastTradeAtWall : now - pos.lastPriceAt,
           devSold: state?.devSold ?? false,
           tiersDone: pos.tiersDone,
+          moonbag: pos.moonbag,
+          books: this.books(pos),
+          moonbagsFull: !pos.moonbag && this.moonbagCount >= this.d.cfg.exits.moonbag.max,
         },
         this.d.cfg.exits,
       )
     }
-    if (decision.action === 'sell') void this.sell(pos.mint, decision.pct, decision.reason, decision.tier)
+    if (decision.action === 'moonbag') {
+      this.startMoonbag(pos, decision.reason)
+      this.evaluate(pos, state)
+    } else if (decision.action === 'sell') {
+      void this.sell(pos.mint, decision.pct, decision.reason, decision.tier, decision.moonbag)
+    }
+  }
+
+  private books(pos: Position): PositionBooks | undefined {
+    if (pos.tokensBought === 0n) return undefined
+    return {
+      heldFraction: Number(pos.tokensHeld) / Number(pos.tokensBought),
+      costLamports: Number(pos.costLamports),
+      realizedLamports: Number(pos.realizedLamports),
+      networkLamports: Number(pos.networkFeesLamports),
+      sellNetworkLamports: Number(this.estimatedNetworkFee('sell')),
+    }
+  }
+
+  private startMoonbag(pos: Position, reason: string): void {
+    pos.moonbag = true
+    pos.moonbagAt = Date.now()
+    this.d.log.info({ mint: pos.mint, symbol: pos.symbol, reason, heldPct: Math.round((Number(pos.tokensHeld) / Number(pos.tokensBought || 1n)) * 100) }, 'moonbag riding')
+    void this.journal.append({ type: 'moonbag', at: pos.moonbagAt, mint: pos.mint, symbol: pos.symbol, paper: pos.paper, reason, tokens: pos.tokensHeld })
+    this.changed(pos)
   }
 
   // Exit ----------------------------------------------------------------------
 
-  /** Sells `pct` of the remaining position, retrying with wider slippage. */
-  async sell(mint: string, pct: number, reason: string, tier?: number): Promise<boolean> {
+  /**
+   * Sells `pct` of the remaining position, retrying with wider slippage.
+   * With `moonbag`, what remains afterwards rides as the moonbag.
+   */
+  async sell(mint: string, pct: number, reason: string, tier?: number, moonbag = false): Promise<boolean> {
     const pos = this.active.get(mint)
     if (!pos || pos.status !== 'open' || this.selling.has(mint)) return false
     this.selling.add(mint)
@@ -367,7 +406,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
           closeAccount: sellingAll && exits.closeTokenAccount && attempt === 0 && !graduated,
         })
         if (result.ok) {
-          await this.applySell(pos, tokens, result, reason, tier)
+          await this.applySell(pos, tokens, result, reason, tier, moonbag)
           return true
         }
 
@@ -375,7 +414,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
         if (result.landed) pos.networkFeesLamports += BASE_FEE + this.d.cfg.sellPriorityLamports
         if (pos.paper && graduated) {
           // Paper mode cannot route through the AMM: book at the last curve value.
-          await this.applySell(pos, tokens, { ok: true, paper: true, signature: 'paper-graduated', slot: 0, tokens, lamports: pos.valueLamports, tradeFeesLamports: 0n, timings: { buildMs: 0, sendMs: 0 } }, reason, tier)
+          await this.applySell(pos, tokens, { ok: true, paper: true, signature: 'paper-graduated', slot: 0, tokens, lamports: pos.valueLamports, tradeFeesLamports: 0n, timings: { buildMs: 0, sendMs: 0 } }, reason, tier, moonbag)
           return true
         }
         if (/Pool account not found/i.test(result.error) && migrationWaits < 30) {
@@ -417,7 +456,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     await Promise.all(this.list().filter((p) => p.status === 'open').map((p) => this.sell(p.mint, 100, reason)))
   }
 
-  private async applySell(pos: Position, tokens: bigint, r: Extract<TradeResult, { ok: true }>, reason: string, tier?: number): Promise<void> {
+  private async applySell(pos: Position, tokens: bigint, r: Extract<TradeResult, { ok: true }>, reason: string, tier?: number, moonbag = false): Promise<void> {
     let lamports = r.lamports
     if (lamports === 0n && !r.paper) {
       // Fill was not seen on the stream; book the expected proceeds until reconciled.
@@ -440,6 +479,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     } else {
       pos.status = 'open'
       this.reprice(pos)
+      if (moonbag && !pos.moonbag) this.startMoonbag(pos, reason)
       this.changed(pos)
     }
   }

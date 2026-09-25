@@ -5,7 +5,7 @@ import type { Position } from '../trading/positions.js'
 import { positionPnl } from '../trading/positions.js'
 import type { Logger } from '../util/logger.js'
 import { Journal } from '../util/persist.js'
-import { type LaunchRecord, type LaunchVerdict, summarize } from './record.js'
+import { type LaunchRecord, type LaunchVerdict, type TradeRow, summarize } from './record.js'
 
 interface Active {
   rec: Omit<LaunchRecord, 'summary'>
@@ -21,6 +21,12 @@ export interface RecorderOptions {
 }
 
 const day = (t: number) => new Date(t).toISOString().slice(0, 10)
+/** Past RECORD_MAX_TRADES: keep a row at least this often... */
+const THIN_MS = 1_000
+/** ...and whenever the price moved this much since the last kept row. */
+const THIN_MOVE = 0.02
+/** Hard cap on rows, as a multiple of RECORD_MAX_TRADES. */
+const THIN_CAP_FACTOR = 4
 const num = (v: bigint) => Number(v)
 
 /**
@@ -111,24 +117,29 @@ export class LaunchRecorder {
     const a = this.active.get(ev.mint.toBase58())
     if (!a) return
     const rec = a.rec
-    if (rec.trades.length >= this.opts.maxTrades) {
-      rec.truncated = true
-      return
-    }
+    if (rec.truncated) return
     const user = ev.user.toBase58()
     let wallet = a.wallets.get(user)
     if (wallet === undefined) {
       wallet = a.wallets.size
       a.wallets.set(user, wallet)
     }
-    rec.trades.push([
-      Date.now() - rec.t,
-      num(ev.virtualSolReserves),
-      num(ev.virtualTokenReserves),
-      ev.isBuy ? 1 : -1,
-      num(ev.solAmount),
-      wallet,
-    ])
+    const row: TradeRow = [Date.now() - rec.t, num(ev.virtualSolReserves), num(ev.virtualTokenReserves), ev.isBuy ? 1 : -1, num(ev.solAmount), wallet]
+    if (rec.trades.length >= this.opts.maxTrades) {
+      // Past the cap, keep the price path: enough to replay exits on a runner, far fewer rows.
+      if (rec.trades.length >= this.opts.maxTrades * THIN_CAP_FACTOR) {
+        rec.truncated = true
+        return
+      }
+      const last = rec.trades[rec.trades.length - 1]!
+      const move = Math.abs(row[1] / row[2] / (last[1] / last[2]) - 1)
+      if (wallet !== 0 && row[0] - last[0] < THIN_MS && move < THIN_MOVE) {
+        rec.skippedTrades = (rec.skippedTrades ?? 0) + 1
+        return
+      }
+      rec.thinnedFrom ??= rec.trades.length
+    }
+    rec.trades.push(row)
   }
 
   complete(mint: string): void {

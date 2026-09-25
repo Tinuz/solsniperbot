@@ -30,6 +30,13 @@ export interface TunableParams {
   devMaxSupplyPct: number
   maxEntryMcapSol: number
   creatorMaxLaunches: number
+  /** 0 = off; the other moonbag settings only matter when on. */
+  moonbagPct: number
+  moonbagSecurePct: number
+  moonbagStopBufferPct: number
+  /** 0 = off. */
+  moonbagTrailingPct: number
+  moonbagMaxHoldSec: number
 }
 
 export type ScalarKey = Exclude<keyof TunableParams, 'takeProfit' | 'entryMode' | 'exitOnDevSell'>
@@ -53,6 +60,12 @@ export const BOUNDS: Record<ScalarKey, [number, number]> = {
   devMaxSupplyPct: [1, 30],
   maxEntryMcapSol: [30, 200],
   creatorMaxLaunches: [1, 10],
+  moonbagPct: [10, 50],
+  moonbagSecurePct: [0, 50],
+  moonbagStopBufferPct: [0, 30],
+  moonbagTrailingPct: [15, 70],
+  // Within the default recording horizon (15 min), so replays can follow a moonbag to the end.
+  moonbagMaxHoldSec: [60, 900],
 }
 export const TP_GAIN_BOUNDS: [number, number] = [15, 500]
 export const TP_SELL_BOUNDS: [number, number] = [25, 100]
@@ -79,11 +92,18 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
   devMaxSupplyPct: { factor: 2 },
   maxEntryMcapSol: { factor: 1.5 },
   creatorMaxLaunches: { abs: 2 },
+  moonbagPct: { abs: 10 },
+  moonbagSecurePct: { abs: 10 },
+  moonbagStopBufferPct: { abs: 5 },
+  moonbagTrailingPct: { abs: 15 },
+  moonbagMaxHoldSec: { factor: 2 },
 }
 const TP_STEP_FACTOR = 2
 
 /** Settings where 0 means "off": switching on (to any in-bounds value) or off counts as one step. */
-const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct'])
+const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct', 'moonbagPct', 'moonbagTrailingPct'])
+/** Only in effect while the moonbag is on: their bounds and steps don't apply while it is off. */
+const MOONBAG_ONLY: ReadonlySet<ScalarKey> = new Set(['moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct', 'moonbagMaxHoldSec'])
 
 export const ENV_NAMES: Record<keyof TunableParams, string> = {
   entryMode: 'ENTRY_MODE',
@@ -106,6 +126,12 @@ export const ENV_NAMES: Record<keyof TunableParams, string> = {
   devMaxSupplyPct: 'DEV_MAX_SUPPLY_PCT',
   maxEntryMcapSol: 'MAX_ENTRY_MCAP_SOL',
   creatorMaxLaunches: 'CREATOR_MAX_LAUNCHES',
+  // Last, so settings without a moonbag keep the key (and fingerprint) they had before moonbags existed.
+  moonbagPct: 'MOONBAG_PCT',
+  moonbagSecurePct: 'MOONBAG_SECURE_PCT',
+  moonbagStopBufferPct: 'MOONBAG_STOP_BUFFER_PCT',
+  moonbagTrailingPct: 'MOONBAG_TRAILING_PCT',
+  moonbagMaxHoldSec: 'MOONBAG_MAX_HOLD_SECONDS',
 }
 
 const round = (v: number, d = 3) => Math.round(v * 10 ** d) / 10 ** d
@@ -132,8 +158,19 @@ export function paramsFromConfig(cfg: Config): TunableParams {
     devMaxSupplyPct: cfg.filters.devMaxSupplyPct,
     maxEntryMcapSol: Number(cfg.filters.maxEntryMcapLamports) / 1e9,
     creatorMaxLaunches: cfg.filters.creatorMaxLaunches,
+    moonbagPct: cfg.exits.moonbag.pct,
+    moonbagSecurePct: cfg.exits.moonbag.securePct,
+    moonbagStopBufferPct: cfg.exits.moonbag.stopBufferPct,
+    moonbagTrailingPct: cfg.exits.moonbag.trailingPct,
+    moonbagMaxHoldSec: cfg.exits.moonbag.maxHoldMs / 1000,
   }
 }
+
+/**
+ * Settings saved by an older version may lack newer fields: those take the
+ * value from `base` (the settings in effect), which is what that version ran.
+ */
+export const completeParams = (p: TunableParams, base: TunableParams): TunableParams => ({ ...base, ...p })
 
 /** A copy of `cfg` with `p` applied (the live config is left untouched). */
 export function withParams(cfg: Config, p: TunableParams): Config {
@@ -159,6 +196,14 @@ export function withParams(cfg: Config, p: TunableParams): Config {
       maxHoldMs: Math.round(p.maxHoldSec * 1000),
       staleMs: Math.round(p.staleSec * 1000),
       exitOnDevSell: p.exitOnDevSell,
+      moonbag: {
+        ...cfg.exits.moonbag,
+        pct: p.moonbagPct,
+        securePct: p.moonbagSecurePct,
+        stopBufferPct: p.moonbagStopBufferPct,
+        trailingPct: p.moonbagTrailingPct,
+        maxHoldMs: Math.round(p.moonbagMaxHoldSec * 1000),
+      },
     },
     filters: {
       ...cfg.filters,
@@ -219,6 +264,7 @@ export function withinLimits(p: TunableParams, origin: TunableParams): boolean {
     const [lo, hi] = BOUNDS[key]
     const v = p[key]
     const o = origin[key]
+    if (MOONBAG_ONLY.has(key) && p.moonbagPct === 0) continue
     if (OPTIONAL.has(key) && (v === 0 || o === 0)) {
       // Off, or switched on/off: only the bounds of the "on" value apply.
       if (v !== 0 && v !== o && (v < lo || v > hi)) return false
@@ -254,6 +300,7 @@ export function withinBounds(p: TunableParams): boolean {
   for (const key of Object.keys(BOUNDS) as ScalarKey[]) {
     const [lo, hi] = BOUNDS[key]
     const v = p[key]
+    if (MOONBAG_ONLY.has(key) && p.moonbagPct === 0) continue
     if (OPTIONAL.has(key) && v === 0) continue
     if (v < lo || v > hi) return false
   }
@@ -320,10 +367,27 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
   for (const v of scale(p.devMaxSupplyPct, [0.5, 0.75, 1.5, 2], 1)) set('dev supply', { devMaxSupplyPct: v })
   for (const v of scale(p.maxEntryMcapSol, [0.75, 0.9, 1.1, 1.5], 1)) set('entry mcap', { maxEntryMcapSol: v })
   for (const d of [-2, -1, 1, 2]) set('creator launches', { creatorMaxLaunches: p.creatorMaxLaunches + d })
+  // The moonbag's own settings only matter while it is on.
+  if (p.moonbagPct === 0) {
+    for (const v of [15, 25, 35]) set('moonbag', { moonbagPct: v })
+  } else {
+    for (const v of [0, p.moonbagPct - 10, p.moonbagPct - 5, p.moonbagPct + 5, p.moonbagPct + 10]) set('moonbag', { moonbagPct: v })
+    for (const d of [-10, -5, 5, 10]) set('moonbag profit', { moonbagSecurePct: p.moonbagSecurePct + d })
+    for (const d of [-5, -2, 2, 5]) set('moonbag stop', { moonbagStopBufferPct: p.moonbagStopBufferPct + d })
+    const trail = p.moonbagTrailingPct === 0 ? [25, 40, 55] : [0, p.moonbagTrailingPct - 15, p.moonbagTrailingPct - 10, p.moonbagTrailingPct + 10, p.moonbagTrailingPct + 15]
+    for (const v of trail) set('moonbag trailing stop', { moonbagTrailingPct: v })
+    for (const v of scale(p.moonbagMaxHoldSec, [0.5, 0.75, 1.5, 2], 0)) set('moonbag hold', { moonbagMaxHoldSec: v })
+  }
   return out
 }
 
-export const paramsKey = (p: TunableParams) => JSON.stringify(toEnv(p))
+/** Identity of a set of settings. The moonbag's settings only count while it is on. */
+export const paramsKey = (p: TunableParams) => {
+  const env = toEnv(p)
+  if (!p.moonbagPct) for (const key of MOONBAG_KEYS) delete env[ENV_NAMES[key]]
+  return JSON.stringify(env)
+}
+const MOONBAG_KEYS: (keyof TunableParams)[] = ['moonbagPct', 'moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct', 'moonbagMaxHoldSec']
 
 /** Short id of a set of settings, stored with each recorded launch. */
 export const settingsFingerprint = (p: TunableParams) => createHash('sha1').update(paramsKey(p)).digest('hex').slice(0, 12)
@@ -354,6 +418,7 @@ export const replayKey = (p: TunableParams) =>
     p.maxHoldSec,
     p.staleSec,
     p.exitOnDevSell,
+    p.moonbagPct ? [p.moonbagPct, p.moonbagSecurePct, p.moonbagStopBufferPct, p.moonbagTrailingPct, p.moonbagMaxHoldSec] : 0,
   ])
 
 /** What the static filters depend on. */

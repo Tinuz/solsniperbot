@@ -312,7 +312,7 @@
       const v = pnl(p)
       const busy = p.status !== 'open'
       return `<tr>
-        <td>${coinCell(p)}${p.paper ? ' <span class="badge">paper</span>' : ''}</td>
+        <td>${coinCell(p)}${p.paper ? ' <span class="badge">paper</span>' : ''}${p.moonbag ? ' <span class="badge accent" title="Stake, fees and a profit are secured; the rest rides until its own stop">moonbag</span>' : ''}</td>
         <td>${age(now - p.openedAt)}</td>
         <td class="num">${sol(lam(p.costLamports))}</td>
         <td class="num">${sol(lam(p.valueLamports))}</td>

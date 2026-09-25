@@ -44,12 +44,16 @@ const VALIDATION = 0.2
 const MAX_ROUNDS = 5
 const FINALISTS = 10
 
+const MOONBAG: Partial<TunableParams> = { moonbagPct: 25, moonbagSecurePct: 10, moonbagStopBufferPct: 5, moonbagTrailingPct: 40, moonbagMaxHoldSec: 900 }
+
 /**
  * Starting points far apart, so the search does not only explore around the
  * current settings: blind and patient entries, quick and slow exits, with and
- * without the insider filters.
+ * without the insider filters, with and without a moonbag.
  */
 const SEEDS: Partial<TunableParams>[] = [
+  MOONBAG,
+  { entryMode: 'momentum', momentumMinBuyers: 4, momentumMinNetBuySol: 1, ...MOONBAG },
   { entryMode: 'instant' },
   { entryMode: 'momentum' },
   { entryMode: 'momentum', momentumMinBuyers: 3, momentumMinNetBuySol: 0.5, momentumMaxSellRatio: 0.6 },

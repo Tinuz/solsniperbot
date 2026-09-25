@@ -64,7 +64,15 @@ export interface LaunchRecord {
   settings?: string
   position?: RecordedPosition
   trades: TradeRow[]
-  /** Trade cap reached before the horizon. */
+  /**
+   * Rows from this index on are a thinned price path: past RECORD_MAX_TRADES
+   * only one trade per second, every price move of 2% or more and every dev
+   * trade are kept, so busy coins (the runners) stay replayable to the end.
+   */
+  thinnedFrom?: number
+  /** Trades left out by the thinning. */
+  skippedTrades?: number
+  /** Hard row cap reached before the horizon: nothing is known after the last row. */
   truncated: boolean
   graduated: boolean
   /** Written before the horizon ended (bot shut down). */
@@ -73,7 +81,7 @@ export interface LaunchRecord {
   summary: RecordSummary
 }
 
-export function summarize(rec: Pick<LaunchRecord, 'curve' | 'trades' | 'tokenOffset'>): RecordSummary {
+export function summarize(rec: Pick<LaunchRecord, 'curve' | 'trades' | 'tokenOffset' | 'skippedTrades'>): RecordSummary {
   const p0 = rec.curve.vq / rec.curve.vt
   let max = 1
   let min = 1
@@ -96,7 +104,7 @@ export function summarize(rec: Pick<LaunchRecord, 'curve' | 'trades' | 'tokenOff
     if (side < 0 && wallet === 0 && devSoldAt === undefined) devSoldAt = dt
   }
   return {
-    trades: rec.trades.length,
+    trades: rec.trades.length + (rec.skippedTrades ?? 0),
     buyers: buyers.size,
     maxMultiple: max,
     tMaxMs: tMax,
