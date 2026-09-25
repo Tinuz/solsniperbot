@@ -149,9 +149,9 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 - **What it can change.** Only which coins to buy, when, and when to sell:
   - entry: `ENTRY_MODE` (instant or momentum), the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`, and the insider filters `MOMENTUM_MAX_EARLY_BUY_SOL`, `MOMENTUM_MAX_TOP_BUYER_PCT` (each can also be switched off);
   - filters: `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`;
-  - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`, and the moonbag: `MOONBAG_PCT` (on or off), `MOONBAG_SECURE_PCT`, `MOONBAG_STOP_BUFFER_PCT`, `MOONBAG_TRAILING_PCT`, `MOONBAG_MAX_HOLD_SECONDS`.
+  - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`, and the moonbag: `MOONBAG_PCT` (on or off), `MOONBAG_SECURE_PCT`, `MOONBAG_STOP_BUFFER_PCT`, `MOONBAG_TRAILING_PCT`.
 - **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
-- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%, moonbag 10–50% with a hold of at most 900s so recordings can follow it), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit, an insider filter or the moonbag counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
+- **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%, moonbag 10–50%, moonbag trailing stop 15–70%), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit, an insider filter or the moonbag counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
 
 **Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
 1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
@@ -251,15 +251,15 @@ Without a moonbag, the last take-profit tier, the trailing stop and the time exi
 2. **The moonbag rides on its own rules.** It is sold:
    - back at entry + `MOONBAG_STOP_BUFFER_PCT` (default 5%), plus what the sell transaction costs;
    - `MOONBAG_TRAILING_PCT` (default 40%) off its peak, so a runner at 5x is cashed well above entry;
-   - after `MOONBAG_MAX_HOLD_SECONDS` (default 900, from opening);
-   - when the dev sells (with `EXIT_ON_DEV_SELL`), or at graduation.
+   - when the dev sells (with `EXIT_ON_DEV_SELL`), or at graduation;
+   - when nobody has traded the coin for `MOONBAG_STALE_SECONDS` (default 30 minutes): a dead coin, not a runner.
 
-   No stale exit (runners pause), and take-profit tiers no longer apply.
+   **No time limit.** `MAX_HOLD_SECONDS`, `STALE_SECONDS` and the take-profit tiers no longer apply: a moonbag rides as long as the coin runs. `MOONBAG_MAX_HOLD_SECONDS` sets an optional hard limit (default 0, none).
 3. **It never blocks a trade.** Moonbags don't count against `MAX_OPEN_POSITIONS`; at most `MAX_MOONBAGS` (default 10) ride at once. When they are all taken, the free ride is skipped and the normal rules apply.
 
 The guarantee comes from the free-ride sale, not the stop: a stop is a trigger, not a price, and a rug can drop 80% in one trade before the sell lands. Because stake, fees and the secured profit are already in, the trade as a whole stays in profit even if the moonbag goes to zero.
 
-It is a trade-off. A moonbag gives up some profit on medium winners (the free ride sells earlier than a 50% tier would) for far more on real runners. Whether that pays depends on how often coins run after you enter: `npm run research` compares both on your own recordings, and autotune can switch the moonbag on or off and tune it.
+It is a trade-off. A moonbag gives up some profit on medium winners (the free ride sells earlier than a 50% tier would) for far more on real runners. Whether that pays depends on how often coins run after you enter: `npm run research` compares both on your own recordings, and autotune can switch the moonbag on or off and tune it. A recording lasts `RECORD_HORIZON_MIN`; a moonbag still riding when it ends is counted at no more than its stop, so research never counts on a run nobody saw.
 
 Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` to `SELL_MAX_SLIPPAGE_BPS`. After that, the exit policy retries with backoff. Full exits also close the token account to reclaim its rent.
 
@@ -321,7 +321,9 @@ npm run typecheck
 - **Moonbag**:
   - the free-ride sale brings back stake, every fee and the secured profit, counting earlier take-profits;
   - never at a loss, and not when every moonbag slot is taken;
-  - the moonbag's own rules (break-even stop with its fee, wide trailing stop, own hold time, no stale exit);
+  - the moonbag's own rules (break-even stop with its fee, wide trailing stop, only a dead coin ends the ride, no time limit);
+  - end to end, a moonbag outlasts `MAX_HOLD_SECONDS` and `STALE_SECONDS` while normal positions are closed by them;
+  - in the replay, a moonbag still riding when the recording ends counts at no more than its stop;
   - in the replay, a runner rides further and a crash after the free ride still leaves the trade in profit;
   - end to end, the moonbag frees its position slot and is stopped above entry;
   - recordings of busy coins thin out instead of stopping, and tuned settings saved before moonbags existed still load.

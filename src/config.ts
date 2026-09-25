@@ -142,7 +142,8 @@ const schema = z.object({
   MOONBAG_SECURE_PCT: num(10, { min: 0, max: 500 }),
   MOONBAG_STOP_BUFFER_PCT: num(5, { min: 0, max: 100 }),
   MOONBAG_TRAILING_PCT: num(40, { min: 0, max: 100 }),
-  MOONBAG_MAX_HOLD_SECONDS: num(900, { min: 0, int: true }),
+  MOONBAG_STALE_SECONDS: num(1_800, { min: 0, int: true }),
+  MOONBAG_MAX_HOLD_SECONDS: num(0, { min: 0, int: true }),
   MAX_MOONBAGS: num(10, { min: 0, int: true }),
   SELL_SLIPPAGE_BPS: num(2_500, { min: 0, max: 9_900, int: true }),
   SELL_MAX_SLIPPAGE_BPS: num(6_000, { min: 0, max: 10_000, int: true }),
@@ -297,7 +298,9 @@ export interface Config {
       stopBufferPct: number
       /** Sell the moonbag this far off its peak; 0 = off. */
       trailingPct: number
-      /** From the position's opening; 0 = no limit. */
+      /** A coin nobody traded for this long is dead, not a runner; 0 = off. */
+      staleMs: number
+      /** Optional hard limit from the position's opening; 0 = none (the default: a moonbag rides as long as it runs). */
       maxHoldMs: number
       /** Most moonbags held at once (they don't count against MAX_OPEN_POSITIONS). */
       max: number
@@ -406,12 +409,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
   if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
-  const moonbagHold = e.MOONBAG_MAX_HOLD_SECONDS
-  if (e.MOONBAG_PCT > 0 && e.RECORD_LAUNCHES && (moonbagHold === 0 || moonbagHold > e.RECORD_HORIZON_MIN * 60)) {
-    throw new Error(
-      `MOONBAG_MAX_HOLD_SECONDS (${moonbagHold || 'no limit'}) outlasts RECORD_HORIZON_MIN (${e.RECORD_HORIZON_MIN} min): raise RECORD_HORIZON_MIN so recordings (and every replay) can follow a moonbag to the end`,
-    )
-  }
   if (e.AUTOTUNE === 'paper' && !e.DRY_RUN) {
     throw new Error('AUTOTUNE=paper only works in paper mode (DRY_RUN=true); use AUTOTUNE=suggest for proposals in live mode')
   }
@@ -507,6 +504,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         securePct: e.MOONBAG_SECURE_PCT,
         stopBufferPct: e.MOONBAG_STOP_BUFFER_PCT,
         trailingPct: e.MOONBAG_TRAILING_PCT,
+        staleMs: e.MOONBAG_STALE_SECONDS * 1_000,
         maxHoldMs: e.MOONBAG_MAX_HOLD_SECONDS * 1_000,
         max: e.MAX_MOONBAGS,
       },

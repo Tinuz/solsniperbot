@@ -97,8 +97,9 @@ export function decideExit(x: ExitInput, e: Config['exits']): ExitDecision {
 
 /**
  * The moonbag is paid for; these rules only decide when to cash it: back at
- * entry (plus a buffer and the sell's own fee), well off its peak, too old,
- * or the dev sold. No stale exit: runners pause.
+ * entry (plus a buffer and the sell's own fee), well off its peak, or the dev
+ * sold. No time limit by default: it rides as long as the coin runs. Only a
+ * coin nobody has traded for a long time counts as dead.
  */
 function decideMoonbag(x: ExitInput, e: Config['exits']): ExitDecision {
   const m = e.moonbag
@@ -110,6 +111,9 @@ function decideMoonbag(x: ExitInput, e: Config['exits']): ExitDecision {
     if (drawdownPct >= m.trailingPct) {
       return { action: 'sell', pct: 100, reason: `moonbag trailing stop: ${drawdownPct.toFixed(1)}% off peak +${x.peakGainPct.toFixed(1)}%`, urgent: true }
     }
+  }
+  if (m.staleMs > 0 && x.idleMs >= m.staleMs) {
+    return { action: 'sell', pct: 100, reason: `moonbag: coin dead (no trades for ${Math.round(x.idleMs / 60_000)} min)`, urgent: false }
   }
   if (m.maxHoldMs > 0 && x.ageMs >= m.maxHoldMs) return { action: 'sell', pct: 100, reason: 'moonbag max hold time', urgent: false }
   return { action: 'hold' }

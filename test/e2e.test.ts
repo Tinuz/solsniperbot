@@ -103,7 +103,8 @@ describe('paper trading end to end', () => {
   })
 
   it('takes a free ride: sells all but the moonbag, frees the slot, and stops the moonbag above entry', async () => {
-    const { chain, engine } = await boot({ TAKE_PROFIT: '60:50,150:100', BUY_SOL: '0.1', MOONBAG_PCT: '25', MAX_OPEN_POSITIONS: '1' })
+    // Short hold and stale times: they must end normal positions, never the moonbag.
+    const { chain, engine } = await boot({ TAKE_PROFIT: '60:50,150:100', BUY_SOL: '0.1', MOONBAG_PCT: '25', MAX_OPEN_POSITIONS: '1', MAX_HOLD_SECONDS: '2', STALE_SECONDS: '1' })
     const a = chain.launch({ symbol: 'RIDE', devBuyLamports: 500_000_000n }).mint.toBase58()
     await waitFor(() => engine.positions.get(a)?.status === 'open', 5_000, 'paper position')
 
@@ -119,6 +120,11 @@ describe('paper trading end to end', () => {
     expect(engine.positions.moonbagCount).toBe(1)
     const b = chain.launch({ symbol: 'NEXT', devBuyLamports: 500_000_000n }).mint.toBase58()
     await waitFor(() => engine.positions.get(b)?.status === 'open', 5_000, 'second position')
+
+    // Well past MAX_HOLD_SECONDS and STALE_SECONDS: the normal position is closed, the moonbag still rides.
+    await waitFor(() => engine.positions.history().find((p) => p.mint === b && p.status === 'closed'), 6_000, 'normal max hold')
+    await new Promise((r) => setTimeout(r, 1_500))
+    expect(engine.positions.get(a)).toMatchObject({ status: 'open', moonbag: true })
 
     // A big holder dumps: the moonbag is sold at its break-even stop, and the trade as a whole made money.
     chain.trade(new PublicKey(a), { sellTokens: 300_000_000_000_000n })

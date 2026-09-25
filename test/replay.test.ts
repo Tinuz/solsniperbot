@@ -218,6 +218,29 @@ describe('replay: moonbag', () => {
     expect(r.pnlLamports).toBeGreaterThan(0.1 * r.costLamports)
   })
 
+  it('has no time limit: only a coin nobody trades any more ends the ride', () => {
+    // Pumps, then trading stops; recorded for an hour.
+    const steps: Step[] = []
+    for (let i = 0; i < 6; i++) steps.push({ dt: 1_000 + i * 2_000, buy: 1.5e9 })
+    const r = run(record(steps, { horizonMs: 3_600_000 }))
+    // Neither MAX_HOLD_SECONDS (180s) nor STALE_SECONDS (30s) touches the moonbag.
+    expect(r.exits).toEqual([expect.stringMatching(/^free ride/), 'moonbag: coin dead (no trades for 30 min)'])
+    expect(r.holdMs).toBeGreaterThan(1_800_000)
+  })
+
+  it('counts a moonbag still riding when the recording ends at no more than its stop', () => {
+    const steps: Step[] = []
+    for (let i = 0; i < 6; i++) steps.push({ dt: 1_000 + i * 2_000, buy: 1.5e9 })
+    for (let i = 0; i < 20; i++) steps.push({ dt: 20_000 + i * 40_000, buy: 0.05e9 }) // still trading, still up
+    const r = run(record(steps))
+    expect(r.exits[1]).toBe('recording ended (moonbag counted at its stop)')
+    // A graduated coin was really sold at the end: that value counts in full.
+    const sold = run(record(steps, { graduated: true }))
+    expect(sold.exits[1]).toBe('graduated')
+    expect(r.pnlLamports).toBeLessThan(sold.pnlLamports)
+    expect(r.pnlLamports).toBeGreaterThan(0.1 * r.costLamports)
+  })
+
   it('frees the position slot when the moonbag starts, so the next launch is not missed', () => {
     const one = { ...env, MAX_OPEN_POSITIONS: '1' }
     const recs = [runner(1_000), runner(21_000)]

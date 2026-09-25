@@ -187,7 +187,7 @@ describe('moonbag (free ride)', () => {
 
   it('is off by default: nothing changes', () => {
     const off = cfgWith({ TAKE_PROFIT: '60:50,150:100' }).exits
-    expect(off.moonbag).toMatchObject({ pct: 0, securePct: 10, stopBufferPct: 5, trailingPct: 40, maxHoldMs: 900_000, max: 10 })
+    expect(off.moonbag).toMatchObject({ pct: 0, securePct: 10, stopBufferPct: 5, trailingPct: 40, staleMs: 1_800_000, maxHoldMs: 0, max: 10 })
     expect(decideExit(x({ gainPct: 160, peakGainPct: 160, tiersDone: 1 }), off)).toMatchObject({ action: 'sell', pct: 100, tier: 1 })
   })
 
@@ -224,7 +224,7 @@ describe('moonbag (free ride)', () => {
     expect(decideExit(x({ gainPct: 160, peakGainPct: 160, tiersDone: 1, moonbagsFull: true }), e)).toMatchObject({ action: 'sell', pct: 100 })
   })
 
-  it('rides the moonbag on its own rules: break-even stop, wide trailing stop, own hold time', () => {
+  it('rides the moonbag on its own rules: break-even stop and wide trailing stop, no time limit', () => {
     // A quarter of the tokens: cost 0.0125 SOL, the sell's 0.0005 SOL fee is 4% of it, so the stop sits at +9%.
     const bag = (over: Partial<ExitInput>) => x({ moonbag: true, books: books({ heldFraction: 0.25, realizedLamports: 57_000_000, networkLamports: 1_500_000 }), ...over })
     expect(moonbagFloorPct(bag({}).books, e.moonbag)).toBeCloseTo(9)
@@ -233,20 +233,18 @@ describe('moonbag (free ride)', () => {
     // Peak 4x, now 2.5x: 37.5% off, keeps riding; at 2.4x (40% off) it is sold.
     expect(decideExit(bag({ gainPct: 150, peakGainPct: 300 }), e)).toEqual({ action: 'hold' })
     expect(decideExit(bag({ gainPct: 140, peakGainPct: 300 }), e)).toMatchObject({ action: 'sell', pct: 100, reason: /^moonbag trailing stop/ })
-    // Take-profit tiers, the normal stop, hold time and stale exits no longer apply: runners pause.
-    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, idleMs: 600_000, ageMs: 600_000 }), e)).toEqual({ action: 'hold' })
-    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, ageMs: 900_000 }), e)).toMatchObject({ action: 'sell', reason: 'moonbag max hold time' })
+    // Take-profit tiers, the normal stop, max hold and stale exits no longer apply: it rides as long as the coin runs.
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, idleMs: 600_000, ageMs: 86_400_000 }), e)).toEqual({ action: 'hold' })
+    // Only a coin nobody traded for half an hour is dead.
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, idleMs: 1_800_000 }), e)).toMatchObject({ action: 'sell', reason: 'moonbag: coin dead (no trades for 30 min)' })
+    // An optional hard limit, for whoever wants one.
+    const capped = cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '3600' }).exits
+    expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, ageMs: 3_600_000 }), capped)).toMatchObject({ action: 'sell', reason: 'moonbag max hold time' })
     expect(decideExit(bag({ gainPct: 200, peakGainPct: 200, devSold: true }), e)).toMatchObject({ action: 'sell', pct: 100, reason: 'moonbag: dev sold' })
     const noTrail = { ...e, moonbag: { ...e.moonbag, trailingPct: 0 } }
     expect(decideExit(bag({ gainPct: 20, peakGainPct: 900 }), noTrail)).toEqual({ action: 'hold' })
   })
 
-  it('refuses a moonbag that outlives the recordings', () => {
-    expect(() => cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '1800' })).toThrow(/raise RECORD_HORIZON_MIN/)
-    expect(() => cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '0' })).toThrow(/no limit/)
-    expect(cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '1800', RECORD_HORIZON_MIN: '30' }).exits.moonbag.maxHoldMs).toBe(1_800_000)
-    expect(cfgWith({ MOONBAG_PCT: '25', MOONBAG_MAX_HOLD_SECONDS: '0', RECORD_LAUNCHES: 'false' }).exits.moonbag.maxHoldMs).toBe(0)
-  })
 })
 
 describe('momentum entry', () => {

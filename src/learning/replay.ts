@@ -1,5 +1,5 @@
 import type { Config } from '../config.js'
-import { type ExitDecision, decideExit } from '../strategy/exits.js'
+import { type ExitDecision, decideExit, moonbagFloorPct } from '../strategy/exits.js'
 import { EARLY_WINDOW_MS, type MomentumSnapshot, decideMomentum } from '../strategy/momentum.js'
 import type { LaunchRecord } from './record.js'
 
@@ -195,14 +195,14 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
     const costHeld = (cost * held) / bought.tokens
     return (value / costHeld - 1) * 100
   }
-  const sellAt = (t: number, pct: number, reason: string) => {
+  const sellAt = (t: number, pct: number, reason: string, maxOut = Number.POSITIVE_INFINITY) => {
     const fillAt = Math.min(t + c.latencyMs, end)
     const s = at(fillAt)
     let amount = pct >= 100 ? held : Math.floor((held * pct) / 100)
     // Same dust rule as the live bot: never leave a sliver behind a partial sell.
     if (held - amount < bought.tokens / 100) amount = held
     const q = sellQuote(s.vq + dq, s.vt + dt, amount, pBps, cBps)
-    proceeds += q.out
+    proceeds += Math.min(q.out, maxOut)
     network += c.sellNetworkLamports
     held -= amount
     dq -= q.gross
@@ -213,8 +213,10 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
 
   // Exit loop: decisions can only change at a trade (price, dev activity) or
   // when a time-based rule comes due. Max hold counts from the decision, as
-  // the live bot's position age does.
-  const maxHoldAt = c.exits.maxHoldMs > 0 ? decisionMs + c.exits.maxHoldMs : Number.POSITIVE_INFINITY
+  // the live bot's position age does. A moonbag has its own timers.
+  const holdAt = (ms: number) => (ms > 0 ? decisionMs + ms : Number.POSITIVE_INFINITY)
+  const idleAt = (ms: number) => (ms > 0 ? lastTradeMs + ms : Number.POSITIVE_INFINITY)
+  const m = c.exits.moonbag
   let t = entryMs
   let i = fill.idx + 1
   let exitedAt = end
@@ -222,8 +224,8 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
   while (held > 0) {
     const nextTrade = i < trades.length ? trades[i]![0] : Number.POSITIVE_INFINITY
     let next = nextTrade
-    const staleAt = c.exits.staleMs > 0 ? lastTradeMs + c.exits.staleMs : Number.POSITIVE_INFINITY
-    for (const due of [maxHoldAt, staleAt]) {
+    const timers = moonbagAt === undefined ? [holdAt(c.exits.maxHoldMs), idleAt(c.exits.staleMs)] : [holdAt(m.maxHoldMs), idleAt(m.staleMs)]
+    for (const due of timers) {
       // A timer that fell due while a sell was in flight fires immediately.
       const when = Math.max(due, t)
       if (when < next && !(when === t && evaluatedAt === t)) next = when
@@ -276,7 +278,15 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
     }
   }
   if (held > 0) {
-    exitedAt = sellAt(end, 100, rec.graduated ? 'graduated' : 'recording ended') // mark to market
+    if (moonbagAt !== undefined && !rec.graduated) {
+      // Still riding when the recording ends: what comes next is unknown, so
+      // count it at no more than its stop rather than bet on a run nobody saw.
+      const costHeld = (cost * held) / bought.tokens
+      const floor = moonbagFloorPct({ heldFraction: held / bought.tokens, costLamports: cost, realizedLamports: proceeds, networkLamports: network, sellNetworkLamports: c.sellNetworkLamports }, m)
+      exitedAt = sellAt(end, 100, 'recording ended (moonbag counted at its stop)', costHeld * (1 + floor / 100))
+    } else {
+      exitedAt = sellAt(end, 100, rec.graduated ? 'graduated' : 'recording ended') // mark to market
+    }
   }
 
   const pnl = proceeds - cost - network
