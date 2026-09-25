@@ -39,7 +39,7 @@ try {
     for (const [id, name] of chats) console.log(`  TELEGRAM_CHAT_ID=${id}    # ${name}`)
     process.exit(0)
   }
-  await telegramCall({ token, apiUrl }, 'sendMessage', { chat_id: chatId, text: '✅ Sol Sniper can reach you here.' })
+  await telegramCall({ token, apiUrl }, 'sendMessage', { chat_id: chatId, text: '✅ Sol Sniper kan je hier bereiken. Typ /help zodra de bot draait.' })
   console.log('Test message sent. Notifications are on the next time the bot starts.')
 } catch (err) {
   console.error(`Telegram: ${(err as Error).message}`)

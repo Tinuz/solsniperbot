@@ -145,6 +145,11 @@ export class Survival {
     return balance
   }
 
+  /** Paper: P&L booked since the paper wallet was (re)started. */
+  get paperRealizedLamports(): bigint {
+    return this.paperRealized
+  }
+
   /** Books a finished paper position into the paper wallet. */
   bookClosed(pos: Position): void {
     if (!this.paper || !pos.paper) return

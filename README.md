@@ -191,14 +191,32 @@ Also for long runs:
 - **Lean paper mode.** Paper mode polls the blockhash once a minute instead of every second, because paper fills don't need it.
 - **Metered usage.** The dashboard header shows streamed data per day. The tooltip adds RPC calls and, for Helius, the estimated credits per day (about 20 credits per streamed MB plus 1 per request), so you can check your plan covers it.
 
-**Notifications (Telegram).** The bot reports what happens while nobody watches:
+**Notifications (Telegram).** The bot reports what happens while nobody watches, in Dutch (logs, dashboard and reports stay English):
 - starts and stops;
 - trading enabled or paused (edge);
 - autotune adoptions, shadow tests and rollbacks;
 - vitals changes and death;
 - feed outages longer than a minute, or a stream that stops delivering (for example when RPC credits run out);
+- **a digest** every `NOTIFY_DIGEST_HOURS` (default 6) on the local clock of `NOTIFY_TIMEZONE`: trades, win rate and P&L of the period, the same **without the single best trade**, best and worst coin, the running total, open positions and moonbags, equity and status;
 - a daily summary at `NOTIFY_DAILY_HOUR_UTC`, covering status, the last 24h, costs and usage;
+- **highlights** (`NOTIFY_HIGHLIGHTS`): a free ride as it happens, an open position passing 3x, 5x, 10x, 20x…, and a new equity record (each at least 5% above the last one announced);
 - with `NOTIFY_TRADES=true`, every closed trade.
+
+The reports count trades from a ledger in `data/notify.json` that keeps a week and survives restarts. The first time, it is filled from the trade journal.
+
+**Commands (Telegram).** With `NOTIFY_COMMANDS=true` (the default) the bot answers in the configured chat. Other chats are ignored, and so are commands sent while the bot was down.
+
+| Command | What it does |
+| --- | --- |
+| `/status` | Trading or observing, equity, vitals, open positions and moonbags, today's result |
+| `/vandaag` | Today's trades (local day): result, win rate, without the best trade, best and worst |
+| `/posities` | Open positions and moonbags with gain, value, peak and age |
+| `/pauze` | Stop buying; open positions are still managed. The pause survives restarts. |
+| `/hervat` | Buy again. It only lifts its own pause, never a daily loss limit or death, and says so when the edge gate still holds the bot back. |
+| `/verkoopalles` | Sell every open position and pause buying, after a tap on the confirmation button (valid 60 s) |
+| `/help` | The list |
+
+English names work too (`/today`, `/positions`, `/pause`, `/resume`, `/sellall`). Only one program can read a bot's commands: don't run `npm run telegram` while the bot is running.
 
 Setup:
 1. Create a bot with @BotFather and set `TELEGRAM_BOT_TOKEN`.
@@ -340,7 +358,9 @@ npm run typecheck
 - **Unattended running**:
   - restart policy: no restart after a clean stop, death or a config error; growing delays after crashes and hangs, never giving up;
   - Telegram delivery: in order, waits out rate limits, drops refused messages, token kept out of the API;
-  - the reporter's alerts, trade reports, debounced feed outages and once-a-day summary;
+  - the reporter's alerts, trade reports, debounced feed outages and once-a-day summary, in Dutch;
+  - the digest on the local clock (with the result without the best trade), highlights each sent once, and the trade ledger (from the journal on first start);
+  - commands: only the owner's chat, stale commands ignored, pause kept across restarts and never lifting another pause, sell-all only after a confirmation tap;
   - the operating-cost ledger: pricing, accrual while running, and restarts.
 - **Autotune**:
   - every tunable value round-trips through `.env`, momentum and entry mode included;

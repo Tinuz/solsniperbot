@@ -202,6 +202,10 @@ const schema = z.object({
   TELEGRAM_API_URL: z.string().url().default('https://api.telegram.org'),
   NOTIFY_TRADES: bool(false),
   NOTIFY_DAILY_HOUR_UTC: num(7, { min: -1, max: 23, int: true }),
+  NOTIFY_DIGEST_HOURS: num(6, { min: 0, max: 24, int: true }),
+  NOTIFY_HIGHLIGHTS: bool(true),
+  NOTIFY_COMMANDS: bool(true),
+  NOTIFY_TIMEZONE: z.string().default('Europe/Amsterdam'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
 })
 
@@ -365,6 +369,14 @@ export interface Config {
     trades: boolean
     /** UTC hour of the daily summary; -1 disables it. */
     dailyHourUtc: number
+    /** A digest every this many hours, on the local clock (0, 6, 12, 18 for 6); 0 = off. */
+    digestHours: number
+    /** Free rides, moonbags at 3x/5x/10x..., new equity records. */
+    highlights: boolean
+    /** Answer /status, /pauze and the other commands from the configured chat. */
+    commands: boolean
+    /** IANA time zone for "today" and the digest clock. */
+    timeZone: string
   }
 
   api: { host: string; port: number; token?: string }
@@ -409,6 +421,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
   if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
+  if (e.NOTIFY_DIGEST_HOURS > 0 && 24 % e.NOTIFY_DIGEST_HOURS !== 0) {
+    throw new Error('NOTIFY_DIGEST_HOURS must divide the day evenly: 1, 2, 3, 4, 6, 8, 12 or 24 (0 = off)')
+  }
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: e.NOTIFY_TIMEZONE })
+  } catch {
+    throw new Error(`NOTIFY_TIMEZONE: unknown time zone "${e.NOTIFY_TIMEZONE}" (e.g. Europe/Amsterdam)`)
+  }
   if (e.AUTOTUNE === 'paper' && !e.DRY_RUN) {
     throw new Error('AUTOTUNE=paper only works in paper mode (DRY_RUN=true); use AUTOTUNE=suggest for proposals in live mode')
   }
@@ -562,6 +582,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       telegram: e.TELEGRAM_BOT_TOKEN && e.TELEGRAM_CHAT_ID ? { token: e.TELEGRAM_BOT_TOKEN, chatId: e.TELEGRAM_CHAT_ID, apiUrl: e.TELEGRAM_API_URL } : undefined,
       trades: e.NOTIFY_TRADES,
       dailyHourUtc: e.NOTIFY_DAILY_HOUR_UTC,
+      digestHours: e.NOTIFY_DIGEST_HOURS,
+      highlights: e.NOTIFY_HIGHLIGHTS,
+      commands: e.NOTIFY_COMMANDS,
+      timeZone: e.NOTIFY_TIMEZONE,
     },
 
     api: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN },
