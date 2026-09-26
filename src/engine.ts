@@ -150,7 +150,7 @@ export class Engine extends EventEmitter<{
     readonly cfg: Config,
     private readonly wallet: Keypair | undefined,
     private readonly log: Logger,
-    private readonly opts: { drainMs?: number; retryMs?: number } = {},
+    private readonly opts: { drainMs?: number; retryMs?: number; reconcile?: { attempts?: number; delayMs?: number; retryMs?: number } } = {},
   ) {
     super()
     this.rpc = new RpcClient(cfg.rpcUrl)
@@ -193,6 +193,7 @@ export class Engine extends EventEmitter<{
       risk: this.risk,
       rpc: this.rpc,
       retryMs: opts.retryMs,
+      reconcile: opts.reconcile,
       log,
     })
     // Subscribed before start: settling restored positions can already close

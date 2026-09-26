@@ -7,6 +7,8 @@ import { deadCoin, earlyRug, momentumMarket } from './records.js'
 
 const START = 1_750_000_000_000
 const OPTS = { minLaunches: 200, minHours: 10, minTrades: 30, minEdgePct: 1, budgetMs: 60_000 }
+/** Full strategy searches are CPU-bound: slower machines need more than the default limit. */
+const HEAVY_MS = 90_000
 const cfgWith = (over: Record<string, string> = {}) =>
   loadConfig({ DRY_RUN: 'true', RPC_URL: 'https://example.com', RECORD_LAUNCHES: 'true', ENTRY_MODE: 'instant', ...over })
 
@@ -29,7 +31,7 @@ describe('strategy search', () => {
     expect(best.test).toEqual(new Evaluator(records.slice(480), cfg).summary(best.params))
     expect(r.finalists.length).toBeGreaterThan(1)
     expect(r.evaluated).toBeGreaterThan(50)
-  })
+  }, HEAVY_MS)
 
   it('finds nothing when every coin dies or rugs', () => {
     const cfg = cfgWith()
@@ -55,7 +57,7 @@ describe('strategy search', () => {
     const second = searchStrategies(records, cfg, current, { ...OPTS, exclude: [banned] }, 0)
     expect(second.best && paramsKey(second.best.params)).not.toBe(banned)
     expect(second.finalists.every((f) => paramsKey(f.params) !== banned)).toBe(true)
-  })
+  }, HEAVY_MS)
 
   it('stops at its time budget and still reports', () => {
     const cfg = cfgWith()

@@ -249,16 +249,17 @@ export class Executor {
    * network fee, priority fee, tip and rent all included. Retries while the
    * transaction propagates to `confirmed`.
    */
-  async walletDelta(signature: string): Promise<bigint | undefined> {
+  async walletDelta(signature: string, o: { attempts?: number; delayMs?: number } = {}): Promise<bigint | undefined> {
     if (this.paper) return undefined
-    for (let i = 0; i < 12; i++) {
+    const attempts = o.attempts ?? 12
+    for (let i = 0; i < attempts; i++) {
       try {
         const r = await this.d.rpc.getBalanceDelta(signature, this.user)
         if (r) return r.delta
       } catch {
         // not yet available
       }
-      await sleep(1_500)
+      if (i < attempts - 1) await sleep(o.delayMs ?? 1_500)
     }
     return undefined
   }

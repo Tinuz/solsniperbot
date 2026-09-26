@@ -78,7 +78,7 @@ async function live(env: Record<string, string> = {}): Promise<Rig> {
 }
 
 async function startEngine(cfg: Config, wallet: Keypair) {
-  const engine = new Engine(cfg, wallet, log, { drainMs: 300, retryMs: 50 })
+  const engine = new Engine(cfg, wallet, log, { drainMs: 300, retryMs: 50, reconcile: { attempts: 3, delayMs: 30, retryMs: 100 } })
   await engine.start()
   // Taken the way the reporter takes them: nothing is missed between start and subscribing.
   const alerts = engine.takeEarlyAlerts()
@@ -151,6 +151,23 @@ describe('shutdown with transactions in flight', () => {
     expect(gone).toMatchObject({ status: 'failed', error: 'buy never landed', networkFeesLamports: 0n })
     expect(rig.engine.positions.has(m)).toBe(false)
     expect(rig.engine.status().pnl.closed).toBe(0)
+  })
+
+  it('never takes tokens alone as proof that the pending buy landed', async () => {
+    const rig = await live()
+    rig.chain.holdNext = 1
+    const { mint } = rig.chain.launch({ symbol: 'ODD', devBuyLamports: 1_000_000_000n })
+    const m = mint.toBase58()
+    await waitFor(() => rig.engine.positions.get(m)?.pending?.signature, 5_000, 'buy submitted')
+    await restart(rig, () => {
+      // The buy never lands, but tokens of the coin reach the wallet some other way.
+      rig.chain.dropHeld()
+      rig.chain.trade(mint, { user: rig.wallet.publicKey, buyLamports: 100_000_000n })
+    })
+    const pos = await waitFor(() => rig.engine.positions.get(m)?.status === 'open' && rig.engine.positions.get(m), 5_000, 'settled')
+    expect(pos.estimated).toMatch(/without a confirmed transaction/)
+    expect(pos.unreconciled ?? []).toEqual([]) // nothing to reconcile, nothing retried forever
+    expect(pos.landedTxs).toBe(0)
   })
 
   it('keeps a sell it could not see land, and books it exactly once it did', async () => {
@@ -240,9 +257,25 @@ describe('restart after a crash', () => {
     expect(rig.engine.positions.has(m)).toBe(false) // not traded again
     const exact = await waitFor(() => rig.reconciled.find(([p]) => p.mint === m), 8_000, 'correction after restart')
     expect(positionPnl(exact[0])).toBe(walletChange(rig))
+    // Booked by the run before: not this run's trade, but today's loss limit counts it exactly.
+    expect(rig.engine.status().pnl).toMatchObject({ closed: 0, wins: 0, losses: 0, realizedSol: 0 })
+    expect(rig.engine.risk.snapshot().realizedTodayLamports).toBe(walletChange(rig))
     await rig.engine.stop()
     expect(saved(rig)).toEqual([]) // settled: gone from the file
     Object.assign(rig, await startEngine(rig.cfg, rig.wallet))
+  })
+
+  it('retries a reconciliation that failed, without waiting for a restart', async () => {
+    const rig = await live()
+    rig.chain.failing.add('getTransaction') // the RPC can't find the transaction for a while
+    const { mint } = rig.chain.launch({ symbol: 'SLOW', devBuyLamports: 1_000_000_000n })
+    const m = mint.toBase58()
+    await waitFor(() => (rig.engine.positions.get(m)?.reconcileFailures ?? 0) >= 2, 8_000, 'failed rounds')
+    expect(rig.engine.positions.get(m)?.reconciled).toBe(false)
+    rig.chain.failing.clear()
+    const exact = await waitFor(() => rig.engine.positions.get(m)?.reconciled && rig.engine.positions.get(m), 8_000, 'reconciled in the same run')
+    expect(exact.walletDeltaLamports).toBe(walletChange(rig))
+    expect(exact.nextReconcileAt).toBeUndefined()
   })
 
   it('keeps the other mode’s positions when DRY_RUN changes, and says so', async () => {

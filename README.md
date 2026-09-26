@@ -59,7 +59,8 @@ Open positions are persisted in `data/positions.json` and resume monitoring afte
 
 **Stops and restarts never lose track of money.**
 - **Stopping.** The bot stops buying first, then gives buys and sells already in flight up to 10 seconds to land. One still in flight after that is saved with its signature as *pending*, never booked as failed, because it may still land.
-- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries every 10 seconds (the position isn't traded meanwhile, so after a minute you get an alert, and another when it recovers). Trades closed during this check reach every ledger, and reconciliations a stop cut off are finished, also for trades that closed just before it (they stay in `positions.json` until then).
+- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries every 10 seconds (the position isn't traded meanwhile, so after a minute you get an alert, and another when it recovers). Trades closed during this check reach every ledger, and reconciliations a stop cut off are finished, also for trades that closed just before it (they stay in `positions.json` until then). A correction to a trade from before the restart updates the cost ledger, the Telegram reports and (if it closed today) the daily loss limit, not this run's dashboard totals.
+- **Reconciling.** Every landed transaction is matched with the wallet's exact change. When the RPC can't find it yet, the bot tries again after 1 minute, doubling up to hourly; after 3 days it keeps the estimate for good. A buy found only by the tokens in the wallet, without a confirmed transaction, stays an estimate from the start.
 - **Switching `DRY_RUN`.** The other mode's positions, live moonbags included, stay in the file untouched, and an alert says they are not managed until you switch back.
 
 ## Survival: the bot keeps itself alive
@@ -167,7 +168,7 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 - **How far it can move.** Each setting has hard bounds (for example stop loss 10–60%, max hold 30–1800s, momentum net buy 0.05–20 SOL, insider buys 0.2–50 SOL, top holder 0.5–20%, moonbag 10–50%, moonbag trailing stop 15–70%), and one adoption moves it at most one step (for example ±10 points of stop loss, at most 2× the hold time, ±3 momentum buyers). Switching the entry mode, the dev-sell exit, an insider filter or the moonbag counts as one step. Exploration (above) is the one exception to the step limit, and only while nothing is traded. One adoption changes at most `AUTOTUNE_MAX_CHANGES` settings (default 3).
 
 **Gates.** The search sees only the older 70% of the recordings. A candidate is adopted only if every gate passes on the newest 30%:
-1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`.
+1. **Enough data:** `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`. It loads the newest `AUTOTUNE_DAYS` daily files, and today's is partial, so `AUTOTUNE_MIN_HOURS` must fit in `AUTOTUNE_DAYS - 1` full days; the config refuses it otherwise.
 2. **Enough trades:** enough simulated trades in both parts.
 3. **Wins out of sample:** it beats the current settings by at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade.
 4. **Profitable out of sample:** it makes money on its own.
@@ -393,13 +394,14 @@ npm run typecheck
   - a sell in flight at shutdown is booked once it landed, with the exact wallet change, never as a loss;
   - after a crash the chain wins over the saved holdings; missing tokens are booked at the last price, with an alert;
   - an RPC error while restarting never drops a position, and the owner hears about it while it lasts;
-  - trades closed while starting reach the cost ledger and the Telegram reports, and reconciliations a stop cut off are finished, for open and for just-closed trades;
+  - trades closed while starting reach the cost ledger and the Telegram reports, and reconciliations a stop cut off are finished, for open and for just-closed trades, without skewing this run's totals;
+  - a reconciliation that fails is retried in the same run; tokens alone never count as a landed transaction;
   - the other mode's positions survive a `DRY_RUN` switch;
   - the same coin is never bought twice at once (a double click, or a manual buy during an automatic one);
   - a failed sell is retried with wider slippage, its fee is reconciled, and the token account is closed afterwards for its rent;
   - an exit that keeps failing alerts the owner;
   - a pause and the day's losses survive a restart, and the daily limit resets the next day.
-- **Sizing**: never above `BUY_SOL`, whatever the wallet, sizing mode or bankroll; a `BUY_SOL` below the smallest trade worth its worst-case fees, and an edge proof that the loaded data could never reach, are refused at startup.
+- **Sizing**: never above `BUY_SOL`, whatever the wallet, sizing mode or bankroll; a `BUY_SOL` below the smallest trade worth its worst-case fees, and an `AUTOTUNE_MIN_HOURS` that `AUTOTUNE_DAYS` daily files (today's partial) can't always hold, are refused at startup.
 - **Resilience**: a gRPC stream is reopened until it works and replaced when it goes silent, an undecodable transaction is skipped; the smart-money window forgets old buys (bounded memory) and replays use the same window; dynamic fees are judged at their cap; overlapping writes never tear a file.
 - **Security**: a non-local API without a strong token is refused at startup; the token only counts from a header or the WebSocket subprotocol, never the URL; RPC keys in query, path or user info are masked; Telegram commands and buttons only count from the owner (a group needs `TELEGRAM_OWNER_IDS`).
 - **Live autonomy**:

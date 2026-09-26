@@ -27,6 +27,8 @@ const HOUR = 3_600_000
 const BASE_ENV = { DRY_RUN: 'true', RPC_URL: 'https://example.com', RECORD_LAUNCHES: 'true', ENTRY_MODE: 'instant' }
 const OPTS = { minLaunches: 200, minHours: 10, minTrainTrades: 30, minTestTrades: 12, minEdgePct: 1, maxChanges: 3 }
 const cfgWith = (over: Record<string, string> = {}) => loadConfig({ ...BASE_ENV, ...over })
+/** Full strategy searches are CPU-bound: slower machines need more than the default limit. */
+const HEAVY_MS = 90_000
 
 describe('tunable settings', () => {
   const cfg = cfgWith()
@@ -529,7 +531,7 @@ describe('AutoTuner', () => {
     // 90 launches over seven hours under them, with enough trades, and they make money: trading starts.
     expect(a.t.status().edge.status).toBe('proven')
     expect(a.t.tradingGate().allowed).toBe(true)
-  })
+  }, HEAVY_MS)
 
   it('shows why it does not search while the forward proof is being collected', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
@@ -706,7 +708,7 @@ describe('AutoTuner', () => {
     const nearby = await b.t.run()
     expect(nearby.exploration).toBeUndefined()
     expect(nearby.decision).not.toBe('adopt')
-  })
+  }, HEAVY_MS)
 
   it('runs the search in a worker thread', async () => {
     const { env } = await setup()

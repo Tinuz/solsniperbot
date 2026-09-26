@@ -104,8 +104,13 @@ export interface Position {
   sellFailures?: number
   /** Failed on-chain checks in a row while pending (the owner hears about it). */
   resolveFailures?: number
-  /** Landed transactions whose exact wallet change is not booked yet (retried after a restart). */
+  /** Landed transactions whose exact wallet change is not booked yet (retried, also after a restart). */
   unreconciled?: string[]
+  /** Since when some transaction is waiting to be reconciled. */
+  unreconciledSince?: number
+  /** Failed reconciliation rounds in a row, and when the next one is due. */
+  reconcileFailures?: number
+  nextReconcileAt?: number
   /** Why this position's P&L stays an estimate even once reconciled (a sale the bot did not see). */
   estimated?: string
 }
@@ -124,6 +129,9 @@ export interface PositionStats {
 const STUCK_ALERT_ROUNDS = 3
 /** Failed on-chain checks of a pending position (one every 10 s) before the owner is alerted. */
 const UNSETTLED_ALERT_TRIES = 6
+/** A transaction whose exact result can't be found for this long keeps its estimated P&L for good. */
+const RECONCILE_GIVE_UP_MS = 3 * 86_400_000
+const utcDay = (t: number) => new Date(t).toISOString().slice(0, 10)
 /** Without a known transaction, a restored buy that has not shown up by then never will. */
 const UNKNOWN_TX_MS = 120_000
 
@@ -137,6 +145,11 @@ interface Deps {
   cfg: Config
   /** How long to wait before checking a pending position on-chain again after an RPC error (default 10 s). */
   retryMs?: number
+  /**
+   * Reconciliation: tries per round and the wait between them (12 × 1.5 s),
+   * and the wait before a failed round is retried (1 min, doubling to 1 h).
+   */
+  reconcile?: { attempts?: number; delayMs?: number; retryMs?: number }
   executor: Executor
   market: MarketBook
   protocol: PumpProtocol
@@ -176,6 +189,10 @@ export class PositionManager extends EventEmitter<{
   private foreign: unknown[] = []
   /** Finished live positions whose last transactions are not reconciled yet: saved, so a restart finishes them. */
   private readonly settling = new Map<string, Position>()
+  /** Those of them that finished in an earlier run: not part of this run's totals. */
+  private readonly earlierRun = new WeakSet<Position>()
+  /** Signatures being reconciled right now: never two lookups of one transaction at once. */
+  private readonly reconciling = new Set<string>()
   private stopping = false
   private readonly journal: Journal
   private readonly store: DebouncedWriter
@@ -408,6 +425,7 @@ export class PositionManager extends EventEmitter<{
   }
 
   private tick(): void {
+    this.retryReconciliations()
     for (const pos of this.active.values()) {
       if (pos.pending) {
         if (!pos.paper) void this.resolve(pos)
@@ -744,6 +762,7 @@ export class PositionManager extends EventEmitter<{
     pos.landedTxs++
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     pos.unreconciled = [...(pos.unreconciled ?? []), signature]
+    pos.unreconciledSince ??= Date.now()
     if (isFinished(pos)) this.keepSettling(pos)
   }
 
@@ -759,35 +778,82 @@ export class PositionManager extends EventEmitter<{
    * (totals and daily risk) is corrected by the difference.
    */
   private async reconcile(pos: Position, signature: string): Promise<void> {
-    const delta = await this.d.executor.walletDelta(signature)
-    if (delta === undefined) {
-      this.d.log.warn({ mint: pos.mint, signature }, 'could not reconcile transaction; P&L stays estimated')
-      return
+    if (this.reconciling.has(signature)) return
+    this.reconciling.add(signature)
+    try {
+      await this.reconcileOnce(pos, signature)
+    } finally {
+      this.reconciling.delete(signature)
     }
+  }
+
+  private async reconcileOnce(pos: Position, signature: string): Promise<void> {
+    const t = this.d.reconcile ?? {}
+    const delta = await this.d.executor.walletDelta(signature, { attempts: t.attempts, delayMs: t.delayMs })
     // Checked again: a restart may have retried it while this one was still waiting.
     if (!pos.unreconciled?.includes(signature)) return
+    if (delta === undefined) return this.reconcileFailed(pos, signature)
     pos.walletDeltaLamports = (pos.walletDeltaLamports ?? 0n) + delta
     pos.unreconciled = pos.unreconciled.filter((s) => s !== signature)
     pos.reconciledTxs++
-    if (!pos.unreconciled.length && this.settling.delete(settlingKey(pos))) this.store.schedule()
+    pos.reconcileFailures = 0
+    if (!pos.unreconciled.length) {
+      pos.unreconciledSince = undefined
+      pos.nextReconcileAt = undefined
+      if (this.settling.delete(settlingKey(pos))) this.store.schedule()
+    }
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     if (pos.reconciled && pos.bookedPnlLamports !== undefined) {
       const exact = positionPnl(pos)
       const correction = exact - pos.bookedPnlLamports
       if (correction !== 0n) {
-        const wasWin = pos.bookedPnlLamports > 0n
-        this.totals.netPnlLamports += correction
-        this.d.risk.recordRealized(correction)
-        if (wasWin !== exact > 0n) {
-          this.totals.wins += wasWin ? -1 : 1
-          this.totals.losses += wasWin ? 1 : -1
+        // A trade booked by an earlier run is not in this run's totals, and its
+        // correction belongs to today's loss limit only if it closed today.
+        const earlier = this.earlierRun.has(pos)
+        if (!earlier) {
+          const wasWin = pos.bookedPnlLamports > 0n
+          this.totals.netPnlLamports += correction
+          if (wasWin !== exact > 0n) {
+            this.totals.wins += wasWin ? -1 : 1
+            this.totals.losses += wasWin ? 1 : -1
+          }
         }
+        if (!earlier || utcDay(pos.closedAt ?? 0) === utcDay(Date.now())) this.d.risk.recordRealized(correction)
         pos.bookedPnlLamports = exact
         void this.journal.append({ type: 'reconcile', at: Date.now(), mint: pos.mint, pnlLamports: exact, correctionLamports: correction })
         this.emit('reconciled', pos, correction)
       }
     }
     this.changed(pos)
+  }
+
+  /** Not found yet (a slow or failing RPC): try again later, and give up after a few days. */
+  private reconcileFailed(pos: Position, signature: string): void {
+    pos.reconcileFailures = (pos.reconcileFailures ?? 0) + 1
+    if (Date.now() - (pos.unreconciledSince ?? Date.now()) > RECONCILE_GIVE_UP_MS) {
+      pos.estimated = `the exact result of ${pos.unreconciled?.length ?? 1} transaction(s) was not found in 3 days; P&L stays estimated`
+      this.d.log.warn({ mint: pos.mint, signature, unreconciled: pos.unreconciled }, 'giving up on reconciling; P&L stays estimated')
+      pos.unreconciled = []
+      pos.unreconciledSince = undefined
+      pos.nextReconcileAt = undefined
+      this.settling.delete(settlingKey(pos))
+      this.changed(pos)
+      return
+    }
+    const base = this.d.reconcile?.retryMs ?? 60_000
+    pos.nextReconcileAt = Date.now() + Math.min(3_600_000, base * 2 ** Math.min(pos.reconcileFailures - 1, 10))
+    this.d.log.warn({ mint: pos.mint, signature, tries: pos.reconcileFailures }, 'could not reconcile transaction yet; retrying later')
+    this.store.schedule()
+  }
+
+  /** Failed reconciliations that are due again, of open and of finished positions. */
+  private retryReconciliations(): void {
+    const now = Date.now()
+    for (const pos of [...this.active.values(), ...this.settling.values()]) {
+      if (pos.paper || !pos.unreconciled?.length || pos.nextReconcileAt === undefined || now < pos.nextReconcileAt) continue
+      pos.nextReconcileAt = undefined
+      for (const sig of pos.unreconciled) void this.reconcile(pos, sig)
+    }
   }
 
   private changed(pos: Position): void {
@@ -828,6 +894,7 @@ export class PositionManager extends EventEmitter<{
         // Closed before the stop, its last reconciliations cut off: finish them.
         if (!pos.paper && pos.unreconciled?.length) {
           this.settling.set(settlingKey(pos), pos)
+          this.earlierRun.add(pos)
           for (const sig of pos.unreconciled) void this.reconcile(pos, sig)
         }
         continue
@@ -899,11 +966,19 @@ export class PositionManager extends EventEmitter<{
       outcome === 'unknown' && (p.lastValidBlockHeight ? !(await this.d.executor.expired(p.lastValidBlockHeight)) : Date.now() - p.since < UNKNOWN_TX_MS)
 
     if (p.side === 'buy') {
-      if (balance > 0n) {
+      // Tokens in the wallet while the buy failed are not from it (left from before): the buy failed.
+      if (balance > 0n && outcome !== 'failed') {
+        // Seen, but not confirmed yet: wait, so it is booked with its transaction.
+        if (p.signature && outcome === 'unknown' && (await mayStillLand())) {
+          pos.nextResolveAt = Date.now() + 3_000
+          return
+        }
         pos.pending = undefined
-        if (!p.signature) pos.estimated = 'buy found on-chain after a restart; its cost is the amount that was sent'
+        // Only a confirmed transaction is reconciled: tokens alone don't say which one brought them.
+        const signature = outcome === 'landed' ? p.signature : undefined
+        if (!signature) pos.estimated = 'buy found on-chain after a restart without a confirmed transaction; its cost is the amount that was sent'
         this.d.log.info({ mint: pos.mint, symbol: pos.symbol, tokens: balance.toString() }, 'buy from before the restart landed')
-        this.applyBuy(pos, { ok: true, paper: false, signature: p.signature ?? '', slot: 0, tokens: balance, lamports: 0n, tradeFeesLamports: 0n, networkFeeLamports: this.d.executor.networkFee('buy'), timings: { buildMs: 0, sendMs: 0 } })
+        this.applyBuy(pos, { ok: true, paper: false, signature: signature ?? '', slot: 0, tokens: balance, lamports: 0n, tradeFeesLamports: 0n, networkFeeLamports: this.d.executor.networkFee('buy'), timings: { buildMs: 0, sendMs: 0 } })
         return
       }
       if (await mayStillLand()) {
@@ -917,6 +992,7 @@ export class PositionManager extends EventEmitter<{
       if (outcome === 'failed') {
         pos.error = 'buy failed on-chain (found after a restart)'
         pos.networkFeesLamports = BASE_FEE_LAMPORTS + priorityLamports(this.d.cfg, 'buy')
+        if (p.signature) this.landedFailure(pos, p.signature)
       } else if (outcome === 'landed') {
         pos.error = 'buy landed but no tokens are in the wallet'
         this.alert(`⚠️ ${pos.symbol}: a buy from before the restart landed but no tokens are in the wallet; check it manually (${pos.mint})`)

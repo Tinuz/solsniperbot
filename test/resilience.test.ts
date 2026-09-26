@@ -226,8 +226,11 @@ describe('fees', () => {
 
   it('refuses an edge proof that could never be reached with the data it loads', () => {
     const base = { RPC_URL: 'https://rpc.example.com', RECORD_LAUNCHES: 'true' }
-    expect(() => loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '96' })).toThrow(/AUTOTUNE_MIN_HOURS=96 can never be reached with AUTOTUNE_DAYS=3/)
-    expect(loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '72' }).autotune.minHours).toBe(72)
+    // Today's file is partial: 3 daily files can hold as little as 48 hours.
+    expect(() => loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '72' })).toThrow(/AUTOTUNE_MIN_HOURS=72 can't always be reached with AUTOTUNE_DAYS=3 .*as little as 48h.*set AUTOTUNE_DAYS=4/)
+    expect(() => loadConfig({ ...base, AUTOTUNE_DAYS: '1' })).toThrow(/AUTOTUNE_MIN_HOURS=24 can't always be reached with AUTOTUNE_DAYS=1/)
+    expect(loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '48' }).autotune.minHours).toBe(48)
+    expect(loadConfig({ ...base, AUTOTUNE_DAYS: '2' }).autotune.days).toBe(2)
     expect(loadConfig({ ...base, AUTOTUNE: 'off', REQUIRE_EDGE: 'false', AUTOTUNE_DAYS: '1', AUTOTUNE_MIN_HOURS: '96' }).autotune.days).toBe(1)
   })
 })

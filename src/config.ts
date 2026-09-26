@@ -627,9 +627,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       `BUY_SOL=${e.BUY_SOL} is below the smallest trade worth its fees, ${lamportsToSol(minViable).toFixed(4)} SOL: round-trip tips and priority fees${worst} must stay under MAX_FEE_DRAG_PCT=${e.MAX_FEE_DRAG_PCT}% of a trade. Raise BUY_SOL, lower the fees, or raise MAX_FEE_DRAG_PCT.`,
     )
   }
-  // The edge gate needs AUTOTUNE_MIN_HOURS of forward data inside the AUTOTUNE_DAYS it loads.
-  if ((cfg.autotune.requireEdge || cfg.autotune.mode !== 'off') && cfg.autotune.minHours > cfg.autotune.days * 24) {
-    throw new Error(`AUTOTUNE_MIN_HOURS=${e.AUTOTUNE_MIN_HOURS} can never be reached with AUTOTUNE_DAYS=${e.AUTOTUNE_DAYS} of data: raise AUTOTUNE_DAYS or lower AUTOTUNE_MIN_HOURS`)
+  // The tuner and the edge gate need AUTOTUNE_MIN_HOURS of data inside what they load:
+  // the newest AUTOTUNE_DAYS daily files, today's still filling up, so as little as
+  // (AUTOTUNE_DAYS - 1) full days right after midnight UTC.
+  const loadedHours = (cfg.autotune.days - 1) * 24
+  if ((cfg.autotune.requireEdge || cfg.autotune.mode !== 'off') && cfg.autotune.minHours > loadedHours) {
+    const days = Math.ceil(cfg.autotune.minHours / 24) + 1
+    throw new Error(
+      `AUTOTUNE_MIN_HOURS=${e.AUTOTUNE_MIN_HOURS} can't always be reached with AUTOTUNE_DAYS=${e.AUTOTUNE_DAYS} of daily files (today's is partial, so as little as ${loadedHours}h are loaded): set AUTOTUNE_DAYS=${days} or more, or lower AUTOTUNE_MIN_HOURS`,
+    )
   }
   return cfg
 }
