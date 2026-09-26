@@ -163,7 +163,17 @@
 
 <script>
 (() => {
-  const token = new URLSearchParams(location.search).get('token') || ''
+  // Opened as /?token=…: keep the token for this tab only, and take it out of the address bar and history.
+  const token = (() => {
+    const fromUrl = new URLSearchParams(location.search).get('token')
+    try {
+      if (fromUrl) sessionStorage.setItem('apiToken', fromUrl)
+      if (fromUrl) history.replaceState(null, '', location.pathname)
+      return fromUrl || sessionStorage.getItem('apiToken') || ''
+    } catch {
+      return fromUrl || ''
+    }
+  })()
   const headers = { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) }
   const $ = (id) => document.getElementById(id)
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
@@ -378,7 +388,7 @@
   }
 
   function connect() {
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${token ? '?token=' + encodeURIComponent(token) : ''}`)
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`, token ? ['sniper-auth', token] : undefined)
     ws.onmessage = (m) => {
       const e = JSON.parse(m.data)
       switch (e.type) {

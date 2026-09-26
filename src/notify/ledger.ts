@@ -45,6 +45,17 @@ export class TradeLedger {
     this.entries = [...entries].sort((a, b) => a.at - b.at)
   }
 
+  /** Applies an on-chain correction to the mint's latest trade; false if it is no longer kept. */
+  correct(mint: string, lamports: number): boolean {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i]!
+      if (e.mint !== mint) continue
+      e.pnl += lamports
+      return true
+    }
+    return false
+  }
+
   add(p: Position, at = p.closedAt ?? Date.now()): LedgerEntry {
     const failed = p.status === 'failed'
     const e: LedgerEntry = {

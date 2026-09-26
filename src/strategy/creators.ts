@@ -26,6 +26,7 @@ export class CreatorReputation {
       () => this.snapshot(),
       60_000,
       (err) => this.log.warn({ err }, 'failed to persist creator history'),
+      { compact: true },
     )
   }
 

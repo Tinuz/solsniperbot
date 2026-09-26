@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import type { Config } from '../config.js'
 import { lamportsToSol } from '../config.js'
+import { txNetworkLamports } from '../trading/fees.js'
 import { type Position, positionPnl } from '../trading/positions.js'
 import type { Logger } from '../util/logger.js'
 import { readJson, writeJsonAtomic } from '../util/persist.js'
@@ -28,7 +29,6 @@ export interface Vitals {
   runwayTrades: number
 }
 
-export const BASE_FEE_LAMPORTS = 5_000n
 /**
  * Upfront account costs of a first buy: Token-2022 ATA rent plus pump's
  * one-time user volume accumulator, rounded up. The ATA rent comes back when
@@ -36,9 +36,10 @@ export const BASE_FEE_LAMPORTS = 5_000n
  */
 export const BUY_ACCOUNT_OVERHEAD_LAMPORTS = 4_500_000n
 
+/** Network costs per trade at the fee floor (see `txNetworkLamports`). */
 export function feeSchedule(cfg: Config) {
-  const buyNetwork = cfg.buyTipLamports + cfg.buyPriorityLamports + BASE_FEE_LAMPORTS
-  const sellNetwork = cfg.sellTipLamports + cfg.sellPriorityLamports + BASE_FEE_LAMPORTS
+  const buyNetwork = txNetworkLamports(cfg, 'buy')
+  const sellNetwork = txNetworkLamports(cfg, 'sell')
   return {
     buyNetwork,
     sellNetwork,

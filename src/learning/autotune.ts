@@ -100,8 +100,13 @@ interface TuningState {
   lastRun?: CycleSummary
   lastProposalAt?: number
   lastCheckAt?: number
-  /** Whether the settings in effect make money on recent launches. */
+  /** Whether the settings in effect made money on launches recorded under them (forward data). */
   edge?: EdgeResult
+  /**
+   * A shadow-tested candidate's forward data starts when it was found, not
+   * when it went live: the launches it was shadow-tested on count too.
+   */
+  forwardSince?: { key: string; since: number }
 }
 
 export interface AutoTunerOptions {
@@ -171,8 +176,9 @@ export async function loadTunedParams(cfg: Config): Promise<{ params: TunablePar
  *   the adoption, it is rolled back and tuning pauses for a cooldown.
  *
  * With REQUIRE_EDGE it is also the bot's permission to trade: buying is only
- * allowed while the settings in effect make money on recent launches
- * (`evaluateEdge`). Until then the bot only watches and records.
+ * allowed while the settings in effect made money on launches recorded
+ * after they were chosen (`evaluateEdge`). Until then the bot only watches
+ * and records.
  *
  * Trade size, reserve, fees and risk limits are never touched. Overrides live
  * in data/tuning and are dropped as soon as the .env settings change.
@@ -360,6 +366,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? { adopted: shadow.to, previous: shadow.from, since: shadow.since, neededTrades: shadow.neededTrades }
           : undefined,
       edge: o.requireEdge,
+      currentSince: st.forwardSince?.key === paramsKey(current) ? st.forwardSince.since : undefined,
       explore: this.mayExplore() ? { budgetMs: EXPLORE_BUDGET_MS } : undefined,
       now: at,
     }
@@ -599,6 +606,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       sh.last = pr
       if (pr.status === 'passed') {
         st.shadow = undefined
+        st.forwardSince = { key: paramsKey(sh.to), since: sh.since }
         this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`)
       } else if (pr.status === 'failed') {
         st.shadow = undefined

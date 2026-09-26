@@ -7,6 +7,8 @@ export type TxOutcome =
   | { status: 'landed'; slot: number; via: 'stream' | 'rpc' }
   | { status: 'failed'; slot: number; err: unknown; via: 'stream' | 'rpc' }
   | { status: 'expired' }
+  /** The bot stopped watching before the outcome was known: the transaction may still land. */
+  | { status: 'aborted' }
 
 interface Entry {
   resolve: (o: TxOutcome) => void
@@ -39,10 +41,15 @@ export class SignatureTracker {
     this.timer = setInterval(() => void this.poll(), this.opts.pollMs)
   }
 
+  /**
+   * Stops polling and re-broadcasting. Transactions still pending resolve as
+   * `aborted`, never as failed: they may land after all, so their positions
+   * are kept and resolved on-chain at the next start.
+   */
   stop(): void {
     clearInterval(this.timer)
     for (const [sig, e] of this.pending) {
-      e.resolve({ status: 'expired' })
+      e.resolve({ status: 'aborted' })
       this.pending.delete(sig)
     }
   }

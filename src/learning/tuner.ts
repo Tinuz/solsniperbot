@@ -13,6 +13,7 @@ import {
   neighbors,
   paramsKey,
   replayKey,
+  settingsFingerprint,
   withParams,
   withinLimits,
 } from './tunable.js'
@@ -307,34 +308,45 @@ export interface EdgeResult {
 }
 
 /**
- * Does the strategy in effect make money right now? Replays `params` on the
- * newest part of the recordings (the same window the tuner validates on).
- * The bot only risks funds while this holds.
+ * Does the strategy make money right now? Judged only on forward data:
+ * launches recorded while exactly these settings were in effect (every
+ * recording carries the fingerprint of the settings of its time), or
+ * recorded after `since` when the settings were picked then (a
+ * shadow-tested candidate). Settings are always picked from data recorded
+ * before they took effect, so none of this data can have helped pick them:
+ * a search result never proves itself, and trading waits for evidence that
+ * arrived afterwards. Only the newest part of the recordings counts (the
+ * share the tuner validates on), so the gate closes again when the market
+ * turns. The bot only risks funds while this holds.
  */
-export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: TunableParams, o: TunerOptions, now = Date.now()): EdgeResult {
-  const sorted = [...records].sort((a, b) => a.t - b.t)
+export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: TunableParams, o: TunerOptions, now = Date.now(), since?: number): EdgeResult {
+  const fingerprint = settingsFingerprint(params)
+  const frac = o.testFrac ?? 0.3
+  const { test: window } = splitByTime([...records].sort((a, b) => a.t - b.t), frac)
+  const sorted = window.filter((r) => r.settings === fingerprint || (since !== undefined && r.t >= since))
   const hours = sorted.length ? (sorted[sorted.length - 1]!.t - sorted[0]!.t) / 3_600_000 : 0
   const base = { at: now, settingsKey: paramsKey(params) }
+  const needLaunches = Math.ceil(o.minLaunches * frac)
+  const needHours = o.minHours * frac
   const dataGate: Gate = {
-    name: 'enough data',
-    pass: sorted.length >= o.minLaunches && hours >= o.minHours,
-    detail: `${sorted.length} launches over ${hours.toFixed(1)}h (need ${o.minLaunches} over ${o.minHours}h)`,
+    name: 'enough forward data',
+    pass: sorted.length >= needLaunches && hours >= needHours,
+    detail: `${sorted.length} launches over ${hours.toFixed(1)}h recorded under these settings (need ${needLaunches} over ${needHours.toFixed(1)}h)`,
   }
-  if (!dataGate.pass) return { ...base, status: 'insufficient-data', reason: `collecting data: ${dataGate.detail}`, gates: [dataGate] }
+  if (!dataGate.pass) return { ...base, status: 'insufficient-data', reason: `collecting forward data: ${dataGate.detail}`, gates: [dataGate] }
 
-  const { test } = splitByTime(sorted, o.testFrac ?? 0.3)
-  const results = new Evaluator(test, cfg).results(params)
+  const results = new Evaluator(sorted, cfg).results(params)
   const recent = summarizeResults(results)
   const buy = Number(cfg.buyLamports)
   const needed = (o.minEdgePct / 100) * buy * Math.max(recent.trades, 1)
   const bestWin = results.reduce((m, r) => Math.max(m, r.pnlLamports), 0)
   const gates: Gate[] = [
     dataGate,
-    { name: 'enough trades', pass: recent.trades >= o.minTestTrades, detail: `${recent.trades} recent trades (need ${o.minTestTrades})` },
+    { name: 'enough trades', pass: recent.trades >= o.minTestTrades, detail: `${recent.trades} forward trades (need ${o.minTestTrades})` },
     {
       name: 'makes money',
       pass: recent.totalPnlLamports > 0 && recent.totalPnlLamports >= needed,
-      detail: `recent total ${sol(recent.totalPnlLamports)} (need +${sol(needed)})`,
+      detail: `forward total ${sol(recent.totalPnlLamports)} (need +${sol(needed)})`,
     },
     { name: 'not one lucky trade', pass: recent.totalPnlLamports - bestWin > 0, detail: `without the best trade: ${sol(recent.totalPnlLamports - bestWin)}` },
   ]
@@ -342,7 +354,7 @@ export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: Tunab
   if (cost !== undefined && cost !== 0) {
     // Scale the replayed profit to a day of real trading: the window's length,
     // and the launches left out when the recordings were sampled.
-    const spanDays = test.length > 1 ? (test[test.length - 1]!.t - test[0]!.t) / 86_400_000 : 0
+    const spanDays = sorted.length > 1 ? (sorted[sorted.length - 1]!.t - sorted[0]!.t) / 86_400_000 : 0
     const perDay = spanDays > 0 ? (recent.totalPnlLamports * (o.sampleStride ?? 1)) / spanDays : 0
     gates.push(
       cost === null
@@ -357,7 +369,7 @@ export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: Tunab
     gates,
     status: failed.length ? 'unproven' : 'proven',
     reason: failed.length
-      ? `no proven edge: ${failed.map((g) => g.name).join(', ')} (${recent.trades} recent trades, ${sol(recent.totalPnlLamports)})`
-      : `${recent.trades} recent trades made ${sol(recent.totalPnlLamports)}`,
+      ? `no proven edge: ${failed.map((g) => g.name).join(', ')} (${recent.trades} forward trades, ${sol(recent.totalPnlLamports)})`
+      : `${recent.trades} forward trades made ${sol(recent.totalPnlLamports)}`,
   }
 }

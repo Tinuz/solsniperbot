@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { join } from 'node:path'
 import { type Keypair, PublicKey } from '@solana/web3.js'
 import { type Config, lamportsToSol } from './config.js'
 import { GrpcFeed } from './feed/grpc-feed.js'
@@ -23,7 +24,7 @@ import { CreatorReputation } from './strategy/creators.js'
 import { staticFilter } from './strategy/filters.js'
 import { MetadataFetcher, hasSocials } from './strategy/metadata.js'
 import { decideMomentum, momentumSnapshot } from './strategy/momentum.js'
-import { WalletBook, readWalletEntries } from './learning/wallets.js'
+import { SMART_WINDOW_DAYS, WalletBook, readWalletEntries } from './learning/wallets.js'
 import { RiskManager } from './strategy/risk.js'
 import { OperatingCosts } from './strategy/costs.js'
 import { Survival, type Vitals } from './strategy/survival.js'
@@ -55,8 +56,8 @@ export type EngineEvent =
   | { type: 'closed'; data: Position }
   | { type: 'notice'; data: { level: 'info' | 'warn' | 'error'; message: string; at: number } }
 
-/** Days of logged early buys the smart-money book is built from. */
-const WALLET_HISTORY_DAYS = 14
+/** How long a shutdown waits for buys and sells in flight to land before it stops watching them. */
+const DRAIN_MS = 10_000
 
 const percentile = (values: number[], p: number) => {
   if (values.length === 0) return undefined
@@ -97,6 +98,8 @@ export class Engine extends EventEmitter<{
   /** Something the owner should hear about even when nobody watches the dashboard. */
   alert: [string]
   feed: [string, boolean]
+  /** A finished position's booked P&L was corrected by the exact on-chain amount. */
+  reconciled: [Position, bigint]
 }> {
   readonly rpc: RpcClient
   readonly protocol: PumpProtocol
@@ -131,6 +134,9 @@ export class Engine extends EventEmitter<{
   private timers: NodeJS.Timeout[] = []
   private readonly startedAt = Date.now()
   private readonly feedProblemAt = new Map<string, number>()
+  /** Alerts raised before anyone listened (while starting), kept for the notifier. */
+  private readonly earlyAlerts: string[] = []
+  private stopping = false
   /** Fingerprint of the strategy settings, recomputed only when the tuner changes them. */
   private settingsFp = { version: -1, value: '' }
 
@@ -138,12 +144,14 @@ export class Engine extends EventEmitter<{
     readonly cfg: Config,
     private readonly wallet: Keypair | undefined,
     private readonly log: Logger,
+    private readonly opts: { drainMs?: number } = {},
   ) {
     super()
     this.rpc = new RpcClient(cfg.rpcUrl)
     this.protocol = new PumpProtocol(this.rpc, log)
     this.market = new MarketBook(this.protocol)
-    this.risk = new RiskManager(cfg)
+    this.risk = new RiskManager(cfg, join(cfg.dataDir, `risk-${cfg.dryRun ? 'paper' : 'live'}.json`), (err) => log.warn({ err }, 'failed to persist risk state'))
+    this.risk.on('alert', (m) => this.alert(m))
     this.survival = new Survival(cfg, log)
     this.costs = new OperatingCosts(cfg, log)
     // Paper fills need no blockhash; polling one every second would only burn RPC credits.
@@ -180,6 +188,12 @@ export class Engine extends EventEmitter<{
       rpc: this.rpc,
       log,
     })
+    // Subscribed before start: restoring positions can already raise alerts.
+    this.positions.on('alert', (m) => this.alert(m))
+    this.positions.on('reconciled', (p, correction) => {
+      this.costs.bookCorrection(correction)
+      this.emit('reconciled', p, correction)
+    })
 
     if (cfg.recorder.enabled) {
       this.recorder = new LaunchRecorder(
@@ -215,6 +229,8 @@ export class Engine extends EventEmitter<{
     )
     if (cfg.dryRun && !this.wallet) log.warn('no wallet configured: paper trading with an ephemeral address')
 
+    // Pauses and the daily loss limit hold from the first launch on.
+    await this.risk.load()
     await this.survival.load()
     await this.costs.load()
     // Tuned settings (paper autotune) are in place before the first launch.
@@ -267,7 +283,7 @@ export class Engine extends EventEmitter<{
         const last = this.feedProblemAt.get(feed.name) ?? 0
         if (Date.now() - last < 30 * 60_000) return
         this.feedProblemAt.set(feed.name, Date.now())
-        this.emit('alert', `⚠️ ${feed.name} feed: ${message}`)
+        this.alert(`⚠️ ${feed.name} feed: ${message}`)
       })
       feed.on('status', (up) => {
         this.notice(up ? 'info' : 'warn', `${feed.name} feed ${up ? 'connected' : 'disconnected'}`)
@@ -296,27 +312,42 @@ export class Engine extends EventEmitter<{
     if (this.tuner) {
       this.tuner.on('notice', (level, message) => {
         this.notice(level, message)
-        this.emit('alert', message)
+        this.alert(message)
       })
       this.tuner.start()
     }
     log.info('engine running')
   }
 
+  /**
+   * Stops without losing track of money: no new buys, then transactions in
+   * flight get a few seconds to land (feeds and the tracker still run, so
+   * their outcome is seen). Whatever is still in flight after that is saved
+   * as pending and settled on-chain at the next start, never booked as failed.
+   */
   async stop(): Promise<void> {
+    this.stopping = true
     for (const t of this.timers) clearInterval(t)
+    this.momentum.clear()
     await this.tuner?.stop()
+    await this.positions.drain(this.opts.drainMs ?? DRAIN_MS)
+    this.tracker.stop()
+    await this.positions.stop()
     for (const f of this.feeds) f.stop()
     this.fees.stop()
     this.lander?.stop()
     this.blockhash.stop()
     this.protocol.stop()
-    await this.positions.stop()
-    this.tracker.stop()
+    await this.risk.flush()
     await this.creators.flush()
     await this.recorder?.flush()
     await this.survival.flush()
     await this.costs.stop()
+  }
+
+  /** Alerts raised while starting, before a notifier listened; each is handed out once. */
+  takeEarlyAlerts(): string[] {
+    return this.earlyAlerts.splice(0)
   }
 
   // Stream handling -----------------------------------------------------------
@@ -403,7 +434,7 @@ export class Engine extends EventEmitter<{
 
   private async enter(launch: Launch, state: MintState, reason: string): Promise<void> {
     const mint = launch.mintStr
-    if (this.entering.has(mint) || this.positions.has(mint)) return
+    if (this.stopping || this.entering.has(mint) || this.positions.has(mint)) return
     // No proven edge yet: watch and record, don't spend.
     const gate = this.tuner?.tradingGate()
     if (gate && !gate.allowed) {
@@ -420,6 +451,7 @@ export class Engine extends EventEmitter<{
         }
       }
 
+      if (this.stopping) return
       // No await between these checks and positions.open() registering the
       // position, so concurrent launches cannot overshoot the limits.
       const vitals = this.survival.compute(this.survivalInput())
@@ -477,7 +509,18 @@ export class Engine extends EventEmitter<{
   /** Buys any coin still on its bonding curve, whether or not the bot saw it launch. */
   async manualBuy(mintStr: string, sol?: number): Promise<Position> {
     const mint = new PublicKey(mintStr)
-    if (this.positions.has(mintStr)) throw new Error('already holding this coin')
+    if (this.stopping) throw new Error('shutting down')
+    // Reserved before the first await: a double click, or the bot buying the same coin meanwhile, cannot buy it twice.
+    if (this.positions.has(mintStr) || this.entering.has(mintStr)) throw new Error('already holding or buying this coin')
+    this.entering.add(mintStr)
+    try {
+      return await this.manualBuyReserved(mint, mintStr, sol)
+    } finally {
+      this.entering.delete(mintStr)
+    }
+  }
+
+  private async manualBuyReserved(mint: PublicKey, mintStr: string, sol?: number): Promise<Position> {
     let state = this.market.get(mintStr)
     const [curveAcct, mintAcct] = await this.rpc.getMultipleAccounts([bondingCurvePda(mint), mint])
     if (!curveAcct) throw new Error('no pump bonding curve for this mint')
@@ -565,9 +608,10 @@ export class Engine extends EventEmitter<{
   private async loadWallets(): Promise<void> {
     this.walletsLoading = new Set()
     try {
-      const from = new Date(Date.now() - WALLET_HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
+      const from = new Date(Date.now() - SMART_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10)
       const entries = await readWalletEntries(this.cfg.dataDir, from)
       for (const e of entries) if (!this.walletsLoading.has(e.mint)) this.wallets.add(e)
+      this.wallets.prune(Date.now())
       this.log.info({ wallets: this.wallets.size, smart: this.wallets.smartCount(), baseRate: this.wallets.baseRate.toFixed(3) }, 'smart-money book loaded')
     } catch (err) {
       this.log.warn({ err: (err as Error).message }, 'could not load the smart-money book')
@@ -659,7 +703,7 @@ export class Engine extends EventEmitter<{
     this.vitals = this.survival.check({ ...this.survivalInput(), busy })
     if (prev && prev !== this.vitals.state && this.vitals.state !== 'dead') {
       this.notice(this.vitals.state === 'healthy' ? 'info' : 'warn', `vitals: ${this.vitals.state} (${this.vitals.reason})`)
-      this.emit('alert', `vitals ${prev} → ${this.vitals.state}: ${this.vitals.reason}`)
+      this.alert(`vitals ${prev} → ${this.vitals.state}: ${this.vitals.reason}`)
       this.log.warn(lamportsView(this.vitals), 'vitals changed')
     }
   }
@@ -669,7 +713,7 @@ export class Engine extends EventEmitter<{
     this.risk.pause(`dead: ${v.reason}`)
     this.momentum.clear()
     this.notice('error', `bot died: ${v.reason}`)
-    this.emit('alert', `bot died: ${v.reason}`)
+    this.alert(`bot died: ${v.reason}`)
     this.emit('dead', v)
   }
 
@@ -705,6 +749,11 @@ export class Engine extends EventEmitter<{
       view.reason = reason
     }
     this.emit('event', { type: 'launch-update', data: { mint, verdict, reason } })
+  }
+
+  private alert(message: string): void {
+    if (this.listenerCount('alert') > 0) this.emit('alert', message)
+    else if (this.earlyAlerts.length < 20) this.earlyAlerts.push(message)
   }
 
   private notice(level: 'info' | 'warn' | 'error', message: string): void {

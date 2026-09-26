@@ -19,7 +19,7 @@ import {
   withinLimits,
 } from '../src/learning/tunable.js'
 import { Evaluator, evaluateEdge, evaluateProbation, proposeTuning } from '../src/learning/tuner.js'
-import { dataset, momentumMarket, pumpThenFade, slowRug, smallPump } from './records.js'
+import { dataset, momentumMarket, pumpThenFade, recordedUnder, slowRug, smallPump } from './records.js'
 
 const log = pino({ level: 'silent' })
 const START = 1_750_000_000_000
@@ -213,24 +213,41 @@ describe('evaluateEdge', () => {
   const cfg = cfgWith()
   const current = paramsFromConfig(cfg)
 
-  it('needs enough data before anything counts', () => {
-    const e = evaluateEdge(dataset(100), cfg, current, OPTS, 0)
+  it('needs enough forward data before anything counts', () => {
+    const e = evaluateEdge(recordedUnder(dataset(100), current), cfg, current, OPTS, 0)
     expect(e.status).toBe('insufficient-data')
-    expect(e.reason).toMatch(/^collecting data/)
+    expect(e.reason).toMatch(/^collecting forward data: 30 launches/)
   })
 
-  it('is not proven when the settings lose on recent launches', () => {
-    const e = evaluateEdge(dataset(600, { pumpShare: 0 }), cfg, current, OPTS, 0)
+  it('never counts launches recorded before the settings took effect, however profitable', () => {
+    // The data a search picked the settings from: it can never prove them.
+    const e = evaluateEdge(dataset(600), cfg, current, OPTS, 0)
+    expect(e.status).toBe('insufficient-data')
+    expect(e.reason).toMatch(/^collecting forward data: 0 launches/)
+    // Recorded under other settings: not these settings' evidence either.
+    const other = paramsFromConfig(cfgWith({ STOP_LOSS_PCT: '35' }))
+    expect(evaluateEdge(recordedUnder(dataset(600), other), cfg, current, OPTS, 0).status).toBe('insufficient-data')
+  })
+
+  it('is not proven when the settings lose on launches recorded under them', () => {
+    const e = evaluateEdge(recordedUnder(dataset(600, { pumpShare: 0 }), current), cfg, current, OPTS, 0)
     expect(e.status).toBe('unproven')
     expect(e.gates.find((g) => g.name === 'makes money')?.pass).toBe(false)
     expect(e.recent!.totalPnlLamports).toBeLessThan(0)
   })
 
-  it('is proven when the settings make money on recent launches', () => {
-    const e = evaluateEdge(dataset(600), cfg, current, OPTS, 0)
+  it('is proven when the settings make money on launches recorded under them', () => {
+    const e = evaluateEdge(recordedUnder(dataset(600), current), cfg, current, OPTS, 0)
     expect(e.status).toBe('proven')
     expect(e.gates.every((g) => g.pass)).toBe(true)
     expect(e.settingsKey).toBe(paramsKey(current))
+    expect(e.recent!.trades).toBeLessThan(200) // only the newest 30% counted
+  })
+
+  it('counts every launch since a given moment for a candidate picked then (shadow test)', () => {
+    const records = dataset(600)
+    const since = records[420]!.t
+    expect(evaluateEdge(records, cfg, current, OPTS, 0, since).status).toBe('proven')
   })
 })
 
@@ -240,6 +257,7 @@ describe('AutoTuner', () => {
     for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true })
   })
 
+  /** Recorded launches: the newest 30% under the .env settings, as the recorder stamps them. */
   async function setup(over: Record<string, string> = {}) {
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
     dirs.push(dir)
@@ -253,9 +271,13 @@ describe('AutoTuner', () => {
       AUTOTUNE_DAYS: '30',
       ...over,
     }
-    await writeRecords(dir, dataset(600))
+    await writeRecords(dir, recordedUnder(dataset(600), paramsFromConfig(loadConfig(env))))
     return { dir, env }
   }
+
+  /** `n` launches every 3 minutes from `start`, recorded while `params` were in effect. */
+  const launchesUnder = (params: TunableParams, n: number, start: number, make = pumpThenFade) =>
+    recordedUnder(Array.from({ length: n }, (_, i) => make(start + (i + 1) * 180_000)), params, 1)
 
   async function writeRecords(dir: string, recs: LaunchRecord[]) {
     await mkdir(join(dir, 'launches'), { recursive: true })
@@ -438,7 +460,7 @@ describe('AutoTuner', () => {
     expect(b.t.tradingGate().allowed).toBe(true)
 
     // The market turns: every new launch rugs. The edge is gone, buying stops.
-    await writeRecords(dir, dataset(300, { pumpShare: 0, start: START + 50 * HOUR }))
+    await writeRecords(dir, recordedUnder(dataset(300, { pumpShare: 0, start: START + 50 * HOUR }), paramsFromConfig(b.cfg), 1))
     clock.now += HOUR
     await b.t.run()
     expect(b.t.tradingGate().allowed).toBe(false)
@@ -457,15 +479,15 @@ describe('AutoTuner', () => {
     expect((await a.t.run('schedule')).decision).toBe('insufficient-data')
     clock.now += HOUR
     expect((await a.t.run('schedule')).decision).toBe('insufficient-data') // not "next search in 6h"
-    expect(a.t.tradingGate().reason).toMatch(/collecting data/)
+    expect(a.t.tradingGate().reason).toMatch(/collecting forward data/)
     await a.t.stop()
   })
 
   it('keeps observing when nothing makes money', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
     dirs.push(dir)
-    await writeRecords(dir, dataset(600, { pumpShare: 0 }))
     const env = { ...BASE_ENV, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    await writeRecords(dir, recordedUnder(dataset(600, { pumpShare: 0 }), paramsFromConfig(loadConfig(env))))
     const a = tuner(env, { now: START + 51 * HOUR })
     await a.t.load()
     const run = await a.t.run()
@@ -474,13 +496,20 @@ describe('AutoTuner', () => {
     expect(a.t.status().edge.status).toBe('unproven')
   })
 
-  it('trades on adopted settings that proved themselves, and re-checks after a revert', async () => {
-    const { env } = await setup()
+  it('trades on adopted settings only once launches recorded under them prove it, and re-checks after a revert', async () => {
+    const { dir, env } = await setup()
     const clock = { now: START + 51 * HOUR }
     const a = tuner(env, clock)
     await a.t.load()
     expect((await a.t.run()).decision).toBe('adopt')
-    // The edge that counts is the adopted settings' own.
+    // Its search result is no proof: nothing was recorded under the adopted settings yet.
+    expect(a.t.status().edge.status).toBe('insufficient-data')
+    expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/collecting forward data/) })
+
+    // Launches recorded under them, and they make money: now it trades.
+    await writeRecords(dir, launchesUnder(paramsFromConfig(a.cfg), 80, clock.now))
+    clock.now += 5 * HOUR
+    await a.t.run()
     expect(a.t.status().edge.status).toBe('proven')
     expect(a.t.tradingGate().allowed).toBe(true)
     await a.t.revert()
@@ -505,23 +534,27 @@ describe('AutoTuner', () => {
     expect(a.t.status().shadow?.changes).toEqual(found.changes)
     expect(a.t.sizeFactor()).toBe(1)
 
-    // New launches on which the candidate does well: adopted live, at half size.
-    await writeRecords(dir, Array.from({ length: 30 }, (_, i) => pumpThenFade(clock.now + (i + 1) * 60_000)))
-    clock.now += HOUR
+    // New launches (recorded under the settings still in effect) on which the candidate does well: adopted live, at half size.
+    await writeRecords(dir, launchesUnder(before, 80, clock.now))
+    clock.now += 5 * HOUR
     const shadowed = await a.t.run()
     expect(shadowed.probation?.status).toBe('passed')
     expect(paramsKey(paramsFromConfig(a.cfg))).not.toBe(paramsKey(before))
     expect(a.t.status().shadow).toBeNull()
     expect(a.t.status().probation?.changes).toEqual(found.changes)
     expect(a.t.sizeFactor()).toBe(0.5)
-    expect(a.t.status().edge.status).toBe('proven') // its own proof, not the old settings'
+    // Its own proof, from the launches since it was found, not the old settings'.
+    expect(a.t.status().edge).toMatchObject({ status: 'proven', allowed: true })
     expect(a.notices.some((n) => /adopted .* after a shadow test .*trading at 50% size/.test(n))).toBe(true)
 
-    // It keeps doing well on the next launches: probation passes, full size again.
-    await writeRecords(dir, Array.from({ length: 30 }, (_, i) => pumpThenFade(clock.now + (i + 1) * 60_000)))
-    clock.now += HOUR
+    // It keeps doing well on the next launches: probation passes, full size again, and
+    // the shadow-test launches still count as its forward data.
+    const adopted = paramsFromConfig(a.cfg)
+    await writeRecords(dir, launchesUnder(adopted, 30, clock.now))
+    clock.now += 2 * HOUR
     expect((await a.t.run()).probation?.status).toBe('passed')
     expect(a.t.sizeFactor()).toBe(1)
+    expect(a.t.tradingGate().allowed).toBe(true)
   })
 
   it('live: a candidate that fails its shadow test is never traded', async () => {
@@ -563,7 +596,8 @@ describe('AutoTuner', () => {
     // A jump no step limit would allow, taken because nothing was being traded on it.
     expect(a.cfg.momentum.minBuyers).toBeLessThan(27)
     expect(a.t.status().probation).not.toBeNull()
-    expect(a.t.tradingGate().allowed).toBe(true) // the found strategy carries its own proof
+    // Found on the recorded data, so that data is no proof: it observes until launches under it are.
+    expect(a.t.tradingGate().allowed).toBe(false)
     expect(a.notices.some((n) => /adopted .* after exploring/.test(n))).toBe(true)
 
     // Without the edge gate the bot might be trading, so it never jumps.

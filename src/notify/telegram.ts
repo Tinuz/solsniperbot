@@ -5,6 +5,8 @@ export interface TelegramTarget {
   token: string
   chatId: string
   apiUrl: string
+  /** User ids allowed to give commands (TELEGRAM_OWNER_IDS); empty: the private chat's own user. */
+  ownerIds?: string[]
 }
 
 /** Telegram allows about one message per second per chat. */

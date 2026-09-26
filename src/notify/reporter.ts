@@ -18,7 +18,7 @@ const MILESTONES = [3, 5, 10, 20, 50, 100]
 const RECORD_STEP = 1.05
 /** How long the sell-all buttons stay valid. */
 const CONFIRM_MS = 60_000
-/** Pause reasons set from Telegram, so /hervat only lifts its own pause. */
+/** Pause reasons set by hand: /hervat lifts these (Telegram's own and the dashboard's), never the daily loss limit or death. */
 const PAUSE_REASON = 'via Telegram (/pauze)'
 const SELL_ALL_PAUSE_REASON = 'via Telegram (/verkoopalles)'
 const OWN_PAUSES = new Set([PAUSE_REASON, SELL_ALL_PAUSE_REASON, 'manual'])
@@ -30,7 +30,7 @@ interface SavedState {
   /** `YYYY-MM-DD HH` (local) of the last digest. */
   lastDigest?: string
   trades?: LedgerEntry[]
-  /** Buying was paused from Telegram: stays paused across restarts. */
+  /** Before pauses were saved by the risk manager: a Telegram pause to carry over once. */
   pausedByUser?: string
   /** Last announced equity record, SOL. */
   recordSol?: number
@@ -166,7 +166,12 @@ export class Reporter {
       this.ledger = new TradeLedger(past)
       this.save()
     }
-    if (this.state.pausedByUser && !this.engine.risk.snapshot().paused) this.engine.risk.pause(this.state.pausedByUser)
+    if (this.state.pausedByUser) {
+      // Saved by an older version: the risk manager keeps pauses now.
+      if (!this.engine.risk.snapshot().paused) this.engine.risk.pause(this.state.pausedByUser)
+      this.state.pausedByUser = undefined
+      this.save()
+    }
     this.state.recordSol ??= this.engine.status().survival.peakEquitySol
     // Already-open positions: don't announce milestones they passed before this start.
     for (const p of this.engine.positions.list()) {
@@ -175,6 +180,9 @@ export class Reporter {
     }
 
     this.engine.on('alert', (m) => this.send(m))
+    this.engine.on('reconciled', (p, correction) => {
+      if (this.ledger.correct(p.mint, Number(correction))) this.save()
+    })
     this.engine.on('feed', (name, up) => this.onFeed(name, up))
     this.engine.on('event', (e) => {
       if (e.type === 'closed') this.onClosed(e.data)
@@ -182,6 +190,8 @@ export class Reporter {
     })
     const restarts = Number(process.env.SUPERVISOR_RESTARTS ?? 0)
     this.send(`▶️ Gestart${restarts ? ` (herstart #${restarts})` : ''} · ${tradingLine(this.engine.status())}${cfg.notify.commands ? '\nTyp /help voor de commando’s.' : ''}`)
+    // Raised while the engine started (restored positions, a pause still in force), before we listened.
+    for (const m of this.engine.takeEarlyAlerts()) this.send(m)
     this.timer = setInterval(() => void this.tick(), 60_000)
     this.timer.unref()
     if (cfg.notify.commands && cfg.notify.telegram) {
@@ -206,11 +216,6 @@ export class Reporter {
   }
 
   private async tick(): Promise<void> {
-    // Resumed from the dashboard: the Telegram pause no longer holds.
-    if (this.state.pausedByUser && !this.engine.risk.snapshot().paused) {
-      this.state.pausedByUser = undefined
-      this.save()
-    }
     await this.maybeSummary()
     await this.maybeDigest()
   }
@@ -404,8 +409,6 @@ export class Reporter {
     const r = this.engine.risk.snapshot()
     if (r.paused) return this.send(`Kopen staat al op pauze: ${toDutch(r.pauseReason ?? 'handmatig')}`)
     this.engine.risk.pause(PAUSE_REASON)
-    this.state.pausedByUser = PAUSE_REASON
-    this.save()
     this.send('⏸ Kopen gepauzeerd, ook na een herstart. Open posities worden gewoon verder beheerd. /hervat om weer te kopen.')
   }
 
@@ -414,8 +417,6 @@ export class Reporter {
     if (!r.paused) return this.send(`Kopen stond niet op pauze.${this.edgeNote()}`)
     if (!OWN_PAUSES.has(r.pauseReason ?? 'manual')) return this.send(`Kan niet hervatten: gepauzeerd omdat ${toDutch(r.pauseReason ?? '')}`)
     this.engine.risk.resume()
-    this.state.pausedByUser = undefined
-    this.save()
     this.send(`▶️ Kopen hervat.${this.edgeNote()}`)
   }
 
@@ -448,8 +449,6 @@ export class Reporter {
     }
     if (action !== 'sellall') return undefined
     this.engine.risk.pause(SELL_ALL_PAUSE_REASON)
-    this.state.pausedByUser = SELL_ALL_PAUSE_REASON
-    this.save()
     const before = this.engine.positions.list().filter((p) => p.status === 'open').length
     void this.engine.positions.sellAll('manual sell-all (Telegram)').then(() => {
       const left = this.engine.positions.list().length
@@ -470,9 +469,11 @@ export class Reporter {
   }
 
   private async persist(): Promise<void> {
+    clearTimeout(this.saveTimer)
     this.saveTimer = undefined
     this.state.trades = this.ledger.toJSON()
-    await writeJsonAtomic(this.path, this.state).catch((err: Error) => this.log.warn({ err: err.message }, 'could not save notify state'))
+    // Plain numbers and strings: compact, so a week of trades saves in well under a millisecond.
+    await writeJsonAtomic(this.path, this.state, { compact: true }).catch((err: Error) => this.log.warn({ err: err.message }, 'could not save notify state'))
   }
 }
 

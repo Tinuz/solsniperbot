@@ -24,12 +24,17 @@ try {
   const me = await telegramCall<{ username: string }>({ token, apiUrl }, 'getMe', {})
   console.log(`Bot: @${me.username}`)
   if (!chatId) {
-    type Update = { message?: { chat: { id: number; type: string; title?: string; first_name?: string; username?: string } } }
+    type Update = {
+      message?: { chat: { id: number; type: string; title?: string; first_name?: string; username?: string }; from?: { id: number; first_name?: string; username?: string } }
+    }
     const updates = await telegramCall<Update[]>({ token, apiUrl }, 'getUpdates', { timeout: 0 })
     const chats = new Map<number, string>()
+    const people = new Map<number, string>()
     for (const u of updates) {
       const c = u.message?.chat
       if (c) chats.set(c.id, c.title ?? c.first_name ?? c.username ?? c.type)
+      const f = u.message?.from
+      if (c && f && c.type !== 'private') people.set(f.id, f.first_name ?? f.username ?? String(f.id))
     }
     if (!chats.size) {
       console.log(`No messages yet. Send @${me.username} any message on Telegram, then run this again.`)
@@ -37,6 +42,10 @@ try {
     }
     console.log('Put one of these in .env, then run this again to send a test message:')
     for (const [id, name] of chats) console.log(`  TELEGRAM_CHAT_ID=${id}    # ${name}`)
+    if (people.size) {
+      console.log('In a group, only these users may give commands (pick yourself):')
+      for (const [id, name] of people) console.log(`  TELEGRAM_OWNER_IDS=${id}    # ${name}`)
+    }
     process.exit(0)
   }
   await telegramCall({ token, apiUrl }, 'sendMessage', { chat_id: chatId, text: '✅ Sol Sniper kan je hier bereiken. Typ /help zodra de bot draait.' })

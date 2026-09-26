@@ -11,6 +11,7 @@ import type { Engine } from '../src/engine.js'
 import { TradeLedger, readJournalTrades, sincePaperReset } from '../src/notify/ledger.js'
 import { dateTimeNl, localClock, startOfLocalDay, toDutch } from '../src/notify/nl.js'
 import { Reporter } from '../src/notify/reporter.js'
+import { RiskManager } from '../src/strategy/risk.js'
 import type { Position } from '../src/trading/positions.js'
 
 const log = pino({ level: 'silent' })
@@ -70,8 +71,11 @@ async function fakeTelegram() {
     sent,
     answered,
     texts: () => sent.map((m) => m.text),
-    message: (text: string, at: number, chatId: number | string = 42) => queue.push({ update_id: nextId++, message: { date: Math.floor(at / 1000), text, chat: { id: chatId } } }),
-    tap: (data: string, chatId: number | string = 42) => queue.push({ update_id: nextId++, callback_query: { id: `cb${nextId}`, data, message: { chat: { id: chatId } } } }),
+    // In a private chat the sender's user id is the chat id.
+    message: (text: string, at: number, chatId: number | string = 42, from: number = Number(chatId)) =>
+      queue.push({ update_id: nextId++, message: { date: Math.floor(at / 1000), text, chat: { id: chatId }, from: { id: from } } }),
+    tap: (data: string, chatId: number | string = 42, from: number = Number(chatId)) =>
+      queue.push({ update_id: nextId++, callback_query: { id: `cb${nextId}`, data, from: { id: from }, message: { chat: { id: chatId } } } }),
   }
 }
 
@@ -85,17 +89,23 @@ const position = (over: Partial<Position>): Position =>
 function fakeEngine(env: Record<string, string>, dir = tmp()) {
   const engine = new EventEmitter() as EventEmitter & Record<string, unknown>
   const cfg = loadConfig({ RPC_URL: 'https://rpc.example.com', DRY_RUN: 'true', DATA_DIR: dir, TELEGRAM_BOT_TOKEN: 'T', TELEGRAM_CHAT_ID: '42', ...env })
-  const risk: { paused: boolean; pauseReason?: string } = { paused: false }
+  // The real one, saved where the engine saves it: pauses must survive a restart.
+  const riskManager = new RiskManager(cfg, join(dir, 'risk-paper.json'))
+  const risk = {
+    get paused() {
+      return riskManager.snapshot().paused
+    },
+    get pauseReason() {
+      return riskManager.snapshot().pauseReason
+    },
+  }
   const open: Position[] = []
   const sold: string[] = []
   const vitals = { equitySol: 1.0 as number | null }
   engine.cfg = cfg
   engine.survival = { paperRealizedLamports: 0n }
-  engine.risk = {
-    snapshot: () => ({ ...risk }),
-    pause: (reason = 'manual') => Object.assign(risk, { paused: true, pauseReason: reason }),
-    resume: () => Object.assign(risk, { paused: false, pauseReason: undefined }),
-  }
+  engine.risk = riskManager
+  engine.takeEarlyAlerts = () => []
   engine.positions = {
     list: () => open,
     history: () => [],
@@ -106,22 +116,26 @@ function fakeEngine(env: Record<string, string>, dir = tmp()) {
   }
   engine.status = () => ({
     uptimeSec: 3_600,
-    risk: { ...risk },
+    risk: riskManager.snapshot(),
     survival: { state: 'healthy', reason: 'ok', equitySol: vitals.equitySol, peakEquitySol: 1.0, drawdownPct: 0, runwayTrades: 18 },
-    tuning: { mode: 'paper', edge: { required: true, allowed: true, reason: '45 recent trades made 0.0123 SOL' } },
+    tuning: { mode: 'paper', edge: { required: true, allowed: true, reason: '45 forward trades made 0.0123 SOL' } },
     costs: null,
     recorder: { written: 18_849 },
     usage: { streamedMbPerDay: 900, heliusCreditsPerDay: null },
   })
-  return { engine: engine as unknown as Engine, cfg, risk, open, sold, vitals, dir }
+  return { engine: engine as unknown as Engine, cfg, risk, riskManager, open, sold, vitals, dir }
 }
 
 async function started(env: Record<string, string>, clock: { now: number }, dir?: string) {
   const tg = await fakeTelegram()
   const f = fakeEngine({ TELEGRAM_API_URL: tg.url, ...env }, dir)
+  await f.riskManager.load()
   const r = new Reporter(f.engine, log, () => clock.now)
   await r.start()
-  closers.push(() => r.stop('SIGTERM'))
+  closers.push(async () => {
+    await r.stop('SIGTERM')
+    await f.riskManager.flush()
+  })
   return { tg, r, ...f }
 }
 
@@ -131,10 +145,14 @@ const NOON = Date.UTC(2026, 8, 25, 10, 0)
 describe('telegram in Dutch', () => {
   it('translates the bot’s own messages, and leaves unknown ones as they are', () => {
     const cases: [string, string][] = [
-      ['edge proven, trading enabled: 45 recent trades made 0.0123 SOL', '✅ Voordeel bewezen, de bot handelt: 45 recente trades maakten 0.0123 SOL'],
+      ['edge proven, trading enabled: 45 forward trades made 0.0123 SOL', '✅ Voordeel bewezen, de bot handelt: 45 trades onder deze instellingen maakten 0.0123 SOL'],
       [
-        'buying paused, still recording: no proven edge: makes money, not one lucky trade (38 recent trades, -0.0210 SOL)',
-        '⏸ Kopen gepauzeerd (blijft opnemen): geen bewezen voordeel: maakt winst, niet één geluksvoltreffer (38 recente trades, -0.0210 SOL)',
+        'buying paused, still recording: no proven edge: makes money, not one lucky trade (38 forward trades, -0.0210 SOL)',
+        '⏸ Kopen gepauzeerd (blijft opnemen): geen bewezen voordeel: maakt winst, niet één geluksvoltreffer (38 trades onder deze instellingen, -0.0210 SOL)',
+      ],
+      [
+        'collecting forward data: 12 launches over 0.4h recorded under these settings (need 60 over 3.0h)',
+        'verzamelt data onder deze instellingen: 12 launches in 0.4 u onder deze instellingen (nodig: 60 in 3.0 u)',
       ],
       ['autotune: rolled back STOP_LOSS_PCT 25 → 30 (32 trades since adoption: new -0.0100 SOL vs previous 0.0040 SOL)', '↩️ Autotune draaide terug: STOP_LOSS_PCT 25 → 30 (32 trades sinds overname: nieuw -0.0100 SOL, vorige 0.0040 SOL)'],
       ['vitals healthy → defensive: drawdown 31.2% from peak: trade size halved', '🩺 Gezondheid gezond → defensief: 31.2% onder de piek: inzet gehalveerd'],
@@ -217,7 +235,7 @@ describe('digest and highlights', () => {
     expect(digest).toContain('Beste: A +0,0300 SOL · slechtste: B −0,0050 SOL')
     expect(digest).toContain('Totaal sinds 25-09 09:00: 3 trades · +0,0270 SOL · zonder beste −0,0030 SOL ❌')
     expect(digest).toContain('Open: 1 positie · 1 moonbag')
-    expect(digest).toContain('Status: handelt (45 recente trades maakten 0.0123 SOL)')
+    expect(digest).toContain('Status: handelt (45 trades onder deze instellingen maakten 0.0123 SOL)')
   })
 
   it('announces a free ride, runners at 3x and 5x, and new equity records, each once', async () => {
@@ -256,10 +274,40 @@ describe('telegram commands', () => {
     await waitFor(() => tg.texts().some((t) => t.includes('Commando’s')))
     tg.message('/status@SniperBot', NOON)
     const status = await waitFor(() => tg.texts().find((t) => t.includes('🤖 Status')))
-    expect(status).toContain('handelt (45 recente trades maakten 0.0123 SOL)')
+    expect(status).toContain('handelt (45 trades onder deze instellingen maakten 0.0123 SOL)')
     expect(status).toContain('Vermogen 1,0000 SOL')
     expect(tg.texts().filter((t) => t.includes('🤖 Status'))).toHaveLength(1)
     expect(tg.sent.every((m) => m.chat_id === '42')).toBe(true)
+  })
+
+  it('in a group, takes commands and taps only from the owners', async () => {
+    const clock = { now: NOON }
+    const group = await started({ NOTIFY_DIGEST_HOURS: '0', TELEGRAM_CHAT_ID: '-100', TELEGRAM_OWNER_IDS: '7' }, clock)
+    group.tg.message('/pauze', NOON, -100, 8) // another member
+    group.tg.message('/help', NOON, -100, 7) // the owner
+    await waitFor(() => group.tg.texts().some((t) => t.includes('Commando’s')))
+    expect(group.risk.paused).toBe(false)
+    group.tg.tap('sellall:x', -100, 8)
+    await waitFor(() => group.tg.answered.length === 1)
+    expect(group.tg.answered[0]!.text).toBeUndefined() // ignored, not even "expired"
+
+    // Without TELEGRAM_OWNER_IDS a group gets no commands at all.
+    const open = await started({ NOTIFY_DIGEST_HOURS: '0', TELEGRAM_CHAT_ID: '-100' }, clock)
+    open.tg.message('/pauze', NOON, -100, 7)
+    open.tg.message('/pauze', NOON, 7, 7) // a private chat that isn't the configured one
+    await new Promise((r) => setTimeout(r, 300))
+    expect(open.risk.paused).toBe(false)
+    expect(open.tg.texts().filter((t) => t.includes('⏸'))).toEqual([])
+  })
+
+  it('carries a pause saved by an older version over to the risk manager', async () => {
+    const clock = { now: NOON }
+    const dir = tmp()
+    writeFileSync(join(dir, 'notify.json'), JSON.stringify({ pausedByUser: 'via Telegram (/pauze)' }))
+    const a = await started({ NOTIFY_DIGEST_HOURS: '0' }, clock, dir)
+    expect(a.risk).toMatchObject({ paused: true, pauseReason: 'via Telegram (/pauze)' })
+    await a.r.stop('SIGTERM')
+    expect(JSON.parse(readFileSync(join(dir, 'notify.json'), 'utf8')).pausedByUser).toBeUndefined()
   })
 
   it('pauses and resumes buying, keeps the pause across a restart, and never lifts another pause', async () => {
@@ -270,7 +318,8 @@ describe('telegram commands', () => {
     expect(a.risk.pauseReason).toBe('via Telegram (/pauze)')
     await waitFor(() => a.tg.texts().some((t) => t.includes('⏸ Kopen gepauzeerd')))
     await a.r.stop('SIGTERM')
-    expect(JSON.parse(readFileSync(join(a.dir, 'notify.json'), 'utf8')).pausedByUser).toBe('via Telegram (/pauze)')
+    await a.riskManager.flush()
+    expect(JSON.parse(readFileSync(join(a.dir, 'risk-paper.json'), 'utf8'))).toMatchObject({ paused: true, pauseReason: 'via Telegram (/pauze)' })
 
     // Restarted: still paused.
     const b = await started({ NOTIFY_DIGEST_HOURS: '0' }, clock, a.dir)
@@ -280,7 +329,7 @@ describe('telegram commands', () => {
     await waitFor(() => b.tg.texts().some((t) => t.includes('▶️ Kopen hervat')))
 
     // The daily loss limit is not the owner's pause to lift.
-    ;(b.engine.risk as unknown as { pause(r: string): void }).pause('daily loss limit hit (-0.200 SOL)')
+    b.riskManager.pause('daily loss limit hit (-0.200 SOL)')
     b.tg.message('/resume', NOON)
     const refused = await waitFor(() => b.tg.texts().find((t) => t.includes('Kan niet hervatten')))
     expect(refused).toContain('daglimiet voor verlies bereikt (-0.200 SOL)')

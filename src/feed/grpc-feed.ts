@@ -63,6 +63,9 @@ function sameKey(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 const PING_MS = 15_000
+/** Pings are answered, so this much silence means the stream is dead even if it looks open. */
+const STALL_MS = 60_000
+const MAX_REOPEN_DELAY_MS = 30_000
 
 /**
  * Yellowstone gRPC feed (Triton, Helius LaserStream and compatible providers).
@@ -79,6 +82,12 @@ export class GrpcFeed extends EventEmitter implements Feed {
   private stream?: DuplexLike
   private deshred?: DuplexLike
   private pingTimer?: NodeJS.Timeout
+  private watchdog?: NodeJS.Timeout
+  private reopenTimer?: NodeJS.Timeout
+  private reopenDelay = 1_000
+  private reopenFailures = 0
+  private stalls = 0
+  private decodeErrors = 0
   private stopped = false
   private connected = false
   private txs = 0
@@ -133,40 +142,100 @@ export class GrpcFeed extends EventEmitter implements Feed {
     await this.openTxStream()
     if (this.opts.deshred) await this.openDeshred()
     this.pingTimer = setInterval(() => this.ping(), PING_MS)
+    this.watchdog = setInterval(() => this.checkStall(), 10_000)
   }
 
   stop(): void {
     this.stopped = true
     clearInterval(this.pingTimer)
+    clearInterval(this.watchdog)
+    clearTimeout(this.reopenTimer)
     this.stream?.destroy()
     this.deshred?.destroy()
     this.connected = false
   }
 
   stats(): FeedStats {
-    return { source: this.name, connected: this.connected, txs: this.txs, reconnects: this.reconnects, lastMessageAt: this.lastMessageAt }
+    return { source: this.name, connected: this.connected, txs: this.txs, reconnects: this.reconnects, lastMessageAt: this.lastMessageAt, stalls: this.stalls }
   }
 
   private async openTxStream(): Promise<void> {
     const stream = (await this.client.subscribe(this.txRequest)) as DuplexLike
     this.stream = stream
     this.connected = true
+    this.lastMessageAt = Date.now()
     this.emit('status', true)
     this.log.info({ deshred: this.opts.deshred }, 'gRPC stream connected')
     stream.on('data', (u: { transaction?: TxUpdate }) => {
       this.lastMessageAt = Date.now()
-      if (u.transaction) this.onTransaction(u.transaction)
+      if (!u.transaction) return
+      try {
+        this.onTransaction(u.transaction)
+      } catch (err) {
+        this.decodeFailed(err)
+      }
     })
     stream.on('error', (err: Error) => this.log.warn({ err: err.message }, 'gRPC stream error'))
     stream.on('close', () => {
+      // Replaced already (the watchdog gave up on it): the new one is in charge.
+      if (this.stream !== stream) return
+      this.stream = undefined
       this.connected = false
       this.emit('status', false)
       if (this.stopped) return
       // The native layer reconnects transparently; only a terminal close lands here.
-      this.reconnects++
       this.log.warn('gRPC stream closed, reopening')
-      setTimeout(() => void this.openTxStream().catch((e) => this.log.error({ err: e.message }, 'gRPC reopen failed')), 1_000)
+      this.scheduleReopen()
     })
+  }
+
+  /** Reopens with growing delays until it works: a deaf feed means no launches and no prices for open positions. */
+  private scheduleReopen(): void {
+    if (this.stopped || this.reopenTimer) return
+    const delay = this.reopenDelay
+    this.reopenDelay = Math.min(this.reopenDelay * 2, MAX_REOPEN_DELAY_MS)
+    this.reopenTimer = setTimeout(() => {
+      this.reopenTimer = undefined
+      if (this.stopped) return
+      this.reconnects++
+      this.openTxStream().then(
+        () => {
+          this.reopenDelay = 1_000
+          this.reopenFailures = 0
+        },
+        (err: Error) => {
+          this.reopenFailures++
+          this.log.error({ err: err.message, tries: this.reopenFailures }, 'gRPC reopen failed, retrying')
+          if (this.reopenFailures === 3 || this.reopenFailures % 30 === 0) this.emit('problem', `cannot reopen the stream (${this.reopenFailures} tries): ${err.message}`)
+          this.scheduleReopen()
+        },
+      )
+    }, delay)
+  }
+
+  /** An open stream that delivers nothing (not even ping replies) is dead: replace it. */
+  private checkStall(): void {
+    const stream = this.stream
+    if (this.stopped || !stream || !this.connected) return
+    const quietMs = Date.now() - this.lastMessageAt
+    if (quietMs < STALL_MS) return
+    this.stalls++
+    this.log.warn({ quietSec: Math.round(quietMs / 1000) }, 'gRPC stream delivers nothing, reconnecting')
+    this.emit('problem', `no data for ${Math.round(quietMs / 1000)}s; reconnecting`)
+    this.stream = undefined
+    this.connected = false
+    this.emit('status', false)
+    stream.destroy()
+    this.scheduleReopen()
+  }
+
+  /** One undecodable transaction must not take the bot down; many of them mean the protocol changed. */
+  private decodeFailed(err: unknown): void {
+    this.decodeErrors++
+    if (this.decodeErrors === 1 || this.decodeErrors % 1_000 === 0) {
+      this.log.error({ err, count: this.decodeErrors }, 'could not decode a pump transaction')
+      this.emit('problem', `${this.decodeErrors} pump transaction(s) could not be decoded (${(err as Error).message}); did the program change?`)
+    }
   }
 
   private async openDeshred(): Promise<void> {
@@ -182,7 +251,12 @@ export class GrpcFeed extends EventEmitter implements Feed {
       this.deshredBackoff = 500
       this.log.info('gRPC deshred stream connected')
       stream.on('data', (u: { deshredTransaction?: DeshredUpdate }) => {
-        if (u.deshredTransaction) this.onDeshred(u.deshredTransaction)
+        if (!u.deshredTransaction) return
+        try {
+          this.onDeshred(u.deshredTransaction)
+        } catch (err) {
+          this.decodeFailed(err)
+        }
       })
       stream.on('error', (err: Error) => this.log.warn({ err: err.message }, 'deshred stream error'))
       stream.on('close', () => this.scheduleDeshredReconnect())
@@ -196,7 +270,9 @@ export class GrpcFeed extends EventEmitter implements Feed {
     if (this.stopped) return
     const delay = this.deshredBackoff
     this.deshredBackoff = Math.min(this.deshredBackoff * 2, 30_000)
-    setTimeout(() => void this.openDeshred(), delay)
+    setTimeout(() => {
+      if (!this.stopped) void this.openDeshred()
+    }, delay)
   }
 
   private ping(): void {

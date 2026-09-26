@@ -37,7 +37,7 @@ The dashboard shows the latency you actually get: detect→send percentiles, lan
 
 ## Quick start
 
-Requires Node.js ≥ 22.19.
+Requires Node.js ≥ 22.12.
 
 ```bash
 npm install
@@ -56,6 +56,11 @@ npm run build && npm start
 ```
 
 Open positions are persisted in `data/positions.json` and resume monitoring after a restart. Every buy, sell, close and reconciliation is appended to `data/trades.jsonl`, and every launch the bot sees is recorded for later analysis (see [Learning from data](#learning-from-data)).
+
+**Stops and restarts never lose track of money.**
+- **Stopping.** The bot stops buying first, then gives buys and sells already in flight up to 10 seconds to land. One still in flight after that is saved with its signature as *pending*, never booked as failed, because it may still land.
+- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries.
+- **Switching `DRY_RUN`.** The other mode's positions, live moonbags included, stay in the file untouched, and an alert says they are not managed until you switch back.
 
 ## Survival: the bot keeps itself alive
 
@@ -123,11 +128,11 @@ To try other settings on the same data, set them for one run. In PowerShell: `$e
 
 ## Prove it first: no edge, no trades
 
-A fresh bot doesn't know whether its settings make money, and blind sniping usually doesn't: on pump.fun most launches never trade again after the first seconds, and every one of those costs the round-trip fees (~8% of a 0.05 SOL trade at the default tips). So with `REQUIRE_EDGE=auto` (the default whenever launches are recorded), the bot only buys while the settings in effect make money on the newest recorded launches.
+A fresh bot doesn't know whether its settings make money, and blind sniping usually doesn't: on pump.fun most launches never trade again after the first seconds, and every one of those costs the round-trip fees (~8% of a 0.05 SOL trade at the default tips). So with `REQUIRE_EDGE=auto` (the default whenever launches are recorded), the bot only buys while the settings in effect have made money on launches recorded *after* they were chosen.
 - **Until then it observes.** It watches and records every launch, which is how it learns, but spends nothing. The dashboard header shows **observing** or **trading**, and skipped launches say why.
-- **The proof.** Every hour it replays the settings in effect on the newest 30% of the recordings. It needs `AUTOTUNE_MIN_LAUNCHES` launches over `AUTOTUNE_MIN_HOURS`, enough trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade. With operating costs set (below), the profit must also cover them.
+- **The proof: forward data only.** Every recording carries a fingerprint of the settings in effect when it was made. Every hour the bot replays the settings in effect on the recordings made under exactly those settings, within the newest 30% of the recordings (the part the tuner validates on, so old profits can't keep the gate open). Settings are always chosen from data recorded before they took effect, so this data can't have helped choose them: a search result can never prove itself. It needs 30% of `AUTOTUNE_MIN_LAUNCHES` launches over 30% of `AUTOTUNE_MIN_HOURS`, at least `AUTOTUNE_MIN_TEST_TRADES` trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade. With operating costs set (below), the profit must also cover them.
 - **It stops when the edge goes.** If the market turns and the settings stop making money, buying pauses again instead of bleeding the wallet. A proof older than three hours no longer counts.
-- **Settings that change get their own proof.** After a rollback or a revert, the bot checks the new settings before it trades on them. A candidate adopted by autotune is only adopted once it made money on the newest data, so that counts as its proof.
+- **Settings that change get their own proof.** New settings (edited `.env`, an adoption, a rollback or a revert) start without proof: the bot observes and records until enough launches were recorded under them. A shadow-tested live candidate is judged on the launches since it was found.
 
 Survival rules stay the last line of defence. Set `REQUIRE_EDGE=false` to trade regardless (the offline demo does this).
 
@@ -144,7 +149,7 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 
 `AUTOTUNE=auto` never picks `live`. The config refuses `AUTOTUNE=paper` with `DRY_RUN=false`, `AUTOTUNE=live` in paper mode, and `AUTOTUNE=live` without the edge gate. The tuner checks again before it changes anything.
 
-**Exploring while observing.** A nearby step can't help when the current settings are far from anything that works. So while the edge gate holds the bot back (nothing is traded on the settings), each cycle whose regular search finds nothing also runs the full `npm run research` search for up to 3 minutes. If it finds a strategy that passes every gate on the validation and test parts, `paper` adopts it in one jump, beyond the usual step and change limits but within the hard bounds, and it goes on probation like any other adoption; `suggest` proposes it. Its test result counts as its proof, so the bot starts trading on it. Exploration never runs once the bot is trading, never in `AUTOTUNE=live`, and never without the edge gate. The dashboard and `data/tuning/report.md` show the last exploration (how many strategies it tried, and the verdict).
+**Exploring while observing.** A nearby step can't help when the current settings are far from anything that works. So while the edge gate holds the bot back (nothing is traded on the settings), each cycle whose regular search finds nothing also runs the full `npm run research` search for up to 3 minutes. If it finds a strategy that passes every gate on the validation and test parts, `paper` adopts it in one jump, beyond the usual step and change limits but within the hard bounds, and it goes on probation like any other adoption; `suggest` proposes it. Its test result is not proof: the bot keeps observing until the launches recorded under it show the edge too. Exploration never runs once the bot is trading, never in `AUTOTUNE=live`, and never without the edge gate. The dashboard and `data/tuning/report.md` show the last exploration (how many strategies it tried, and the verdict).
 
 **Live autonomy (`AUTOTUNE=live`).** Real money gets extra brakes:
 1. **One change at a time.** A candidate changes one setting, so a loss can be traced to its cause.
@@ -194,7 +199,7 @@ Every cycle is logged to `data/tuning/history.jsonl`. `data/tuning/report.md` ho
 - **Linux.** A systemd service with `ExecStart=npm run supervise` (or `node dist/index.js` with `Restart=on-failure` and `RestartPreventExitStatus=3 78`).
 
 Also for long runs:
-- **Stalled streams.** A log stream that answers pings but delivers nothing for 2 minutes is reconnected.
+- **Stalled streams.** A log stream that answers pings but delivers nothing for 2 minutes is reconnected. A gRPC stream that delivers nothing for a minute (not even ping replies) is replaced, a failed reopen is retried with growing delays until it works, and a transaction that can't be decoded is skipped instead of crashing the bot.
 - **Lean paper mode.** Paper mode polls the blockhash once a minute instead of every second, because paper fills don't need it.
 - **Metered usage.** The dashboard header shows streamed data per day. The tooltip adds RPC calls and, for Helius, the estimated credits per day (about 20 credits per streamed MB plus 1 per request), so you can check your plan covers it.
 
@@ -203,6 +208,9 @@ Also for long runs:
 - trading enabled or paused (edge);
 - autotune adoptions, shadow tests and rollbacks;
 - vitals changes and death;
+- the daily loss limit pausing buying;
+- an exit that keeps failing (3 rounds in a row) and when it succeeds after all, a buy that landed without tokens in the wallet, and tokens that left the wallet without a sale the bot saw;
+- positions of the other mode kept but not managed after `DRY_RUN` changed;
 - feed outages longer than a minute, or a stream that stops delivering (for example when RPC credits run out);
 - **a digest** every `NOTIFY_DIGEST_HOURS` (default 6) on the local clock of `NOTIFY_TIMEZONE`: trades, win rate and P&L of the period, the same **without the single best trade**, best and worst coin, the running total, open positions and moonbags, equity and status;
 - a daily summary at `NOTIFY_DAILY_HOUR_UTC`, covering status, the last 24h, costs and usage;
@@ -211,15 +219,15 @@ Also for long runs:
 
 The reports count trades from a ledger in `data/notify.json` that keeps a week and survives restarts. The first time, it is filled from the trade journal.
 
-**Commands (Telegram).** With `NOTIFY_COMMANDS=true` (the default) the bot answers in the configured chat. Other chats are ignored, and so are commands sent while the bot was down.
+**Commands (Telegram).** With `NOTIFY_COMMANDS=true` (the default) the bot answers in the configured chat, and only to its owner: in a private chat that is the chat's own user; in a group, only the user ids in `TELEGRAM_OWNER_IDS` (without it, a group gets no commands at all, so other members can read along but never pause or sell). Other chats are ignored, and so are commands sent while the bot was down.
 
 | Command | What it does |
 | --- | --- |
 | `/status` | Trading or observing, equity, vitals, open positions and moonbags, today's result |
 | `/vandaag` | Today's trades (local day): result, win rate, without the best trade, best and worst |
 | `/posities` | Open positions and moonbags with gain, value, peak and age |
-| `/pauze` | Stop buying; open positions are still managed. The pause survives restarts. |
-| `/hervat` | Buy again. It only lifts its own pause, never a daily loss limit or death, and says so when the edge gate still holds the bot back. |
+| `/pauze` | Stop buying; open positions are still managed. The pause survives restarts and crashes. |
+| `/hervat` | Buy again. It lifts a pause set by hand (from Telegram or the dashboard), never a daily loss limit or death, and says so when the edge gate still holds the bot back. |
 | `/verkoopalles` | Sell every open position and pause buying, after a tap on the confirmation button (valid 60 s) |
 | `/help` | The list |
 
@@ -227,8 +235,8 @@ English names work too (`/today`, `/positions`, `/pause`, `/resume`, `/sellall`)
 
 Setup:
 1. Create a bot with @BotFather and set `TELEGRAM_BOT_TOKEN`.
-2. Send the bot a message and run `npm run telegram`. It prints your chat id.
-3. Set `TELEGRAM_CHAT_ID` and run it again. It sends a test message.
+2. Send the bot a message and run `npm run telegram`. It prints your chat id (and, for a group, the user ids of who wrote in it).
+3. Set `TELEGRAM_CHAT_ID` (and for a group `TELEGRAM_OWNER_IDS`) and run it again. It sends a test message.
 
 **Cost of existence.** A bot that has to keep itself alive also has to pay for itself. Set `OPERATING_COST_PER_MONTH` (with `OPERATING_COST_CURRENCY` usd, eur or sol) to what the RPC plan and server cost.
 - **The ledger.** The bot converts the costs to SOL at the current price and accrues them while it runs. It sets them against the P&L of its trades in `data/costs-{paper,live}.json`.
@@ -250,7 +258,7 @@ Copy traders profit by buying when wallets with a track record buy. The bot lear
 
 1. **What it logs.** For every finished launch, `data/wallets/<day>.jsonl` gets the early buyers (each wallet's first buy within the first minute, the dev and the bot itself aside). For each it notes whether the price later reached twice what the wallet paid (a *hit*).
 2. **Who is smart.** A wallet needs at least 3 early buys. Its hit rate, shrunk for small samples (hits / (buys + 2)), must be at least 25% and at least twice the average wallet's. Wallets that buy everything, and insiders whose coins dump, don't qualify.
-3. **No look-ahead.** A launch only counts once its recording has ended, so a wallet is always judged on what was known at that moment. Live, the book is built at startup from the last 14 days of logs and grows as launches finish. Every replay walks forward through time the same way.
+3. **No look-ahead, one window.** A launch only counts once its recording has ended, so a wallet is always judged on what was known at that moment, over the 14 days before it. Live, the book is built at startup from the last 14 days of logs, grows as launches finish and forgets what gets older (so memory stays bounded however long the bot runs). Every replay walks forward through time with exactly the same window, so the signal research validates is the one the bot trades. Smart buyers are judged among the first minute's buyers, so `MOMENTUM_MIN_SMART_BUYERS` needs `MOMENTUM_MAX_AGE_MS` ≤ 60000.
 4. **The signal.** With `MOMENTUM_MIN_SMART_BUYERS=1`, momentum entry waits until a smart wallet has bought, and the launch reason says so (`5 buyers (1 smart)`). The other momentum thresholds still apply; set them low to follow smart money alone.
 
 `npm run analyze` has a *Smart money* section: how many wallets qualify, and how launches with smart early buyers did compared with the rest. `npm run research` and autotune try the signal as soon as the data supports it. `/status` in Telegram shows how many smart wallets the bot knows. Recordings from before this existed have no buyer addresses, so it takes a few days of new data before the signal can prove itself.
@@ -301,7 +309,7 @@ Failed sells retry immediately with slippage widening from `SELL_SLIPPAGE_BPS` t
 
 ### Risk limits
 
-`MAX_OPEN_POSITIONS` (moonbags excluded, see above), `MAX_BUYS_PER_MINUTE`, and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day. Balance, trade size and the exit reserve are handled by [survival](#survival-the-bot-keeps-itself-alive). None of these can be overridden by a strategy signal.
+`MAX_OPEN_POSITIONS` (moonbags excluded, see above), `MAX_BUYS_PER_MINUTE`, and `DAILY_LOSS_LIMIT_SOL`, which pauses buying for the rest of the UTC day (with an alert). The day's result and any pause are saved in `data/risk-{paper,live}.json` and loaded before the first launch, so a crash, a supervisor restart or a deploy never lifts them. Balance, trade size and the exit reserve are handled by [survival](#survival-the-bot-keeps-itself-alive). None of these can be overridden by a strategy signal.
 
 ## Dashboard and API
 
@@ -319,12 +327,15 @@ The dashboard at `http://localhost:8787` streams launches with the filter verdic
 | `POST /api/tuning/revert` | Back to the `.env` settings (paper autotune); tuning pauses for the cooldown. |
 | `WS /ws` | Snapshot, then live events. |
 
-The API binds to `127.0.0.1`. It rejects non-local Host headers (DNS rebinding) and cross-origin requests, and mutating calls must send JSON (so a CORS preflight is forced, which the server never approves). This means a malicious web page can't trade your wallet through your browser. Set `API_TOKEN` before binding it anywhere else, then open the dashboard with `?token=...`.
+The API binds to `127.0.0.1`. It rejects non-local Host headers (DNS rebinding) and cross-origin requests, and mutating calls must send JSON (so a CORS preflight is forced, which the server never approves). This means a malicious web page can't trade your wallet through your browser. On a VPS, reach it through an SSH tunnel (`ssh -L 8787:127.0.0.1:8787 user@vps`).
+
+Binding it anywhere else (`API_HOST=0.0.0.0`) requires `API_TOKEN`: the bot refuses to start without one, or with one shorter than 16 characters (`openssl rand -hex 24` makes a good one). Open the dashboard once with `?token=...`; it keeps the token for that tab and removes it from the address bar. The API only accepts it in the `Authorization: Bearer` header (and the dashboard's live connection as a WebSocket subprotocol), never from the URL, and compares it in constant time. Keys in RPC URLs (query, path or user info) are masked in `/api/config` and the dashboard.
 
 ## Tuning for speed
 
 - **Colocate.** Run the bot in the same region as your RPC and landing endpoints (Frankfurt, Amsterdam, New York or Salt Lake City are common). Point `HELIUS_SENDER_URL` at the regional sender (e.g. `http://fra-sender.helius-rpc.com/fast`).
 - **Prefer gRPC** (`GRPC_URL`) over websockets if your provider offers it. Try `GRPC_DESHRED=true` if they support deshred.
+- **Dynamic priority fees** (`PRIORITY_FEE_MODE=dynamic`) pay up to `PRIORITY_FEE_MAX_SOL` in busy moments. Positions book the fee each transaction really paid. Replay, research and the edge gate assume the cap on every trade, so a strategy is never judged on fees cheaper than it may pay: keep the cap realistic.
 - **Measure compute.** Run paper mode with `SIMULATE_DRY_RUN=true` and a funded wallet, then read `unitsConsumed` from `data/trades.jsonl`. Set `BUY_COMPUTE_UNITS` just above it: a lower limit at the same total fee means a higher per-CU price.
 - **Watch "Landed slots after launch"** on the dashboard. It's the metric that matters, and it moves with tip, priority fee and region.
 
@@ -371,8 +382,21 @@ npm run typecheck
   - recordings of busy coins thin out instead of stopping, and tuned settings saved before moonbags existed still load.
 - **Edge gate**:
   - no buys (but full recording) until the settings are proven;
+  - only launches recorded under the exact settings count (or, for a shadow-tested candidate, those since it was found): data from before, however profitable, never proves them, and neither does an adopted candidate's own search result;
   - the proof is per exact settings, restored after restart, stale after 3h, and withdrawn when the market turns;
   - operating costs must be covered, with sampled data scaled up.
+- **Money across stops and restarts** (live, mock chain):
+  - a buy in flight at shutdown is kept as pending and becomes a position once it lands; one that never lands is dropped without a loss;
+  - a sell in flight at shutdown is booked once it landed, with the exact wallet change, never as a loss;
+  - after a crash the chain wins over the saved holdings; missing tokens are booked at the last price, with an alert;
+  - an RPC error while restarting never drops a position;
+  - the other mode's positions survive a `DRY_RUN` switch;
+  - the same coin is never bought twice at once (a double click, or a manual buy during an automatic one);
+  - a failed sell is retried with wider slippage, its fee is reconciled, and the token account is closed afterwards for its rent;
+  - an exit that keeps failing alerts the owner;
+  - a pause and the day's losses survive a restart, and the daily limit resets the next day.
+- **Resilience**: a gRPC stream is reopened until it works and replaced when it goes silent, an undecodable transaction is skipped; the smart-money window forgets old buys (bounded memory) and replays use the same window; dynamic fees are judged at their cap; overlapping writes never tear a file.
+- **Security**: a non-local API without a strong token is refused at startup; the token only counts from a header or the WebSocket subprotocol, never the URL; RPC keys in query, path or user info are masked; Telegram commands and buttons only count from the owner (a group needs `TELEGRAM_OWNER_IDS`).
 - **Live autonomy**:
   - a candidate is shadow-tested before any real trade;
   - one change at a time;
@@ -384,7 +408,7 @@ npm run typecheck
   - Telegram delivery: in order, waits out rate limits, drops refused messages, token kept out of the API;
   - the reporter's alerts, trade reports, debounced feed outages and once-a-day summary, in Dutch;
   - the digest on the local clock (with the result without the best trade), highlights each sent once, and the trade ledger (from the journal on first start);
-  - commands: only the owner's chat, stale commands ignored, pause kept across restarts and never lifting another pause, sell-all only after a confirmation tap;
+  - commands: only the owner (in a group only `TELEGRAM_OWNER_IDS`), stale commands ignored, pause kept across restarts and never lifting another pause, sell-all only after a confirmation tap;
   - the operating-cost ledger: pricing, accrual while running, and restarts.
 - **Autotune**:
   - every tunable value round-trips through `.env`, momentum and entry mode included;
@@ -399,7 +423,7 @@ npm run typecheck
   - while observing, it explores the whole bounded range and adopts a strategy far beyond one step when it holds up, but never while trading or without the edge gate.
 - **Strategy research**: finds a profitable strategy far from the current settings and proves it on the newest 20% it never used; finds nothing on a market of dead coins and rugs; needs enough data; never picks excluded settings; respects its time budget.
 - **Forward test**: candidates are frozen at the end of the research data and judged only on launches after it; pass needs enough trades, a positive total and a positive total without the best trade; saved sets load newest first; changed trade size, latency or fees are reported.
-- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing the insider signals (early bundled buys, biggest holder) and moonbags.
+- **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing (decided after every trade and on a 250 ms clock, as live), the insider signals (early bundled buys, biggest holder) and moonbags.
 - **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, a moonbag free ride, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 
 **Not covered:** these tests can't prove landing performance or strategy profitability on mainnet. Validate with paper trading and small sizes first.

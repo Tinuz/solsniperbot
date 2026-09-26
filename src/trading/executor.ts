@@ -23,6 +23,7 @@ import type { Logger } from '../util/logger.js'
 import { nowMs, sleep } from '../util/time.js'
 import type { AmmSeller } from './amm.js'
 import { describeTxError, isCurveCompleteError, isSlippageError } from './errors.js'
+import { BASE_FEE_LAMPORTS, priorityFeeFor } from './fees.js'
 
 export interface Timings {
   /** Decision to signed bytes. */
@@ -52,6 +53,8 @@ export type TradeResult =
       /** Buys: lamports paid incl. trade fees. Sells: lamports received after trade fees. */
       lamports: bigint
       tradeFeesLamports: bigint
+      /** Signature fee, priority fee (at the price actually used) and tip. */
+      networkFeeLamports: bigint
       timings: Timings
       simulation?: SimulationReport
     }
@@ -61,10 +64,23 @@ export type TradeResult =
       signature?: string
       /** True when the transaction executed on-chain and failed (its fees were paid). */
       landed?: boolean
+      /** What a landed failure paid: signature and priority fee (a failed transaction's tip is rolled back). */
+      networkFeeLamports?: bigint
+      /** The bot stopped before the outcome was known: the transaction may still land. */
+      aborted?: boolean
       slippage?: boolean
       curveComplete?: boolean
       timings?: Timings
     }
+
+export interface SubmitHooks {
+  /**
+   * Called once the signed transaction is on its way, so its signature can be
+   * saved: if the bot stops before the outcome is known, the next start can
+   * look it up on-chain.
+   */
+  onSubmit?(signature: string, lastValidBlockHeight: number): void
+}
 
 export interface BuyRequest {
   mint: PublicKey
@@ -99,6 +115,12 @@ interface Deps {
   amm: AmmSeller
   wallet?: Keypair
   log: Logger
+}
+
+interface BuildOverrides {
+  computeUnits?: number
+  /** false: no tip, whatever the landing service. */
+  tip?: false
 }
 
 let paperSeq = 0
@@ -139,7 +161,7 @@ export class Executor {
     }
   }
 
-  async buy(req: BuyRequest): Promise<TradeResult> {
+  async buy(req: BuyRequest, hooks: SubmitHooks = {}): Promise<TradeResult> {
     const t0 = nowMs()
     const rates = feeRates(this.d.protocol.feeContext(), req.curve)
     const expected = quoteBuyExactIn(req.curve, rates, req.lamports)
@@ -152,14 +174,14 @@ export class Executor {
       createAtaIdempotentIx(this.user, this.user, req.mint, req.tokenProgram),
       buyExactQuoteInV2Ix(this.accounts(req), req.lamports, minTokensOut),
     ]
-    return this.submit('buy', req.mint, req.tokenProgram, ixs, t0)
+    return this.submit('buy', req.mint, req.tokenProgram, ixs, t0, hooks)
   }
 
-  async sell(req: SellRequest): Promise<TradeResult> {
+  async sell(req: SellRequest, hooks: SubmitHooks = {}): Promise<TradeResult> {
     const t0 = nowMs()
     const key = req.mint.toBase58()
     const state = this.d.market.get(key)
-    if (state?.complete) return this.sellOnAmm(req, t0)
+    if (state?.complete) return this.sellOnAmm(req, t0, hooks)
     if (!state) return { ok: false, error: 'no live curve state for mint' }
 
     const rates = feeRates(this.d.protocol.feeContext(), state.curve)
@@ -173,7 +195,45 @@ export class Executor {
       const ata = associatedTokenAddress(this.user, req.mint, req.tokenProgram)
       ixs.push(closeTokenAccountIx(ata, this.user, this.user, req.tokenProgram))
     }
-    return this.submit('sell', req.mint, req.tokenProgram, ixs, t0)
+    return this.submit('sell', req.mint, req.tokenProgram, ixs, t0, hooks)
+  }
+
+  /**
+   * Closes our empty token account for `mint` to get its rent back (about
+   * 0.002 SOL), when a full exit could not close it in the same transaction.
+   * Sent without a tip: it is not urgent, and plain RPCs take it.
+   */
+  async closeTokenAccount(mint: PublicKey, tokenProgram: PublicKey): Promise<{ ok: true; signature: string } | { ok: false; error: string }> {
+    if (this.paper) return { ok: false, error: 'paper mode' }
+    const ata = associatedTokenAddress(this.user, mint, tokenProgram)
+    const balance = await this.d.rpc.getTokenAccountBalance(ata)
+    if (balance === null) return { ok: false, error: 'already closed' }
+    if (balance !== 0n) return { ok: false, error: 'the account still holds tokens' }
+    const r = await this.submit('sell', mint, tokenProgram, [closeTokenAccountIx(ata, this.user, this.user, tokenProgram)], nowMs(), {}, { computeUnits: 20_000, tip: false })
+    return r.ok ? { ok: true, signature: r.signature } : { ok: false, error: r.error }
+  }
+
+  /** Network cost of a trade transaction built right now: signature fee, priority fee at the current price, and tip. */
+  networkFee(side: Side): bigint {
+    const { cfg, fees } = this.d
+    const cu = side === 'buy' ? cfg.buyComputeUnits : cfg.sellComputeUnits
+    const tip = cfg.landing === 'rpc' ? 0n : side === 'buy' ? cfg.buyTipLamports : cfg.sellTipLamports
+    return BASE_FEE_LAMPORTS + priorityFeeFor(cu, fees.microLamportsPerCu(side, cu)) + tip
+  }
+
+  /**
+   * On-chain outcome of a transaction the bot lost track of (after a
+   * restart): landed, failed, or not found (yet).
+   */
+  async txOutcome(signature: string): Promise<'landed' | 'failed' | 'unknown'> {
+    const [st] = await this.d.rpc.getSignatureStatuses([signature], true)
+    if (!st?.confirmationStatus) return 'unknown'
+    return st.err ? 'failed' : 'landed'
+  }
+
+  /** True once a transaction with this `lastValidBlockHeight` can no longer land. */
+  async expired(lastValidBlockHeight: number): Promise<boolean> {
+    return (await this.d.rpc.getBlockHeight()) > lastValidBlockHeight
   }
 
   /** On-chain token balance of our ATA (base units), 0 if it does not exist. */
@@ -214,26 +274,22 @@ export class Executor {
     }
   }
 
-  private build(side: Side, ixs: TransactionInstruction[]): BuiltTx {
+  private build(side: Side, ixs: TransactionInstruction[], o: BuildOverrides = {}): BuiltTx & { priorityLamports: bigint; tipLamports: bigint } {
     const { cfg, fees, lander, blockhash } = this.d
-    const cu = side === 'buy' ? cfg.buyComputeUnits : cfg.sellComputeUnits
-    const tipLamports = side === 'buy' ? cfg.buyTipLamports : cfg.sellTipLamports
-    return buildTransaction({
-      payer: this.signer,
-      instructions: ixs,
-      computeUnits: cu,
-      microLamportsPerCu: fees.microLamportsPerCu(side, cu),
-      blockhash: blockhash.get(),
-      tip: lander?.tipsEnabled && tipLamports > 0n ? { account: lander.tipAccount(), lamports: tipLamports } : undefined,
-    })
+    const cu = o.computeUnits ?? (side === 'buy' ? cfg.buyComputeUnits : cfg.sellComputeUnits)
+    const tipLamports = o.tip === false ? 0n : side === 'buy' ? cfg.buyTipLamports : cfg.sellTipLamports
+    const microLamportsPerCu = fees.microLamportsPerCu(side, cu)
+    const tip = lander?.tipsEnabled && tipLamports > 0n ? { account: lander.tipAccount(), lamports: tipLamports } : undefined
+    const tx = buildTransaction({ payer: this.signer, instructions: ixs, computeUnits: cu, microLamportsPerCu, blockhash: blockhash.get(), tip })
+    return { ...tx, priorityLamports: priorityFeeFor(cu, microLamportsPerCu), tipLamports: tip?.lamports ?? 0n }
   }
 
-  private async submit(side: Side, mint: PublicKey, tokenProgram: PublicKey, ixs: TransactionInstruction[], t0: number): Promise<TradeResult> {
+  private async submit(side: Side, mint: PublicKey, tokenProgram: PublicKey, ixs: TransactionInstruction[], t0: number, hooks: SubmitHooks = {}, o: BuildOverrides = {}): Promise<TradeResult> {
     const { tracker, lander, log } = this.d
     if (!lander) return { ok: false, error: 'no submission paths configured' }
-    let tx: BuiltTx
+    let tx: ReturnType<Executor['build']>
     try {
-      tx = this.build(side, ixs)
+      tx = this.build(side, ixs, o)
     } catch (e) {
       return { ok: false, error: `build failed: ${(e as Error).message}` }
     }
@@ -243,7 +299,10 @@ export class Executor {
 
     let sends: SendResult[]
     try {
-      sends = await lander.broadcast(tx.base64, tx.signature)
+      const sending = lander.broadcast(tx.base64, tx.signature)
+      // After the sends are on their way: saving the signature must not delay them.
+      hooks.onSubmit?.(tx.signature, tx.lastValidBlockHeight)
+      sends = await sending
     } catch (e) {
       sends = [{ target: 'all', ok: false, ms: 0, error: (e as Error).message }]
     }
@@ -256,7 +315,12 @@ export class Executor {
     const fill = this.fills.get(tx.signature)
     this.fills.delete(tx.signature)
     const timings: Timings = { buildMs: built - t0, sendMs: sent - built, landMs: landed - sent }
+    const failedFee = BASE_FEE_LAMPORTS + tx.priorityLamports
+    const networkFeeLamports = failedFee + tx.tipLamports
 
+    if (result.status === 'aborted') {
+      return { ok: false, error: 'the bot stopped before the outcome was known', signature: tx.signature, aborted: true, timings }
+    }
     if (result.status === 'expired') {
       return { ok: false, error: accepted ? 'transaction expired before landing' : `rejected by all paths: ${sends.map((s) => s.error).join('; ')}`, signature: tx.signature, timings }
     }
@@ -266,6 +330,7 @@ export class Executor {
         error: describeTxError(result.err),
         signature: tx.signature,
         landed: true,
+        networkFeeLamports: failedFee,
         slippage: isSlippageError(result.err),
         curveComplete: isCurveCompleteError(result.err),
         timings,
@@ -283,6 +348,7 @@ export class Executor {
         tokens: trade.tokenAmount,
         lamports: side === 'buy' ? trade.solAmount + fees : trade.solAmount - fees,
         tradeFeesLamports: fees,
+        networkFeeLamports,
         timings,
       }
     }
@@ -290,7 +356,7 @@ export class Executor {
     // The stream missed our fill; fall back to on-chain balances. Exact
     // lamport accounting follows via walletDelta().
     const tokens = side === 'buy' ? await this.landedTokenBalance(mint, tokenProgram) : 0n
-    return { ok: true, paper: false, signature: tx.signature, slot: result.slot, tokens, lamports: 0n, tradeFeesLamports: 0n, timings }
+    return { ok: true, paper: false, signature: tx.signature, slot: result.slot, tokens, lamports: 0n, tradeFeesLamports: 0n, networkFeeLamports, timings }
   }
 
   /** Polls our ATA briefly: the RPC may lag the stream that reported the landing. */
@@ -303,13 +369,13 @@ export class Executor {
     return 0n
   }
 
-  private async sellOnAmm(req: SellRequest, t0: number): Promise<TradeResult> {
+  private async sellOnAmm(req: SellRequest, t0: number, hooks: SubmitHooks): Promise<TradeResult> {
     if (this.paper) {
       return { ok: false, error: 'paper mode cannot fill graduated (AMM) sells; position marked closed at last curve value' }
     }
     try {
       const ixs = await this.d.amm.sellInstructions(req.mint, this.user, req.tokens, req.slippageBps)
-      return await this.submit('sell', req.mint, req.tokenProgram, ixs, t0)
+      return await this.submit('sell', req.mint, req.tokenProgram, ixs, t0, hooks)
     } catch (e) {
       return { ok: false, error: `AMM sell failed: ${(e as Error).message}` }
     }
@@ -341,6 +407,7 @@ export class Executor {
       tokens: q.tokensOut,
       lamports: q.netQuote + q.fees,
       tradeFeesLamports: q.fees,
+      networkFeeLamports: this.networkFee('buy'),
       timings,
       simulation,
     }
@@ -365,6 +432,7 @@ export class Executor {
       tokens: req.tokens,
       lamports: q.quoteOut,
       tradeFeesLamports: q.fees,
+      networkFeeLamports: this.networkFee('sell'),
       timings,
       simulation,
     }

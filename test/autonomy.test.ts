@@ -19,7 +19,7 @@ import { OperatingCosts } from '../src/strategy/costs.js'
 import type { Position } from '../src/trading/positions.js'
 import { toJson } from '../src/util/json.js'
 import { EXIT_CONFIG, EXIT_DEAD, RESTART_LIMITS, decideRestart } from '../src/util/restart-policy.js'
-import { dataset } from './records.js'
+import { dataset, recordedUnder } from './records.js'
 
 const log = pino({ level: 'silent' })
 const dirs: string[] = []
@@ -166,7 +166,7 @@ describe('operating costs', () => {
     const cfg = loadConfig(BASE)
     const p = paramsFromConfig(cfg)
     const o = { minLaunches: 200, minHours: 10, minTrainTrades: 30, minTestTrades: 12, minEdgePct: 1, maxChanges: 3 }
-    const records = dataset(600) // profitable: ~2.25 SOL over the newest ~15 hours
+    const records = recordedUnder(dataset(600), p) // under these settings: ~2.25 SOL over the newest ~15 hours
     expect(evaluateEdge(records, cfg, p, { ...o, costPerDayLamports: 100_000_000 }, 0).status).toBe('proven')
     const expensive = evaluateEdge(records, cfg, p, { ...o, costPerDayLamports: 10_000_000_000 }, 0)
     expect(expensive.status).toBe('unproven')
@@ -186,6 +186,7 @@ function fakeEngine(cfg = loadConfig({ ...BASE, DATA_DIR: tmp(), TELEGRAM_BOT_TO
   engine.positions = { history: () => closed, list: () => [] }
   engine.risk = { snapshot: () => ({ paused: false }), pause: () => {}, resume: () => {} }
   engine.survival = { paperRealizedLamports: 0n }
+  engine.takeEarlyAlerts = () => []
   engine.status = () => ({
     uptimeSec: 2 * 86_400,
     risk: { paused: false },
