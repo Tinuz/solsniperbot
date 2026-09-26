@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -309,6 +309,50 @@ describe('launch recording', () => {
     expect(b.position?.exits).toEqual(['max hold time'])
     expect(b.trades.length).toBeGreaterThanOrEqual(1)
   }, 20_000)
+})
+
+describe('smart money (real engine)', () => {
+  it('learns smart wallets from the logged early buys and buys only when one of them does', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'sniper-smart-'))
+    const smart = Keypair.generate().publicKey
+    const now = Date.now()
+    // A day of history: ordinary early buyers mostly miss; this wallet was early in four runners.
+    const lines = Array.from({ length: 12 }, (_, i) => ({
+      mint: `M${i}`,
+      t: now - 3_600_000 + i,
+      until: now - 2_700_000 + i,
+      buys: [[1, `ordinary-${i}`, 0], [2, `other-${i}`, i === 0 ? 1 : 0], ...(i < 4 ? [[3, smart.toBase58(), 1]] : [])],
+    }))
+    mkdirSync(join(dataDir, 'wallets'))
+    writeFileSync(join(dataDir, 'wallets', `${new Date(now).toISOString().slice(0, 10)}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`)
+    try {
+      const { chain, engine } = await boot({
+        DATA_DIR: dataDir,
+        ENTRY_MODE: 'momentum',
+        MOMENTUM_MIN_AGE_MS: '100',
+        MOMENTUM_MAX_AGE_MS: '2000',
+        MOMENTUM_MIN_BUYERS: '1',
+        MOMENTUM_MIN_NET_BUY_SOL: '0.1',
+        MOMENTUM_MIN_SMART_BUYERS: '1',
+      })
+      await waitFor(() => engine.wallets.size > 0, 5_000, 'smart-money book')
+      expect(engine.wallets.isSmart(smart.toBase58())).toBe(true)
+      expect(engine.status().wallets).toMatchObject({ smart: 1 })
+
+      // Ordinary buyers only: no entry.
+      const plain = chain.launch({ symbol: 'PLAIN', devBuyLamports: 200_000_000n }).mint
+      for (let i = 0; i < 3; i++) chain.trade(plain, { buyLamports: 500_000_000n })
+      // The smart wallet buys: entry.
+      const followed = chain.launch({ symbol: 'FOLLOW', devBuyLamports: 200_000_000n }).mint
+      chain.trade(followed, { user: smart, buyLamports: 500_000_000n })
+      await waitFor(() => engine.positions.has(followed.toBase58()), 5_000, 'entry after the smart buyer')
+      expect(engine.recentLaunches().find((l) => l.mint === followed.toBase58())?.reason).toMatch(/\(1 smart\)/)
+      await waitFor(() => /momentum window expired/.test(engine.recentLaunches().find((l) => l.mint === plain.toBase58())?.reason ?? ''), 5_000, 'plain launch passed over')
+      expect(engine.positions.has(plain.toBase58())).toBe(false)
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('telegram (real engine)', () => {

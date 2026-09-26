@@ -23,10 +23,14 @@ export interface MomentumSnapshot {
   earlyBuyLamports: bigint
   /** Largest share of the supply held by one wallet other than the dev, %. */
   topBuyerPct: number
+  /** Distinct buyers that are smart money (wallets whose early buys keep turning into runners). */
+  smartBuyers: number
 }
 
-export function momentumSnapshot(state: MintState, launch: Launch, now: number): MomentumSnapshot {
+export function momentumSnapshot(state: MintState, launch: Launch, now: number, isSmart?: (wallet: string) => boolean): MomentumSnapshot {
   const buyers = state.devStr && state.buyers.has(state.devStr) ? state.buyers.size - 1 : state.buyers.size
+  let smartBuyers = 0
+  if (isSmart) for (const w of state.buyers) if (w !== state.devStr && isSmart(w)) smartBuyers++
   const organicBuys = state.buyVolume - launch.devBuyLamports
   let top = 0n
   for (const [wallet, tokens] of state.holders) if (wallet !== state.devStr && tokens > top) top = tokens
@@ -41,6 +45,7 @@ export function momentumSnapshot(state: MintState, launch: Launch, now: number):
     complete: state.complete,
     earlyBuyLamports: state.earlyBuyVolume,
     topBuyerPct: supply > 0n ? Number((top * 1_000_000n) / supply) / 10_000 : 0,
+    smartBuyers,
   }
 }
 
@@ -67,8 +72,9 @@ export function decideMomentum(x: MomentumSnapshot, m: Config['momentum'], maxEn
   if (x.buyers < m.minBuyers) return { action: 'wait' }
   if (x.netBuyLamports < m.minNetBuyLamports) return { action: 'wait' }
   if (x.sellRatio > m.maxSellRatio) return { action: 'wait' }
+  if (x.smartBuyers < m.minSmartBuyers) return { action: 'wait' }
   return {
     action: 'buy',
-    reason: `${x.buyers} buyers, +${lamportsToSol(x.netBuyLamports).toFixed(2)} SOL net in ${(x.ageMs / 1000).toFixed(1)}s`,
+    reason: `${x.buyers} buyers${x.smartBuyers ? ` (${x.smartBuyers} smart)` : ''}, +${lamportsToSol(x.netBuyLamports).toFixed(2)} SOL net in ${(x.ageMs / 1000).toFixed(1)}s`,
   }
 }

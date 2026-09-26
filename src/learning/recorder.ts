@@ -6,6 +6,7 @@ import { positionPnl } from '../trading/positions.js'
 import type { Logger } from '../util/logger.js'
 import { Journal } from '../util/persist.js'
 import { type LaunchRecord, type LaunchVerdict, type TradeRow, summarize } from './record.js'
+import { type WalletEntry, earlyBuys } from './wallets.js'
 
 interface Active {
   rec: Omit<LaunchRecord, 'summary'>
@@ -18,6 +19,10 @@ export interface RecorderOptions {
   maxTrades: number
   /** Cap on launches being recorded at once, to bound memory. */
   maxActive?: number
+  /** Wallets never logged as early buyers (the bot's own). */
+  ignoreWallets?: string[]
+  /** Called with each finished launch's early buyers (see `wallets.ts`). */
+  onWallets?: (e: WalletEntry) => void
 }
 
 const day = (t: number) => new Date(t).toISOString().slice(0, 10)
@@ -41,6 +46,7 @@ export class LaunchRecorder {
   private readonly active = new Map<string, Active>()
   private readonly journals = new Map<string, Journal>()
   private readonly maxActive: number
+  private readonly ignore: ReadonlySet<string>
   private written = 0
   private dropped = 0
 
@@ -49,6 +55,7 @@ export class LaunchRecorder {
     private readonly log: Logger,
   ) {
     this.maxActive = opts.maxActive ?? 20_000
+    this.ignore = new Set(opts.ignoreWallets ?? [])
   }
 
   start(
@@ -182,16 +189,28 @@ export class LaunchRecorder {
     this.active.delete(mint)
     const rec: LaunchRecord = { ...a.rec, partial, summary: summarize(a.rec) }
     const d = day(rec.t)
-    let journal = this.journals.get(d)
-    if (!journal) {
-      journal = new Journal(join(this.opts.dataDir, 'launches', `${d}.jsonl`), (err) =>
-        this.log.error({ err }, 'failed to write launch record'),
-      )
-      this.journals.set(d, journal)
-      // Keep only the current and previous day's handles.
-      for (const k of [...this.journals.keys()].sort().slice(0, -2)) this.journals.delete(k)
-    }
-    void journal.append(rec)
+    void this.journal('launches', d).append(rec)
     this.written++
+    // Early buyers and how their buys turned out (a cut-short recording has no outcome yet).
+    if (partial) return
+    const addresses: string[] = []
+    for (const [address, index] of a.wallets) addresses[index] = address
+    const buys = earlyBuys(rec, addresses, this.ignore)
+    if (!buys.length) return
+    const entry: WalletEntry = { mint, t: rec.t, until: rec.t + rec.horizonMs, buys }
+    void this.journal('wallets', d).append(entry)
+    this.opts.onWallets?.(entry)
+  }
+
+  private journal(kind: 'launches' | 'wallets', d: string): Journal {
+    const key = `${kind}/${d}`
+    let journal = this.journals.get(key)
+    if (!journal) {
+      journal = new Journal(join(this.opts.dataDir, kind, `${d}.jsonl`), (err) => this.log.error({ err, kind }, 'failed to write recording'))
+      this.journals.set(key, journal)
+      // Keep only the current and previous day's handles of each kind.
+      for (const k of [...this.journals.keys()].filter((x) => x.startsWith(`${kind}/`)).sort().slice(0, -2)) this.journals.delete(k)
+    }
+    return journal
   }
 }

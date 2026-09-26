@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline'
 import { PublicKey } from '@solana/web3.js'
 import type { Launch } from '../feed/market.js'
 import type { LaunchRecord } from './record.js'
+import { annotateFromDisk } from './wallets.js'
 
 /**
  * Loads recorded launches, oldest first. `days` keeps only the most recent N
@@ -48,7 +49,10 @@ export async function loadSample(dataDir: string, opts: { days?: number; max?: n
       }
     }
   }
-  return { records: out.sort((a, b) => a.t - b.t), stride }
+  out.sort((a, b) => a.t - b.t)
+  // Which early buyers were smart money at each launch, from the logged early buys (no look-ahead).
+  await annotateFromDisk(dataDir, out)
+  return { records: out, stride }
 }
 
 async function countLines(path: string): Promise<number> {

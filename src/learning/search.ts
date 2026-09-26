@@ -54,6 +54,8 @@ const MOONBAG: Partial<TunableParams> = { moonbagPct: 25, moonbagSecurePct: 10, 
 const SEEDS: Partial<TunableParams>[] = [
   MOONBAG,
   { entryMode: 'momentum', momentumMinBuyers: 4, momentumMinNetBuySol: 1, ...MOONBAG },
+  // Follow smart money: buy when a proven wallet does, with little else required.
+  { entryMode: 'momentum', momentumMinBuyers: 1, momentumMinNetBuySol: 0.1, momentumMaxSellRatio: 1, momentumMinSmartBuyers: 1, ...MOONBAG },
   { entryMode: 'instant' },
   { entryMode: 'momentum' },
   { entryMode: 'momentum', momentumMinBuyers: 3, momentumMinNetBuySol: 0.5, momentumMaxSellRatio: 0.6 },

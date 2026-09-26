@@ -105,6 +105,9 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
   let decisionMs = 0
   if (c.entry === 'momentum') {
     const buyers = new Set<number>()
+    // Early buyers that were smart money when the coin launched (see wallets.ts).
+    const smartWallets = new Set(rec.smart ?? [])
+    let smartBuyers = 0
     // Net tokens per wallet: each row's reserves move by exactly the tokens traded.
     const holdings = new Map<number, number>()
     let lastVt = rec.curve.vt
@@ -124,6 +127,7 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
         if (side > 0) {
           buys += lamports
           if (wallet !== 0) {
+            if (!buyers.has(wallet) && smartWallets.has(wallet)) smartBuyers++
             buyers.add(wallet)
             if (dt <= EARLY_WINDOW_MS) early += lamports
           }
@@ -155,6 +159,7 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
         complete: false,
         earlyBuyLamports: BigInt(Math.round(early)),
         topBuyerPct: rec.curve.supply > 0 ? Math.floor((top / rec.curve.supply) * 1_000_000) / 10_000 : 0,
+        smartBuyers,
       }
       const d = decideMomentum(snap, c.momentum, c.maxEntryMcapLamports)
       if (d.action === 'reject') return none(d.reason)

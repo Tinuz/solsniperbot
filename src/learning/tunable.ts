@@ -18,6 +18,8 @@ export interface TunableParams {
   momentumMaxEarlyBuySol: number
   /** 0 = off. */
   momentumMaxTopBuyerPct: number
+  /** 0 = off. */
+  momentumMinSmartBuyers: number
   takeProfit: { gainPct: number; sellPct: number }[]
   stopLossPct: number
   trailingStopPct: number
@@ -49,6 +51,7 @@ export const BOUNDS: Record<ScalarKey, [number, number]> = {
   momentumMaxAgeMs: [3_000, 60_000],
   momentumMaxEarlyBuySol: [0.2, 50],
   momentumMaxTopBuyerPct: [0.5, 20],
+  momentumMinSmartBuyers: [1, 3],
   stopLossPct: [10, 60],
   trailingStopPct: [0, 50],
   trailingArmPct: [10, 300],
@@ -79,6 +82,7 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
   momentumMaxAgeMs: { factor: 2 },
   momentumMaxEarlyBuySol: { factor: 2 },
   momentumMaxTopBuyerPct: { factor: 2 },
+  momentumMinSmartBuyers: { abs: 1 },
   stopLossPct: { abs: 10 },
   trailingStopPct: { abs: 10 },
   trailingArmPct: { abs: 40 },
@@ -97,7 +101,7 @@ export const STEP_LIMITS: Record<ScalarKey, { abs?: number; factor?: number }> =
 const TP_STEP_FACTOR = 2
 
 /** Settings where 0 means "off": switching on (to any in-bounds value) or off counts as one step. */
-const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct', 'moonbagPct', 'moonbagTrailingPct'])
+const OPTIONAL: ReadonlySet<ScalarKey> = new Set(['momentumMaxEarlyBuySol', 'momentumMaxTopBuyerPct', 'momentumMinSmartBuyers', 'moonbagPct', 'moonbagTrailingPct'])
 /** Only in effect while the moonbag is on: their bounds and steps don't apply while it is off. */
 const MOONBAG_ONLY: ReadonlySet<ScalarKey> = new Set(['moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct'])
 
@@ -127,6 +131,7 @@ export const ENV_NAMES: Record<keyof TunableParams, string> = {
   moonbagSecurePct: 'MOONBAG_SECURE_PCT',
   moonbagStopBufferPct: 'MOONBAG_STOP_BUFFER_PCT',
   moonbagTrailingPct: 'MOONBAG_TRAILING_PCT',
+  momentumMinSmartBuyers: 'MOMENTUM_MIN_SMART_BUYERS',
 }
 
 const round = (v: number, d = 3) => Math.round(v * 10 ** d) / 10 ** d
@@ -157,6 +162,7 @@ export function paramsFromConfig(cfg: Config): TunableParams {
     moonbagSecurePct: cfg.exits.moonbag.securePct,
     moonbagStopBufferPct: cfg.exits.moonbag.stopBufferPct,
     moonbagTrailingPct: cfg.exits.moonbag.trailingPct,
+    momentumMinSmartBuyers: cfg.momentum.minSmartBuyers,
   }
 }
 
@@ -180,6 +186,7 @@ export function withParams(cfg: Config, p: TunableParams): Config {
       maxAgeMs: Math.round(p.momentumMaxAgeMs),
       maxEarlyBuyLamports: solToLamports(p.momentumMaxEarlyBuySol),
       maxTopBuyerPct: p.momentumMaxTopBuyerPct,
+      minSmartBuyers: Math.round(p.momentumMinSmartBuyers),
     },
     exits: {
       ...cfg.exits,
@@ -325,6 +332,8 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
     const optional = (v: number, on: number[]) => (v === 0 ? on : [0, ...scale(v, [0.5, 0.75, 1.5, 2], 2)])
     for (const v of optional(p.momentumMaxEarlyBuySol, [0.5, 1, 2, 5])) set('insider buys', { momentumMaxEarlyBuySol: v })
     for (const v of optional(p.momentumMaxTopBuyerPct, [2, 3, 5, 8])) set('top holder', { momentumMaxTopBuyerPct: v })
+    const smart = p.momentumMinSmartBuyers
+    for (const v of smart === 0 ? [1, 2] : [0, smart - 1, smart + 1]) set('smart buyers', { momentumMinSmartBuyers: v })
     for (const mn of [p.momentumMinAgeMs, Math.round(p.momentumMinAgeMs / 2), p.momentumMinAgeMs * 2]) {
       for (const mx of [p.momentumMaxAgeMs, Math.round(p.momentumMaxAgeMs / 2), p.momentumMaxAgeMs * 2]) {
         if (mn !== p.momentumMinAgeMs || mx !== p.momentumMaxAgeMs) set('momentum window', { momentumMinAgeMs: mn, momentumMaxAgeMs: mx })
@@ -373,10 +382,15 @@ export function neighbors(p: TunableParams): { group: string; params: TunablePar
   return out
 }
 
-/** Identity of a set of settings. The moonbag's settings only count while it is on. */
+/**
+ * Identity of a set of settings. Settings added later are left out while off,
+ * so older settings keep their key (and fingerprint); the moonbag's settings
+ * only count while it is on.
+ */
 export const paramsKey = (p: TunableParams) => {
   const env = toEnv(p)
   if (!p.moonbagPct) for (const key of MOONBAG_KEYS) delete env[ENV_NAMES[key]]
+  if (!p.momentumMinSmartBuyers) delete env[ENV_NAMES.momentumMinSmartBuyers]
   return JSON.stringify(env)
 }
 const MOONBAG_KEYS: (keyof TunableParams)[] = ['moonbagPct', 'moonbagSecurePct', 'moonbagStopBufferPct', 'moonbagTrailingPct']
@@ -400,6 +414,7 @@ export const replayKey = (p: TunableParams) =>
           p.momentumMaxAgeMs,
           p.momentumMaxEarlyBuySol,
           p.momentumMaxTopBuyerPct,
+          p.momentumMinSmartBuyers,
           p.maxEntryMcapSol,
         ]
       : null,

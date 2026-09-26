@@ -31,6 +31,7 @@ import {
   writeReport,
 } from '../src/learning/report.js'
 import { applyParams, paramsFromConfig, settingsFingerprint } from '../src/learning/tunable.js'
+import { SMART_HIT_MULTIPLE, SMART_MIN_APPEARANCES, WalletBook, readWalletEntries } from '../src/learning/wallets.js'
 import { type FilterContext, staticFilter } from '../src/strategy/filters.js'
 
 loadDotenv({ quiet: true })
@@ -200,6 +201,46 @@ for (const [key, label] of Object.entries(FEATURE_LABELS).filter(([k]) => k !== 
   say(`### ${label}${LOOKAHEAD_SECONDS[key] ? ` ⏱ known after ${LOOKAHEAD_SECONDS[key]}s` : ''}`)
   say()
   say(table(['Range', 'Launches', 'Win rate', 'Mean', 'Median'], bucketRows))
+  say()
+}
+
+// Smart money ----------------------------------------------------------------
+say('## Smart money')
+say()
+const walletEntries = await readWalletEntries(cfg.dataDir)
+if (!walletEntries.length) {
+  say('No early buyers logged yet. The bot logs them for every finished launch (`data/wallets/`); this section fills in after a few days of recording.')
+  say()
+} else {
+  const book = new WalletBook()
+  const last = records[records.length - 1]!.t
+  for (const e of walletEntries) if (e.until <= last) book.add(e)
+  say(
+    `${book.size.toLocaleString()} wallets with early buys logged; ${book.smartCount().toLocaleString()} count as smart money at the end of the data ` +
+      `(at least ${SMART_MIN_APPEARANCES} early buys and a hit rate of at least ${Math.round(book.threshold * 100)}%, shrunk for small samples). ` +
+      `A hit: the price later reached ${SMART_HIT_MULTIPLE}x what the wallet paid; ${Math.round(book.baseRate * 100)}% of all early buys were hits.`,
+  )
+  say()
+  say('Launches split by whether smart wallets were among their early buyers (⏱ known once they bought, within the first minute), judged only on launches that had finished before. Early in the data few wallets have a history yet.')
+  say()
+  const groups: [string, (r: Row) => boolean][] = [
+    ['No smart buyers', (r) => !(r.rec.smart?.length ?? 0)],
+    ['1 smart buyer', (r) => r.rec.smart?.length === 1],
+    ['2+ smart buyers', (r) => (r.rec.smart?.length ?? 0) >= 2],
+  ]
+  say(
+    table(
+      ['Early buyers', 'Launches', 'Instant: win rate', 'Instant: mean', 'Current strategy: trades', 'Current strategy: SOL'],
+      groups.map(([label, match]) => {
+        const g = rows.filter(match)
+        const inst = summarizeResults(g.map((r) => r.ifBought))
+        const cur = summarizeResults(g.filter((r) => r.pass).map((r) => r.now))
+        return [label, g.length, inst.trades ? `${Math.round(inst.winRate * 100)}%` : '–', inst.trades ? pct(inst.meanPnlPct) : '–', cur.trades, sol(cur.totalPnlLamports)]
+      }),
+    ),
+  )
+  say()
+  say('`MOMENTUM_MIN_SMART_BUYERS=1` waits for a smart buyer before entering; `npm run research` and autotune try it as soon as the data supports it.')
   say()
 }
 
