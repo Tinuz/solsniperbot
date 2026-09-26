@@ -9,6 +9,7 @@ import { GrpcFeed } from '../src/feed/grpc-feed.js'
 import { replayConfigFrom } from '../src/learning/replay.js'
 import { type WalletEntry, WalletBook, annotateSmartBuyers } from '../src/learning/wallets.js'
 import { RiskManager } from '../src/strategy/risk.js'
+import { Executor } from '../src/trading/executor.js'
 import { txNetworkLamports } from '../src/trading/fees.js'
 import { writeJsonAtomic } from '../src/util/persist.js'
 import { buildRecord } from './records.js'
@@ -200,6 +201,17 @@ describe('fees', () => {
     expect(replayConfigFrom(fixed).buyNetworkLamports).toBe(505_000)
     expect(replayConfigFrom(dynamic).buyNetworkLamports).toBe(3_005_000)
     expect(txNetworkLamports(dynamic, 'buy')).toBe(505_000n) // survival sizes on the floor
+  })
+})
+
+describe('settling after a restart', () => {
+  it('counts a transaction as landed only once it is confirmed, the commitment balances are read at', async () => {
+    const at = (confirmationStatus: string | null, err: unknown = null) =>
+      new Executor({ rpc: { getSignatureStatuses: async () => [confirmationStatus ? { slot: 1, confirmationStatus, err } : null] } } as unknown as ConstructorParameters<typeof Executor>[0])
+    expect(await at('processed').txOutcome('sig')).toBe('unknown')
+    expect(await at('confirmed').txOutcome('sig')).toBe('landed')
+    expect(await at('finalized', { InstructionError: [2, { Custom: 6003 }] }).txOutcome('sig')).toBe('failed')
+    expect(await at(null).txOutcome('sig')).toBe('unknown')
   })
 })
 

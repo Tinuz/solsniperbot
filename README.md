@@ -59,7 +59,7 @@ Open positions are persisted in `data/positions.json` and resume monitoring afte
 
 **Stops and restarts never lose track of money.**
 - **Stopping.** The bot stops buying first, then gives buys and sells already in flight up to 10 seconds to land. One still in flight after that is saved with its signature as *pending*, never booked as failed, because it may still land.
-- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries.
+- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries every 10 seconds (the position isn't traded meanwhile, so after a minute you get an alert, and another when it recovers). Trades closed during this check reach every ledger, and reconciliations a stop cut off are finished.
 - **Switching `DRY_RUN`.** The other mode's positions, live moonbags included, stay in the file untouched, and an alert says they are not managed until you switch back.
 
 ## Survival: the bot keeps itself alive
@@ -130,9 +130,10 @@ To try other settings on the same data, set them for one run. In PowerShell: `$e
 
 A fresh bot doesn't know whether its settings make money, and blind sniping usually doesn't: on pump.fun most launches never trade again after the first seconds, and every one of those costs the round-trip fees (~8% of a 0.05 SOL trade at the default tips). So with `REQUIRE_EDGE=auto` (the default whenever launches are recorded), the bot only buys while the settings in effect have made money on launches recorded *after* they were chosen.
 - **Until then it observes.** It watches and records every launch, which is how it learns, but spends nothing. The dashboard header shows **observing** or **trading**, and skipped launches say why.
-- **The proof: forward data only.** Every recording carries a fingerprint of the settings in effect when it was made. Every hour the bot replays the settings in effect on the recordings made under exactly those settings, within the newest 30% of the recordings (the part the tuner validates on, so old profits can't keep the gate open). Settings are always chosen from data recorded before they took effect, so this data can't have helped choose them: a search result can never prove itself. It needs 30% of `AUTOTUNE_MIN_LAUNCHES` launches over 30% of `AUTOTUNE_MIN_HOURS`, at least `AUTOTUNE_MIN_TEST_TRADES` trades, a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade. With operating costs set (below), the profit must also cover them.
+- **The proof: forward data only.** Every recording carries a fingerprint of the settings in effect when it was made. Every hour the bot replays the settings in effect on the recordings made under exactly those settings, within the newest 30% of the recordings (the part the tuner validates on, so old profits can't keep the gate open). Settings are always chosen from data recorded before they took effect, so this data can't have helped choose them: a search result can never prove itself. It needs 30% of `AUTOTUNE_MIN_LAUNCHES` launches over 30% of `AUTOTUNE_MIN_HOURS`, at least 40% of `AUTOTUNE_MIN_TRADES` trades (5 at least) within `AUTOTUNE_MIN_HOURS` of recording (fewer after that means no edge), a profit of at least `AUTOTUNE_MIN_EDGE_PCT`% of the trade size per trade, and a profit that doesn't hang on one lucky trade. With operating costs set (below), the profit must also cover them.
 - **It stops when the edge goes.** If the market turns and the settings stop making money, buying pauses again instead of bleeding the wallet. A proof older than three hours no longer counts.
-- **Settings that change get their own proof.** New settings (edited `.env`, an adoption, a rollback or a revert) start without proof: the bot observes and records until enough launches were recorded under them. A shadow-tested live candidate is judged on the launches since it was found.
+- **Settings that change get their own proof.** New settings (edited `.env`, an adoption, a rollback or a revert) start without proof: the bot observes and records until enough launches were recorded under them. A shadow-tested candidate is judged on the launches since it was found.
+- **No moving target.** While the settings in effect are still collecting their proof, autotune doesn't replace them (that would restart the clock, and the gate might never open). It searches again once they have a verdict: when they don't make money, it adopts a better candidate directly (nothing is traded on them anyway); while they do, a paper candidate is first shadow-tested next to them, like in live mode, so trading never stops and the shadow test becomes the candidate's proof.
 
 Survival rules stay the last line of defence. Set `REQUIRE_EDGE=false` to trade regardless (the offline demo does this).
 
@@ -335,7 +336,7 @@ Binding it anywhere else (`API_HOST=0.0.0.0`) requires `API_TOKEN`: the bot refu
 
 - **Colocate.** Run the bot in the same region as your RPC and landing endpoints (Frankfurt, Amsterdam, New York or Salt Lake City are common). Point `HELIUS_SENDER_URL` at the regional sender (e.g. `http://fra-sender.helius-rpc.com/fast`).
 - **Prefer gRPC** (`GRPC_URL`) over websockets if your provider offers it. Try `GRPC_DESHRED=true` if they support deshred.
-- **Dynamic priority fees** (`PRIORITY_FEE_MODE=dynamic`) pay up to `PRIORITY_FEE_MAX_SOL` in busy moments. Positions book the fee each transaction really paid. Replay, research and the edge gate assume the cap on every trade, so a strategy is never judged on fees cheaper than it may pay: keep the cap realistic.
+- **Dynamic priority fees** (`PRIORITY_FEE_MODE=dynamic`) pay up to `PRIORITY_FEE_MAX_SOL` in busy moments. Positions book the fee each transaction really paid. Replay, research, the edge gate and the survival checks (exit reserve, smallest viable trade, fee drag) assume the cap on every trade, so a strategy is never judged on fees cheaper than it may pay: keep the cap realistic.
 - **Measure compute.** Run paper mode with `SIMULATE_DRY_RUN=true` and a funded wallet, then read `unitsConsumed` from `data/trades.jsonl`. Set `BUY_COMPUTE_UNITS` just above it: a lower limit at the same total fee means a higher per-CU price.
 - **Watch "Landed slots after launch"** on the dashboard. It's the metric that matters, and it moves with tip, priority fee and region.
 
@@ -383,13 +384,15 @@ npm run typecheck
 - **Edge gate**:
   - no buys (but full recording) until the settings are proven;
   - only launches recorded under the exact settings count (or, for a shadow-tested candidate, those since it was found): data from before, however profitable, never proves them, and neither does an adopted candidate's own search result;
+  - settings still collecting their proof are never replaced, over many search cycles, so the gate does open; while settings make money, a paper candidate is shadow-tested first and trading goes on;
   - the proof is per exact settings, restored after restart, stale after 3h, and withdrawn when the market turns;
   - operating costs must be covered, with sampled data scaled up.
 - **Money across stops and restarts** (live, mock chain):
   - a buy in flight at shutdown is kept as pending and becomes a position once it lands; one that never lands is dropped without a loss;
   - a sell in flight at shutdown is booked once it landed, with the exact wallet change, never as a loss;
   - after a crash the chain wins over the saved holdings; missing tokens are booked at the last price, with an alert;
-  - an RPC error while restarting never drops a position;
+  - an RPC error while restarting never drops a position, and the owner hears about it while it lasts;
+  - trades closed while starting reach the cost ledger and the Telegram reports, and reconciliations a stop cut off are finished;
   - the other mode's positions survive a `DRY_RUN` switch;
   - the same coin is never bought twice at once (a double click, or a manual buy during an automatic one);
   - a failed sell is retried with wider slippage, its fee is reconciled, and the token account is closed afterwards for its rent;

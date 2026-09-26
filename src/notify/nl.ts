@@ -45,6 +45,7 @@ const PHRASES: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^autotune exploration suggests /, '💡 Autotune (verkenning) stelt voor: '],
   [/^autotune suggests /, '💡 Autotune stelt voor: '],
   [/^autotune: shadow-testing (.+) on new launches before trading it live \((\d+) trades\)/, (_, c, n) => `⚙️ Autotune: schaduwtest van ${c} op nieuwe launches, voordat het live gaat (${n} trades)`],
+  [/^autotune: shadow-testing (.+) on new launches before trading it \((\d+) trades\)/, (_, c, n) => `⚙️ Autotune: schaduwtest van ${c} op nieuwe launches, voordat de bot erop handelt (${n} trades)`],
   [/^autotune adopted /, '⚙️ Autotune nam over: '],
   [/; on probation for (\d+) trades/, (_, n) => `; proeftijd ${n} trades`],
   [/; trading at (\d+)% size/, (_, p) => `; handelt op ${p}% van de inzet`],

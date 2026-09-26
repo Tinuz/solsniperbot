@@ -227,7 +227,9 @@ export class Executor {
    */
   async txOutcome(signature: string): Promise<'landed' | 'failed' | 'unknown'> {
     const [st] = await this.d.rpc.getSignatureStatuses([signature], true)
-    if (!st?.confirmationStatus) return 'unknown'
+    // Only `confirmed` or better: balances are read at `confirmed`, so a
+    // transaction seen only at `processed` is not settled yet (asked again).
+    if (st?.confirmationStatus !== 'confirmed' && st?.confirmationStatus !== 'finalized') return 'unknown'
     return st.err ? 'failed' : 'landed'
   }
 

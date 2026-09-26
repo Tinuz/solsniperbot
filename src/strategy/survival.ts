@@ -36,10 +36,14 @@ export interface Vitals {
  */
 export const BUY_ACCOUNT_OVERHEAD_LAMPORTS = 4_500_000n
 
-/** Network costs per trade at the fee floor (see `txNetworkLamports`). */
+/**
+ * Network costs per trade, at the most they can be (dynamic priority fees at
+ * their cap): the exit reserve and the viability checks must hold in a busy
+ * network too.
+ */
 export function feeSchedule(cfg: Config) {
-  const buyNetwork = txNetworkLamports(cfg, 'buy')
-  const sellNetwork = txNetworkLamports(cfg, 'sell')
+  const buyNetwork = txNetworkLamports(cfg, 'buy', 'worst')
+  const sellNetwork = txNetworkLamports(cfg, 'sell', 'worst')
   return {
     buyNetwork,
     sellNetwork,

@@ -75,7 +75,7 @@ async function live(env: Record<string, string> = {}): Promise<Rig> {
 }
 
 async function startEngine(cfg: Config, wallet: Keypair): Promise<{ engine: Engine; alerts: string[] }> {
-  const engine = new Engine(cfg, wallet, log, { drainMs: 300 })
+  const engine = new Engine(cfg, wallet, log, { drainMs: 300, retryMs: 50 })
   await engine.start()
   const alerts = engine.takeEarlyAlerts()
   engine.on('alert', (m) => alerts.push(m))
@@ -143,7 +143,7 @@ describe('shutdown with transactions in flight', () => {
   })
 
   it('keeps a sell it could not see land, and books it exactly once it did', async () => {
-    const rig = await live()
+    const rig = await live({ OPERATING_COST_PER_MONTH: '1', OPERATING_COST_CURRENCY: 'sol' })
     const { mint, dev, m } = await bought(rig)
     rig.chain.holdNext = 1
     rig.chain.trade(mint, { user: dev, sellTokens: 10_000_000_000_000n }) // dev dumps: exit
@@ -161,6 +161,9 @@ describe('shutdown with transactions in flight', () => {
     // Not a false loss: the P&L is the wallet's exact change over the buy and the sell.
     expect(positionPnl(closed)).toBe(walletChange(rig))
     expect(rig.chain.landed.filter((t) => t.kind === 'sell')).toHaveLength(1)
+    // Closed while starting, yet in every ledger: the cost ledger (exact, once reconciled) and the notifier's.
+    await waitFor(() => Math.abs(rig.engine.costs.status().earnedSol - Number(walletChange(rig)) / 1e9) < 1e-9, 5_000, 'cost ledger')
+    expect(rig.engine.takeEarlyClosed().map((p) => p.mint)).toEqual([m])
   })
 })
 
@@ -182,7 +185,7 @@ describe('restart after a crash', () => {
     expect(rig.alerts.some((a) => /tokens left the wallet/.test(a))).toBe(true)
   })
 
-  it('never drops a position because the RPC failed while restarting', async () => {
+  it('never drops a position because the RPC failed while restarting, and says so while it lasts', async () => {
     const rig = await live()
     const { m } = await bought(rig)
     await restart(rig, () => {
@@ -191,7 +194,24 @@ describe('restart after a crash', () => {
     const pos = rig.engine.positions.get(m)!
     expect(pos).toBeDefined()
     expect(pos.pending?.side).toBe('sync') // waits for the chain before trading again
+    await waitFor(() => rig.alerts.find((a) => /cannot check this position on-chain .*no stop-loss meanwhile/.test(a)), 8_000, 'unsettled alert')
     rig.chain.failing.clear()
+    await waitFor(() => rig.alerts.find((a) => /checked on-chain again/.test(a)), 8_000, 'recovery alert')
+    expect(rig.engine.positions.get(m)?.pending).toBeUndefined()
+  })
+
+  it('finishes the reconciliations a stop cut off', async () => {
+    const rig = await live()
+    rig.chain.failing.add('getTransaction')
+    const { mint } = rig.chain.launch({ symbol: 'LATE', devBuyLamports: 1_000_000_000n })
+    const m = mint.toBase58()
+    const pos = await waitFor(() => rig.engine.positions.get(m)?.status === 'open' && rig.engine.positions.get(m), 8_000, 'buy')
+    expect(pos.reconciled).toBe(false)
+    expect(pos.unreconciled).toHaveLength(1)
+    await restart(rig, () => rig.chain.failing.clear())
+    const exact = await waitFor(() => rig.engine.positions.get(m)?.reconciled && rig.engine.positions.get(m), 8_000, 'reconciled after restart')
+    expect(exact.unreconciled).toEqual([])
+    expect(exact.walletDeltaLamports).toBe(walletChange(rig))
   })
 
   it('keeps the other mode’s positions when DRY_RUN changes, and says so', async () => {

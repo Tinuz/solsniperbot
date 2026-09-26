@@ -337,6 +337,12 @@ export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: Tunab
 
   const results = new Evaluator(sorted, cfg).results(params)
   const recent = summarizeResults(results)
+  // Too few trades so far is no verdict yet, until the settings had the full
+  // AUTOTUNE_MIN_HOURS to make them (settings that hardly trade are unproven).
+  if (recent.trades < o.minTestTrades && hours < o.minHours) {
+    const detail = `${recent.trades}/${o.minTestTrades} trades in ${hours.toFixed(1)}h recorded under these settings`
+    return { ...base, recent, status: 'insufficient-data', reason: `collecting forward data: ${detail}`, gates: [dataGate, { name: 'enough trades', pass: false, detail }] }
+  }
   const buy = Number(cfg.buyLamports)
   const needed = (o.minEdgePct / 100) * buy * Math.max(recent.trades, 1)
   const bestWin = results.reduce((m, r) => Math.max(m, r.pnlLamports), 0)

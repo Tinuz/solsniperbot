@@ -136,6 +136,9 @@ export class Engine extends EventEmitter<{
   private readonly feedProblemAt = new Map<string, number>()
   /** Alerts raised before anyone listened (while starting), kept for the notifier. */
   private readonly earlyAlerts: string[] = []
+  /** Positions closed while starting (settled on-chain), for the notifier's ledger. */
+  private readonly earlyClosed: Position[] = []
+  private running = false
   private stopping = false
   /** Fingerprint of the strategy settings, recomputed only when the tuner changes them. */
   private settingsFp = { version: -1, value: '' }
@@ -144,7 +147,7 @@ export class Engine extends EventEmitter<{
     readonly cfg: Config,
     private readonly wallet: Keypair | undefined,
     private readonly log: Logger,
-    private readonly opts: { drainMs?: number } = {},
+    private readonly opts: { drainMs?: number; retryMs?: number } = {},
   ) {
     super()
     this.rpc = new RpcClient(cfg.rpcUrl)
@@ -186,10 +189,21 @@ export class Engine extends EventEmitter<{
       protocol: this.protocol,
       risk: this.risk,
       rpc: this.rpc,
+      retryMs: opts.retryMs,
       log,
     })
-    // Subscribed before start: restoring positions can already raise alerts.
+    // Subscribed before start: settling restored positions can already close
+    // some (a sell that landed while the bot was down) or raise alerts.
     this.positions.on('alert', (m) => this.alert(m))
+    this.positions.on('update', (p) => this.emit('event', { type: 'position', data: p }))
+    this.positions.on('closed', (p) => {
+      this.survival.bookClosed(p)
+      this.costs.bookClosed(p)
+      this.recorder?.position(p)
+      this.emit('event', { type: 'closed', data: p })
+      if (!this.running && this.earlyClosed.length < 100) this.earlyClosed.push(p)
+      if (!cfg.dryRun) void this.refreshBalance()
+    })
     this.positions.on('reconciled', (p, correction) => {
       this.costs.bookCorrection(correction)
       this.emit('reconciled', p, correction)
@@ -258,14 +272,6 @@ export class Engine extends EventEmitter<{
     this.vitals = this.survival.check({ ...this.survivalInput(), busy: false })
     log.info(lamportsView(this.vitals), 'vitals')
 
-    this.positions.on('update', (p) => this.emit('event', { type: 'position', data: p }))
-    this.positions.on('closed', (p) => {
-      this.survival.bookClosed(p)
-      this.costs.bookClosed(p)
-      this.recorder?.position(p)
-      this.emit('event', { type: 'closed', data: p })
-      if (!cfg.dryRun) void this.refreshBalance()
-    })
     this.market.on('launch', (l, s) => this.onLaunch(l, s))
     this.market.on('trade', (state, trade) => this.onTrade(state, trade))
     this.market.on('complete', (state) => {
@@ -316,6 +322,7 @@ export class Engine extends EventEmitter<{
       })
       this.tuner.start()
     }
+    this.running = true
     log.info('engine running')
   }
 
@@ -348,6 +355,11 @@ export class Engine extends EventEmitter<{
   /** Alerts raised while starting, before a notifier listened; each is handed out once. */
   takeEarlyAlerts(): string[] {
     return this.earlyAlerts.splice(0)
+  }
+
+  /** Positions closed while starting, before a notifier listened; each is handed out once. */
+  takeEarlyClosed(): Position[] {
+    return this.earlyClosed.splice(0)
   }
 
   // Stream handling -----------------------------------------------------------

@@ -257,12 +257,17 @@ describe('AutoTuner', () => {
     for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true })
   })
 
-  /** Recorded launches: the newest 30% under the .env settings, as the recorder stamps them. */
+  /**
+   * Recorded launches: the newest 30% under the .env settings, as the recorder
+   * stamps them. Without the edge gate unless a test asks for it: these tests
+   * are about adoption, probation and rollback.
+   */
   async function setup(over: Record<string, string> = {}) {
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
     dirs.push(dir)
     const env = {
       ...BASE_ENV,
+      REQUIRE_EDGE: 'false',
       DATA_DIR: dir,
       AUTOTUNE_MIN_LAUNCHES: '200',
       AUTOTUNE_MIN_HOURS: '10',
@@ -468,17 +473,62 @@ describe('AutoTuner', () => {
     expect(b.notices.some((n) => n.startsWith('warn: buying paused, still recording'))).toBe(true)
   })
 
-  it('searches with every check while data is still short', async () => {
+  it('searches with every check while data is still short (without the edge gate)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
     dirs.push(dir)
     await writeRecords(dir, dataset(100))
-    const env = { ...BASE_ENV, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    const env = { ...BASE_ENV, DATA_DIR: dir, REQUIRE_EDGE: 'false', AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
     const clock = { now: START + 9 * HOUR }
     const a = tuner(env, clock)
     await a.t.load()
     expect((await a.t.run('schedule')).decision).toBe('insufficient-data')
     clock.now += HOUR
     expect((await a.t.run('schedule')).decision).toBe('insufficient-data') // not "next search in 6h"
+    await a.t.stop()
+  })
+
+  it('never replaces settings that are still collecting their forward proof, so the gate can open', async () => {
+    // Strict settings that never trade: unproven, so exploration adopts something that works.
+    const strict = { ENTRY_MODE: 'momentum', MOMENTUM_MIN_BUYERS: '30', MOMENTUM_MIN_NET_BUY_SOL: '20', REQUIRE_EDGE: 'true' }
+    const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
+    dirs.push(dir)
+    const env = { ...BASE_ENV, ...strict, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_PROBATION_TRADES: '3', AUTOTUNE_DAYS: '30' }
+    await writeRecords(dir, recordedUnder(momentumMarket(600), paramsFromConfig(loadConfig(env))))
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    expect((await a.t.run()).reason).toMatch(/^exploration/)
+    const adopted = paramsFromConfig(a.cfg)
+    expect(a.t.tradingGate().allowed).toBe(false)
+
+    // Every cycle a search falls due, and new launches arrive under the adopted settings.
+    let from = START + 51 * HOUR
+    const reasons: string[] = []
+    for (let cycle = 0; cycle < 3; cycle++) {
+      await writeRecords(dir, recordedUnder(momentumMarket(30, from), adopted, 1))
+      from += 30 * 300_000
+      clock.now += 7 * HOUR
+      reasons.push((await a.t.run('schedule')).reason)
+      // Kept: replacing them would restart their forward clock.
+      expect(paramsKey(paramsFromConfig(a.cfg))).toBe(paramsKey(adopted))
+    }
+    expect(reasons.some((r) => /^no search while the settings in effect collect their forward proof \(collecting forward data: \d+\/12 trades/.test(r))).toBe(true)
+    expect(a.t.status().adoptions).toHaveLength(1)
+    // 90 launches over seven hours under them, with enough trades, and they make money: trading starts.
+    expect(a.t.status().edge.status).toBe('proven')
+    expect(a.t.tradingGate().allowed).toBe(true)
+  })
+
+  it('shows why it does not search while the forward proof is being collected', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
+    dirs.push(dir)
+    await writeRecords(dir, dataset(100))
+    const env = { ...BASE_ENV, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    const a = tuner(env, { now: START + 9 * HOUR })
+    await a.t.load()
+    const run = await a.t.run('schedule')
+    expect(run.decision).toBe('skipped')
+    expect(run.reason).toMatch(/^no search while the settings in effect collect their forward proof \(collecting forward data: 0 launches/)
     expect(a.t.tradingGate().reason).toMatch(/collecting forward data/)
     await a.t.stop()
   })
@@ -496,26 +546,32 @@ describe('AutoTuner', () => {
     expect(a.t.status().edge.status).toBe('unproven')
   })
 
-  it('trades on adopted settings only once launches recorded under them prove it, and re-checks after a revert', async () => {
-    const { dir, env } = await setup()
+  it('shadow-tests a paper candidate while the settings in effect make money, so trading never stops', async () => {
+    const { dir, env } = await setup({ REQUIRE_EDGE: 'true' })
     const clock = { now: START + 51 * HOUR }
     const a = tuner(env, clock)
     await a.t.load()
-    expect((await a.t.run()).decision).toBe('adopt')
-    // Its search result is no proof: nothing was recorded under the adopted settings yet.
-    expect(a.t.status().edge.status).toBe('insufficient-data')
-    expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/collecting forward data/) })
-
-    // Launches recorded under them, and they make money: now it trades.
-    await writeRecords(dir, launchesUnder(paramsFromConfig(a.cfg), 80, clock.now))
-    clock.now += 5 * HOUR
-    await a.t.run()
-    expect(a.t.status().edge.status).toBe('proven')
+    const before = paramsFromConfig(a.cfg)
+    const found = await a.t.run()
+    expect(found.decision).toBe('adopt')
+    expect(found.reason).toMatch(/shadow test started/)
+    expect(paramsKey(paramsFromConfig(a.cfg))).toBe(paramsKey(before)) // still trading the proven settings
     expect(a.t.tradingGate().allowed).toBe(true)
+    expect(a.notices.some((n) => /shadow-testing .* before trading it \(/.test(n))).toBe(true)
+
+    // The candidate does better on the next launches: adopted, and the shadow test is its forward proof.
+    await writeRecords(dir, launchesUnder(before, 80, clock.now))
+    clock.now += 5 * HOUR
+    expect((await a.t.run()).probation?.status).toBe('passed')
+    expect(paramsKey(paramsFromConfig(a.cfg))).not.toBe(paramsKey(before))
+    expect(a.t.status().edge).toMatchObject({ status: 'proven', allowed: true })
+    expect(a.t.sizeFactor()).toBe(1) // paper: no reduced stake
+
+    // Back to the .env settings by hand: they need their own proof before trading again.
     await a.t.revert()
     expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/checking/) })
     await a.t.run()
-    expect(a.t.tradingGate().allowed).toBe(true) // the .env settings also make money on this data
+    expect(a.t.tradingGate().allowed).toBe(true) // recorded under them, and they make money
   })
 
   it('live: shadow-tests a candidate first, then trades it at reduced size until probation passes', async () => {
@@ -558,7 +614,7 @@ describe('AutoTuner', () => {
   })
 
   it('live: a candidate that fails its shadow test is never traded', async () => {
-    const { dir, env } = await setup({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]' })
+    const { dir, env } = await setup({ AUTOTUNE: 'live', DRY_RUN: 'false', PRIVATE_KEY: '[1]', REQUIRE_EDGE: 'true' })
     const clock = { now: START + 51 * HOUR }
     const a = tuner(env, clock)
     await a.t.load()
@@ -584,8 +640,9 @@ describe('AutoTuner', () => {
     const strict = { ENTRY_MODE: 'momentum', MOMENTUM_MIN_BUYERS: '30', MOMENTUM_MIN_NET_BUY_SOL: '20', REQUIRE_EDGE: 'true' }
     const dir = await mkdtemp(join(tmpdir(), 'autotune-'))
     dirs.push(dir)
-    await writeRecords(dir, momentumMarket(600))
     const env = { ...BASE_ENV, ...strict, DATA_DIR: dir, AUTOTUNE_MIN_LAUNCHES: '200', AUTOTUNE_MIN_HOURS: '10', AUTOTUNE_MIN_TRADES: '30', AUTOTUNE_DAYS: '30' }
+    // Recorded under these settings long enough for a verdict: they never trade, so unproven.
+    await writeRecords(dir, recordedUnder(momentumMarket(600), paramsFromConfig(loadConfig(env))))
     const a = tuner(env, { now: START + 51 * HOUR })
     await a.t.load()
     expect(a.t.tradingGate().allowed).toBe(false)

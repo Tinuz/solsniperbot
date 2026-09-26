@@ -102,6 +102,10 @@ export interface Position {
   nextResolveAt?: number
   /** Failed sell rounds in a row (the owner hears about a stuck exit). */
   sellFailures?: number
+  /** Failed on-chain checks in a row while pending (the owner hears about it). */
+  resolveFailures?: number
+  /** Landed transactions whose exact wallet change is not booked yet (retried after a restart). */
+  unreconciled?: string[]
   /** Why this position's P&L stays an estimate even once reconciled (a sale the bot did not see). */
   estimated?: string
 }
@@ -118,6 +122,8 @@ export interface PositionStats {
 
 /** Failed sell rounds in a row before the owner is alerted. */
 const STUCK_ALERT_ROUNDS = 3
+/** Failed on-chain checks of a pending position (one every 10 s) before the owner is alerted. */
+const UNSETTLED_ALERT_TRIES = 6
 /** Without a known transaction, a restored buy that has not shown up by then never will. */
 const UNKNOWN_TX_MS = 120_000
 
@@ -129,6 +135,8 @@ export function positionPnl(p: Position): bigint {
 
 interface Deps {
   cfg: Config
+  /** How long to wait before checking a pending position on-chain again after an RPC error (default 10 s). */
+  retryMs?: number
   executor: Executor
   market: MarketBook
   protocol: PumpProtocol
@@ -338,7 +346,8 @@ export class PositionManager extends EventEmitter<{
       onSubmit: (signature, lastValidBlockHeight) => {
         if (side === 'buy') pos.buySignature = signature
         pos.pending = { side, signature, lastValidBlockHeight, ...sale, since: Date.now() }
-        this.store.schedule()
+        // Written now, not debounced: a hard kill right after sending must not lose the signature.
+        void this.store.flush()
       },
     }
   }
@@ -356,7 +365,7 @@ export class PositionManager extends EventEmitter<{
     pos.timings = r.timings
     pos.simulation = r.simulation
     pos.lastPriceAt = Date.now()
-    if (!pos.paper && r.signature) this.markLanded(pos)
+    if (!pos.paper && r.signature) this.markLanded(pos, r.signature)
     if (pos.tokensHeld === 0n) {
       pos.status = 'failed'
       pos.error = 'buy landed but token balance could not be determined; check the wallet manually'
@@ -646,8 +655,7 @@ export class PositionManager extends EventEmitter<{
         const r = await this.d.executor.closeTokenAccount(new PublicKey(pos.mint), new PublicKey(pos.tokenProgram))
         if (r.ok) {
           this.d.log.info({ mint: pos.mint, symbol: pos.symbol, signature: r.signature }, 'closed the empty token account')
-          this.markLanded(pos)
-          void this.reconcile(pos, r.signature)
+          this.landedFailure(pos, r.signature)
           return
         }
         if (r.error !== 'the account still holds tokens') return
@@ -667,7 +675,7 @@ export class PositionManager extends EventEmitter<{
     pos.realizedLamports += lamports
     pos.networkFeesLamports += r.networkFeeLamports
     pos.sells.push({ at: Date.now(), tokens, lamports, signature: r.signature, reason })
-    if (!r.paper && r.signature) this.markLanded(pos)
+    if (!r.paper && r.signature) this.markLanded(pos, r.signature)
     if (tier !== undefined) pos.tiersDone = tier + 1
     pos.error = undefined
     this.d.log.info({ mint: pos.mint, symbol: pos.symbol, reason, sol: lamportsToSol(lamports), tokens: Number(tokens) / 1e6, paper: pos.paper }, 'sold')
@@ -723,14 +731,16 @@ export class PositionManager extends EventEmitter<{
 
   /** A transaction that executed and failed still moved the wallet (its fees): reconcile it like any other. */
   private landedFailure(pos: Position, signature: string): void {
-    this.markLanded(pos)
+    this.markLanded(pos, signature)
     void this.reconcile(pos, signature)
   }
 
   /** A new landed tx makes the wallet delta incomplete until it is reconciled too. */
-  private markLanded(pos: Position): void {
+  private markLanded(pos: Position, signature: string): void {
+    if (pos.unreconciled?.includes(signature)) return
     pos.landedTxs++
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
+    pos.unreconciled = [...(pos.unreconciled ?? []), signature]
   }
 
   /**
@@ -744,7 +754,10 @@ export class PositionManager extends EventEmitter<{
       this.d.log.warn({ mint: pos.mint, signature }, 'could not reconcile transaction; P&L stays estimated')
       return
     }
+    // Checked again: a restart may have retried it while this one was still waiting.
+    if (!pos.unreconciled?.includes(signature)) return
     pos.walletDeltaLamports = (pos.walletDeltaLamports ?? 0n) + delta
+    pos.unreconciled = pos.unreconciled.filter((s) => s !== signature)
     pos.reconciledTxs++
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     if (pos.reconciled && pos.bookedPnlLamports !== undefined) {
@@ -793,7 +806,7 @@ export class PositionManager extends EventEmitter<{
   private async restore(): Promise<void> {
     const saved = await readJson<Record<string, unknown>[]>(join(this.d.cfg.dataDir, 'positions.json'))
     if (!saved?.length) return
-    const toCheck: Position[] = []
+    const restored: Position[] = []
     for (const raw of saved) {
       const pos = reviveBigints(raw) as unknown as Position
       if (pos.paper !== this.d.executor.paper) {
@@ -809,9 +822,12 @@ export class PositionManager extends EventEmitter<{
       pos.status = pos.pending?.side === 'buy' ? 'opening' : 'open'
       pos.nextSellAt = 0
       pos.nextResolveAt = 0
-      await this.seedCurve(pos)
+      restored.push(pos)
+    }
+    // All at once: a slow RPC must not stretch the start by the number of positions.
+    await Promise.all(restored.map((pos) => this.seedCurve(pos)))
+    for (const pos of restored) {
       this.active.set(pos.mint, pos)
-      if (pos.pending) toCheck.push(pos)
       this.d.log.info({ mint: pos.mint, symbol: pos.symbol, check: pos.pending?.side }, 'restored position')
     }
     if (this.foreign.length) {
@@ -821,7 +837,9 @@ export class PositionManager extends EventEmitter<{
         `⚠️ ${this.foreign.length} ${mode} position(s)${bags ? ` (${bags} moonbag(s))` : ''} from before DRY_RUN changed are kept but not managed; switch back to manage them.`,
       )
     }
-    for (const pos of toCheck) await this.resolve(pos)
+    await Promise.all(restored.filter((pos) => pos.pending).map((pos) => this.resolve(pos)))
+    // Reconciliations the last stop cut off.
+    for (const pos of restored) if (!pos.paper) for (const sig of pos.unreconciled ?? []) void this.reconcile(pos, sig)
   }
 
   private async seedCurve(pos: Position): Promise<void> {
@@ -840,9 +858,15 @@ export class PositionManager extends EventEmitter<{
     this.busy.add(pos.mint)
     try {
       await this.track(this.settle(pos, p))
+      if ((pos.resolveFailures ?? 0) >= UNSETTLED_ALERT_TRIES) this.alert(`✅ ${pos.symbol}: checked on-chain again; managed as usual`)
+      pos.resolveFailures = 0
     } catch (err) {
-      pos.nextResolveAt = Date.now() + 10_000
-      this.d.log.warn({ mint: pos.mint, err: (err as Error).message }, 'could not check the position on-chain yet; retrying')
+      pos.nextResolveAt = Date.now() + (this.d.retryMs ?? 10_000)
+      pos.resolveFailures = (pos.resolveFailures ?? 0) + 1
+      this.d.log.warn({ mint: pos.mint, err: (err as Error).message, tries: pos.resolveFailures }, 'could not check the position on-chain yet; retrying')
+      if (pos.resolveFailures === UNSETTLED_ALERT_TRIES) {
+        this.alert(`⚠️ ${pos.symbol}: cannot check this position on-chain (${(err as Error).message}); it is not traded until it can, so no stop-loss meanwhile. Retrying every 10 s.`)
+      }
     } finally {
       this.busy.delete(pos.mint)
     }

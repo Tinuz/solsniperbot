@@ -337,7 +337,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const o = this.cfg.autotune
     const current = paramsFromConfig(this.cfg)
     const probationAdoption = this.adopts && st.probation ? this.adoption(st.probation.adoptionId) : undefined
-    const shadow = this.live && !probationAdoption ? st.shadow : undefined
+    const shadow = !probationAdoption ? st.shadow : undefined
     const coolingDown = (st.cooldownUntil ?? 0) > at
     // Hourly checks are cheap; the search itself runs every AUTOTUNE_INTERVAL_HOURS,
     // or with every check while data is still short (then it returns at once).
@@ -366,6 +366,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? { adopted: shadow.to, previous: shadow.from, since: shadow.since, neededTrades: shadow.neededTrades }
           : undefined,
       edge: o.requireEdge,
+      waitForVerdict: o.requireEdge,
       currentSince: st.forwardSince?.key === paramsKey(current) ? st.forwardSince.since : undefined,
       explore: this.mayExplore() ? { budgetMs: EXPLORE_BUDGET_MS } : undefined,
       now: at,
@@ -625,7 +626,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? 'autotune off: edge check only'
           : coolingDown
             ? `cooling down until ${iso(st.cooldownUntil ?? at)} (${st.cooldownReason ?? ''})`
-            : `next search after ${iso((st.lastProposalAt ?? at) + o.intervalMs)}`
+            : res.collecting
+              ? `no search while the settings in effect collect their forward proof (${res.edge?.reason ?? ''})`
+              : `next search after ${iso((st.lastProposalAt ?? at) + o.intervalMs)}`
       return { ...base, decision: 'skipped', reason, changes: [], gates: [] }
     }
     st.lastProposalAt = at
@@ -687,11 +690,13 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       currentLamports: metrics.current.test.totalPnlLamports,
       candidateLamports: metrics.candidate?.test.totalPnlLamports ?? 0,
     }
-    if (this.live) {
-      // Real money: first prove it forward on launches nobody has seen yet, without trading it.
+    // Real money, or paper settings that are making money right now: first prove the
+    // candidate forward on launches nobody has seen yet, without trading it. Paper
+    // trading goes on meanwhile, and the shadow test becomes the candidate's forward proof.
+    if (this.live || (this.cfg.autotune.requireEdge && res.edge?.status === 'proven')) {
       st.shadow = { since: at, neededTrades: this.cfg.autotune.probationTrades, from: job.current, to: p.candidate, changes: p.changes, test }
       void this.journal.append({ type: 'shadow', at, changes: p.changes, test })
-      this.notice('info', `autotune: shadow-testing ${describe(p.changes)} on new launches before trading it live (${this.cfg.autotune.probationTrades} trades)`)
+      this.notice('info', `autotune: shadow-testing ${describe(p.changes)} on new launches before trading it${this.live ? ' live' : ''} (${this.cfg.autotune.probationTrades} trades)`)
       out.reason = `all ${out.gates.length} gates passed; shadow test started`
       if (this.timer) this.schedule(this.intervalMs())
       return out
@@ -789,7 +794,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const lines: string[] = [
       '# Autotune report',
       '',
-      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.live ? ' (adopts in LIVE trading after a shadow test, at reduced size during probation)' : this.adopts ? ' (adopts automatically, paper only)' : ' (proposes only)'}.`,
+      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.live ? ' (adopts in LIVE trading after a shadow test, at reduced size during probation)' : this.adopts ? ' (adopts automatically, paper only; after a shadow test while the settings in effect make money)' : ' (proposes only)'}.`,
       '',
     ]
     if (this.cfg.autotune.requireEdge) {

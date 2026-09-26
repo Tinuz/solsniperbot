@@ -25,6 +25,13 @@ export interface TuningJob {
   /** Launches since then count as forward data for the settings in effect (a shadow-tested candidate). */
   currentSince?: number
   /**
+   * With the edge gate: settings still collecting their forward proof are not
+   * replaced (no search), or their clock would restart with every adoption
+   * and the gate might never open. The search resumes once they have a
+   * verdict, proven or unproven.
+   */
+  waitForVerdict?: boolean
+  /**
    * While the bot is not trading: if the nearby search finds nothing to
    * adopt, search the whole bounded space (see `searchStrategies`).
    */
@@ -38,6 +45,8 @@ export interface TuningJobResult {
   proposal?: TuningResult
   /** Edge of the settings in effect. */
   edge?: EdgeResult
+  /** No search: the settings in effect are still collecting their forward proof. */
+  collecting?: boolean
   exploration?: StrategySearchResult
   /** Edge of the adopted candidate, for when the proposal (or exploration) is adopted. */
   candidateEdge?: EdgeResult
@@ -65,7 +74,9 @@ export async function runTuningJob(job: TuningJob): Promise<TuningJobResult> {
     // from the launches since it was picked (recorded under the settings it would replace).
     if (job.edge && out.probation.status === 'passed' && paramsKey(p.adopted) !== paramsKey(job.current)) out.candidateEdge = edge(p.adopted, p.since)
   }
-  if (job.propose) {
+  if (job.edge) out.edge = edge(job.current, job.currentSince)
+  out.collecting = job.waitForVerdict === true && out.edge?.status === 'insufficient-data'
+  if (job.propose && !out.collecting) {
     out.proposal = proposeTuning(records, job.cfg, job.current, job.options, job.now)
     if (job.edge && out.proposal.decision === 'adopt' && out.proposal.candidate) out.candidateEdge = edge(out.proposal.candidate)
     const nearbyFailed = out.proposal.decision === 'reject' || out.proposal.decision === 'no-improvement'
@@ -81,7 +92,6 @@ export async function runTuningJob(job: TuningJob): Promise<TuningJobResult> {
       if (job.edge && out.exploration.decision === 'found' && out.exploration.best) out.candidateEdge = edge(out.exploration.best.params)
     }
   }
-  if (job.edge) out.edge = edge(job.current, job.currentSince)
   out.ms = performance.now() - started
   return out
 }

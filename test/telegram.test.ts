@@ -100,12 +100,14 @@ function fakeEngine(env: Record<string, string>, dir = tmp()) {
     },
   }
   const open: Position[] = []
+  const earlyClosed: Position[] = []
   const sold: string[] = []
   const vitals = { equitySol: 1.0 as number | null }
   engine.cfg = cfg
   engine.survival = { paperRealizedLamports: 0n }
   engine.risk = riskManager
   engine.takeEarlyAlerts = () => []
+  engine.takeEarlyClosed = () => earlyClosed.splice(0)
   engine.positions = {
     list: () => open,
     history: () => [],
@@ -123,7 +125,7 @@ function fakeEngine(env: Record<string, string>, dir = tmp()) {
     recorder: { written: 18_849 },
     usage: { streamedMbPerDay: 900, heliusCreditsPerDay: null },
   })
-  return { engine: engine as unknown as Engine, cfg, risk, riskManager, open, sold, vitals, dir }
+  return { engine: engine as unknown as Engine, cfg, risk, riskManager, open, earlyClosed, sold, vitals, dir }
 }
 
 async function started(env: Record<string, string>, clock: { now: number }, dir?: string) {
@@ -215,6 +217,17 @@ describe('trade ledger', () => {
 })
 
 describe('digest and highlights', () => {
+  it('counts trades the engine closed while starting (settled on-chain) before the reporter listened', async () => {
+    const tg = await fakeTelegram()
+    const f = fakeEngine({ TELEGRAM_API_URL: tg.url, NOTIFY_DIGEST_HOURS: '0', NOTIFY_TRADES: 'true' })
+    f.earlyClosed.push(position({ mint: 'GONE', symbol: 'GONE', status: 'closed', closedAt: NOON - 60_000, openedAt: NOON - 600_000, realizedLamports: 70_000_000n, tokensHeld: 0n, valueLamports: 0n, closeReason: 'dev sold (found on-chain)' }))
+    const r = new Reporter(f.engine, log, () => NOON)
+    await r.start()
+    closers.push(() => r.stop('SIGTERM'))
+    expect(r.todayText()).toContain('Trades: 1 trade · 100% winst · +0,0200 SOL')
+    await waitFor(() => tg.texts().some((t) => t.includes('🟢 GONE +0,0200 SOL')))
+  })
+
   it('sends a digest on the local clock, with the forward-test check', async () => {
     const clock = { now: NOON - 5 * 60_000 }
     const { tg, r, engine, open } = await started({ NOTIFY_COMMANDS: 'false', NOTIFY_DIGEST_HOURS: '6' }, clock)

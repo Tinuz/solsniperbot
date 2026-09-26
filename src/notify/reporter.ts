@@ -192,6 +192,8 @@ export class Reporter {
     this.send(`▶️ Gestart${restarts ? ` (herstart #${restarts})` : ''} · ${tradingLine(this.engine.status())}${cfg.notify.commands ? '\nTyp /help voor de commando’s.' : ''}`)
     // Raised while the engine started (restored positions, a pause still in force), before we listened.
     for (const m of this.engine.takeEarlyAlerts()) this.send(m)
+    // Closed while the engine settled restored positions on-chain: they belong in the ledger too.
+    for (const p of this.engine.takeEarlyClosed()) this.onClosed(p)
     this.timer = setInterval(() => void this.tick(), 60_000)
     this.timer.unref()
     if (cfg.notify.commands && cfg.notify.telegram) {
