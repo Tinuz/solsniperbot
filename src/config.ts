@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { minViableBuyLamports } from './trading/fees.js'
 
 // Env parsing helpers -----------------------------------------------------------
 
@@ -468,7 +469,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('Live trading (DRY_RUN=false) requires PRIVATE_KEY or KEYPAIR_PATH')
   }
 
-  return {
+  const cfg: Config = {
     rpcUrl: e.RPC_URL,
     wsUrl: e.WS_URL ?? deriveWsUrl(e.RPC_URL),
     sendRpcUrls: e.SEND_RPC_URLS,
@@ -616,6 +617,21 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     dataDir: e.DATA_DIR,
     logLevel: e.LOG_LEVEL,
   }
+
+  // BUY_SOL is the most a trade may be: it must be large enough that the
+  // round-trip fees, at their worst, stay under MAX_FEE_DRAG_PCT of it.
+  const minViable = minViableBuyLamports(cfg)
+  if (minViable > cfg.buyLamports) {
+    const worst = e.PRIORITY_FEE_MODE === 'dynamic' ? ` (dynamic priority fees counted at PRIORITY_FEE_MAX_SOL=${e.PRIORITY_FEE_MAX_SOL})` : ''
+    throw new Error(
+      `BUY_SOL=${e.BUY_SOL} is below the smallest trade worth its fees, ${lamportsToSol(minViable).toFixed(4)} SOL: round-trip tips and priority fees${worst} must stay under MAX_FEE_DRAG_PCT=${e.MAX_FEE_DRAG_PCT}% of a trade. Raise BUY_SOL, lower the fees, or raise MAX_FEE_DRAG_PCT.`,
+    )
+  }
+  // The edge gate needs AUTOTUNE_MIN_HOURS of forward data inside the AUTOTUNE_DAYS it loads.
+  if ((cfg.autotune.requireEdge || cfg.autotune.mode !== 'off') && cfg.autotune.minHours > cfg.autotune.days * 24) {
+    throw new Error(`AUTOTUNE_MIN_HOURS=${e.AUTOTUNE_MIN_HOURS} can never be reached with AUTOTUNE_DAYS=${e.AUTOTUNE_DAYS} of data: raise AUTOTUNE_DAYS or lower AUTOTUNE_MIN_HOURS`)
+  }
+  return cfg
 }
 
 /** Config with secrets stripped, safe to log or expose on the API. */

@@ -174,6 +174,8 @@ export class PositionManager extends EventEmitter<{
   private readonly inflight = new Set<Promise<unknown>>()
   /** The other mode's positions (DRY_RUN switched): kept in the file untouched, not managed. */
   private foreign: unknown[] = []
+  /** Finished live positions whose last transactions are not reconciled yet: saved, so a restart finishes them. */
+  private readonly settling = new Map<string, Position>()
   private stopping = false
   private readonly journal: Journal
   private readonly store: DebouncedWriter
@@ -192,7 +194,7 @@ export class PositionManager extends EventEmitter<{
     super()
     const onError = (err: unknown) => d.log.error({ err }, 'failed to persist positions')
     this.journal = new Journal(join(d.cfg.dataDir, 'trades.jsonl'), onError)
-    this.store = new DebouncedWriter(join(d.cfg.dataDir, 'positions.json'), () => [...this.active.values(), ...this.foreign], 200, onError)
+    this.store = new DebouncedWriter(join(d.cfg.dataDir, 'positions.json'), () => [...this.active.values(), ...this.settling.values(), ...this.foreign], 200, onError)
   }
 
   // Lifecycle -----------------------------------------------------------------
@@ -723,6 +725,7 @@ export class PositionManager extends EventEmitter<{
         void this.journal.append({ type: 'close', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, reason: pos.closeReason, pnlLamports: pnl, cost: pos.costLamports, realized: pos.realizedLamports, networkFees: pos.networkFeesLamports })
       }
     }
+    if (!pos.paper && pos.unreconciled?.length) this.keepSettling(pos)
     this.store.schedule()
     this.emit('closed', pos)
   }
@@ -741,6 +744,13 @@ export class PositionManager extends EventEmitter<{
     pos.landedTxs++
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     pos.unreconciled = [...(pos.unreconciled ?? []), signature]
+    if (isFinished(pos)) this.keepSettling(pos)
+  }
+
+  /** A finished position stays in the file until its last transactions are reconciled. */
+  private keepSettling(pos: Position): void {
+    this.settling.set(settlingKey(pos), pos)
+    this.store.schedule()
   }
 
   /**
@@ -759,6 +769,7 @@ export class PositionManager extends EventEmitter<{
     pos.walletDeltaLamports = (pos.walletDeltaLamports ?? 0n) + delta
     pos.unreconciled = pos.unreconciled.filter((s) => s !== signature)
     pos.reconciledTxs++
+    if (!pos.unreconciled.length && this.settling.delete(settlingKey(pos))) this.store.schedule()
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     if (pos.reconciled && pos.bookedPnlLamports !== undefined) {
       const exact = positionPnl(pos)
@@ -811,6 +822,14 @@ export class PositionManager extends EventEmitter<{
       const pos = reviveBigints(raw) as unknown as Position
       if (pos.paper !== this.d.executor.paper) {
         this.foreign.push(raw)
+        continue
+      }
+      if (isFinished(pos)) {
+        // Closed before the stop, its last reconciliations cut off: finish them.
+        if (!pos.paper && pos.unreconciled?.length) {
+          this.settling.set(settlingKey(pos), pos)
+          for (const sig of pos.unreconciled) void this.reconcile(pos, sig)
+        }
         continue
       }
       if (pos.paper) {
@@ -922,6 +941,9 @@ export class PositionManager extends EventEmitter<{
     this.bookMissing(pos, pos.tokensHeld - balance, sold ? p.signature : undefined, p.reason ?? 'sold before the restart', sold ? p.tier : undefined, sold ? p.moonbag : false)
   }
 }
+
+const isFinished = (p: Position) => p.status === 'closed' || p.status === 'failed'
+const settlingKey = (p: Position) => `${p.mint}:${p.openedAt}`
 
 const BIGINT_FIELDS = new Set([
   'costLamports',

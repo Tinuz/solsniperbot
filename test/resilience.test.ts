@@ -9,6 +9,7 @@ import { GrpcFeed } from '../src/feed/grpc-feed.js'
 import { replayConfigFrom } from '../src/learning/replay.js'
 import { type WalletEntry, WalletBook, annotateSmartBuyers } from '../src/learning/wallets.js'
 import { RiskManager } from '../src/strategy/risk.js'
+import { Survival } from '../src/strategy/survival.js'
 import { Executor } from '../src/trading/executor.js'
 import { txNetworkLamports } from '../src/trading/fees.js'
 import { writeJsonAtomic } from '../src/util/persist.js'
@@ -197,10 +198,37 @@ describe('smart-money window', () => {
 describe('fees', () => {
   it('judges strategies on the most dynamic priority fees can cost, and books what a trade really paid', () => {
     const fixed = loadConfig({ RPC_URL: 'https://rpc.example.com', LANDING: 'rpc', PRIORITY_FEE_SOL: '0.0005' })
-    const dynamic = loadConfig({ RPC_URL: 'https://rpc.example.com', LANDING: 'rpc', PRIORITY_FEE_SOL: '0.0005', PRIORITY_FEE_MODE: 'dynamic', PRIORITY_FEE_MAX_SOL: '0.003' })
+    const dynamic = loadConfig({ RPC_URL: 'https://rpc.example.com', LANDING: 'rpc', PRIORITY_FEE_SOL: '0.0005', PRIORITY_FEE_MODE: 'dynamic', PRIORITY_FEE_MAX_SOL: '0.003', BUY_SOL: '0.1' })
     expect(replayConfigFrom(fixed).buyNetworkLamports).toBe(505_000)
     expect(replayConfigFrom(dynamic).buyNetworkLamports).toBe(3_005_000)
-    expect(txNetworkLamports(dynamic, 'buy')).toBe(505_000n) // survival sizes on the floor
+    expect(txNetworkLamports(dynamic, 'buy')).toBe(505_000n) // the floor: what a quiet network costs
+  })
+
+  it('never trades above BUY_SOL: a BUY_SOL too small for the fees at their worst is refused at startup', () => {
+    const base = { RPC_URL: 'https://rpc.example.com' }
+    // Dynamic fees at the default cap make a round trip cost ~0.012 SOL: 0.05 SOL trades would lose 24% to fees.
+    expect(() => loadConfig({ ...base, PRIORITY_FEE_MODE: 'dynamic' })).toThrow(/BUY_SOL=0.05 is below the smallest trade worth its fees, 0\.1201 SOL.*PRIORITY_FEE_MAX_SOL=0.005/)
+    expect(() => loadConfig({ ...base, BUY_SOL: '0.02' })).toThrow(/BUY_SOL=0.02 is below the smallest trade worth its fees, 0\.0281 SOL/)
+    expect(loadConfig({ ...base, PRIORITY_FEE_MODE: 'dynamic', PRIORITY_FEE_MAX_SOL: '0.001' }).buyLamports).toBe(50_000_000n)
+
+    // However big the wallet, however the size is computed: never more than BUY_SOL.
+    const live = { ...base, DRY_RUN: 'false', PRIVATE_KEY: '[1]', BUY_SOL: '0.05', DATA_DIR: tmp() }
+    for (const env of [live, { ...live, SIZING: 'fraction', BUY_FRACTION_PCT: '50' }]) {
+      const cfg = loadConfig(env)
+      const v = new Survival(cfg, log).compute({ walletLamports: 100_000_000_000n, open: [] })
+      expect(v.nextBuyLamports).toBe(50_000_000n)
+    }
+    // A small bankroll trades the smallest viable size, still within BUY_SOL.
+    const small = new Survival(loadConfig({ ...live, SIZING: 'fraction', BUY_FRACTION_PCT: '1' }), log).compute({ walletLamports: 1_000_000_000n, open: [] })
+    expect(small.nextBuyLamports).toBe(small.minViableBuyLamports)
+    expect(small.nextBuyLamports <= 50_000_000n).toBe(true)
+  })
+
+  it('refuses an edge proof that could never be reached with the data it loads', () => {
+    const base = { RPC_URL: 'https://rpc.example.com', RECORD_LAUNCHES: 'true' }
+    expect(() => loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '96' })).toThrow(/AUTOTUNE_MIN_HOURS=96 can never be reached with AUTOTUNE_DAYS=3/)
+    expect(loadConfig({ ...base, AUTOTUNE_DAYS: '3', AUTOTUNE_MIN_HOURS: '72' }).autotune.minHours).toBe(72)
+    expect(loadConfig({ ...base, AUTOTUNE: 'off', REQUIRE_EDGE: 'false', AUTOTUNE_DAYS: '1', AUTOTUNE_MIN_HOURS: '96' }).autotune.days).toBe(1)
   })
 })
 

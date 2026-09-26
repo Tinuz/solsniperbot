@@ -136,9 +136,12 @@ export class Engine extends EventEmitter<{
   private readonly feedProblemAt = new Map<string, number>()
   /** Alerts raised before anyone listened (while starting), kept for the notifier. */
   private readonly earlyAlerts: string[] = []
-  /** Positions closed while starting (settled on-chain), for the notifier's ledger. */
-  private readonly earlyClosed: Position[] = []
-  private running = false
+  /**
+   * Positions closed, and corrections booked, before the notifier listened
+   * (while settling restored positions on-chain), kept until it takes them.
+   */
+  private earlyClosed: Position[] | undefined = []
+  private earlyReconciled: [Position, bigint][] | undefined = []
   private stopping = false
   /** Fingerprint of the strategy settings, recomputed only when the tuner changes them. */
   private settingsFp = { version: -1, value: '' }
@@ -201,12 +204,13 @@ export class Engine extends EventEmitter<{
       this.costs.bookClosed(p)
       this.recorder?.position(p)
       this.emit('event', { type: 'closed', data: p })
-      if (!this.running && this.earlyClosed.length < 100) this.earlyClosed.push(p)
+      if (this.earlyClosed && this.earlyClosed.length < 100) this.earlyClosed.push(p)
       if (!cfg.dryRun) void this.refreshBalance()
     })
     this.positions.on('reconciled', (p, correction) => {
       this.costs.bookCorrection(correction)
       this.emit('reconciled', p, correction)
+      if (this.earlyReconciled && this.earlyReconciled.length < 100) this.earlyReconciled.push([p, correction])
     })
 
     if (cfg.recorder.enabled) {
@@ -322,7 +326,6 @@ export class Engine extends EventEmitter<{
       })
       this.tuner.start()
     }
-    this.running = true
     log.info('engine running')
   }
 
@@ -357,9 +360,15 @@ export class Engine extends EventEmitter<{
     return this.earlyAlerts.splice(0)
   }
 
-  /** Positions closed while starting, before a notifier listened; each is handed out once. */
-  takeEarlyClosed(): Position[] {
-    return this.earlyClosed.splice(0)
+  /**
+   * Positions closed before a notifier listened, and the corrections booked
+   * meanwhile; handed out once, after which nothing more is kept.
+   */
+  takeEarlyClosed(): { closed: Position[]; reconciled: [Position, bigint][] } {
+    const out = { closed: this.earlyClosed ?? [], reconciled: this.earlyReconciled ?? [] }
+    this.earlyClosed = undefined
+    this.earlyReconciled = undefined
+    return out
   }
 
   // Stream handling -----------------------------------------------------------

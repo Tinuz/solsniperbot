@@ -322,8 +322,10 @@ export interface EdgeResult {
 export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: TunableParams, o: TunerOptions, now = Date.now(), since?: number): EdgeResult {
   const fingerprint = settingsFingerprint(params)
   const frac = o.testFrac ?? 0.3
-  const { test: window } = splitByTime([...records].sort((a, b) => a.t - b.t), frac)
-  const sorted = window.filter((r) => r.settings === fingerprint || (since !== undefined && r.t >= since))
+  const all = [...records].sort((a, b) => a.t - b.t)
+  const { test: window } = splitByTime(all, frac)
+  const underThese = (r: LaunchRecord) => r.settings === fingerprint || (since !== undefined && r.t >= since)
+  const sorted = window.filter(underThese)
   const hours = sorted.length ? (sorted[sorted.length - 1]!.t - sorted[0]!.t) / 3_600_000 : 0
   const base = { at: now, settingsKey: paramsKey(params) }
   const needLaunches = Math.ceil(o.minLaunches * frac)
@@ -339,8 +341,11 @@ export function evaluateEdge(records: LaunchRecord[], cfg: Config, params: Tunab
   const recent = summarizeResults(results)
   // Too few trades so far is no verdict yet, until the settings had the full
   // AUTOTUNE_MIN_HOURS to make them (settings that hardly trade are unproven).
-  if (recent.trades < o.minTestTrades && hours < o.minHours) {
-    const detail = `${recent.trades}/${o.minTestTrades} trades in ${hours.toFixed(1)}h recorded under these settings`
+  // Counted from their first recording in all the loaded data, not just the window.
+  const first = all.find(underThese)
+  const inEffectHours = first ? (all[all.length - 1]!.t - first.t) / 3_600_000 : 0
+  if (recent.trades < o.minTestTrades && inEffectHours < o.minHours) {
+    const detail = `${recent.trades}/${o.minTestTrades} trades in ${inEffectHours.toFixed(1)}h recorded under these settings`
     return { ...base, recent, status: 'insufficient-data', reason: `collecting forward data: ${detail}`, gates: [dataGate, { name: 'enough trades', pass: false, detail }] }
   }
   const buy = Number(cfg.buyLamports)

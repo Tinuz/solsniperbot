@@ -59,16 +59,16 @@ Open positions are persisted in `data/positions.json` and resume monitoring afte
 
 **Stops and restarts never lose track of money.**
 - **Stopping.** The bot stops buying first, then gives buys and sells already in flight up to 10 seconds to land. One still in flight after that is saved with its signature as *pending*, never booked as failed, because it may still land.
-- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries every 10 seconds (the position isn't traded meanwhile, so after a minute you get an alert, and another when it recovers). Trades closed during this check reach every ledger, and reconciliations a stop cut off are finished.
+- **Starting.** Live positions are checked against the chain before they trade again. A pending buy that landed becomes an open position; one that expired is dropped without a loss. A pending sell that landed is booked with its exact on-chain result. Holdings that shrank while the bot was down (a crash right after a sale) are booked at the last price, and you get an alert to check the wallet. An RPC error during this check never counts as an empty wallet: the bot retries every 10 seconds (the position isn't traded meanwhile, so after a minute you get an alert, and another when it recovers). Trades closed during this check reach every ledger, and reconciliations a stop cut off are finished, also for trades that closed just before it (they stay in `positions.json` until then).
 - **Switching `DRY_RUN`.** The other mode's positions, live moonbags included, stay in the file untouched, and an alert says they are not managed until you switch back.
 
 ## Survival: the bot keeps itself alive
 
 The bot is built to protect its own bankroll. It sizes trades to what it can afford, and it stops itself before it bleeds a wallet dry.
 
-- **Sizing follows the bankroll.** With `SIZING=fixed` every trade is `BUY_SOL`. With `SIZING=fraction` every trade is `BUY_FRACTION_PCT` of the free balance, capped at `BUY_SOL`. In both modes a trade shrinks to what is affordable when funds run low.
+- **Sizing follows the bankroll.** With `SIZING=fixed` every trade is `BUY_SOL`. With `SIZING=fraction` every trade is `BUY_FRACTION_PCT` of the free balance, capped at `BUY_SOL`. In both modes a trade shrinks to what is affordable when funds run low, and never grows beyond `BUY_SOL`.
 - **An exit reserve is never spent.** `MIN_SOL_RESERVE` is kept back so open positions can always pay their sell fees.
-- **Trades that fees would eat are refused.** A trade must be large enough that tips and priority fees for the round trip stay under `MAX_FEE_DRAG_PCT` of it. With the defaults the minimum viable trade is ~0.028 SOL.
+- **Trades that fees would eat are refused.** A trade must be large enough that tips and priority fees for the round trip, at their worst, stay under `MAX_FEE_DRAG_PCT` of it. With the defaults the minimum viable trade is ~0.028 SOL; with `PRIORITY_FEE_MODE=dynamic` it is computed at `PRIORITY_FEE_MAX_SOL` (~0.12 SOL at the default cap). The bot refuses to start when `BUY_SOL` is below it, and names what to change.
 - **Defensive mode.** Once equity (balance plus open positions) falls `DEFENSIVE_DRAWDOWN_PCT` below its peak, trade size is halved until it recovers.
 - **Self-shutdown.** When the wallet can't fund a viable trade, the bot goes *critical* while open positions may still bring money back. Once it is flat and still short, it declares itself **dead**, records why in `data/survival-{paper,live}.json`, and exits with **code 3**. A wallet at 0 counts too.
 - **A dead bot stays dead.** On restart it refuses to run and prints how much SOL it needs. Top up the wallet (or set `PAPER_RESET=true` for paper mode) and it revives by itself. Under systemd use `RestartPreventExitStatus=3` so it isn't restarted in a loop.
@@ -336,7 +336,7 @@ Binding it anywhere else (`API_HOST=0.0.0.0`) requires `API_TOKEN`: the bot refu
 
 - **Colocate.** Run the bot in the same region as your RPC and landing endpoints (Frankfurt, Amsterdam, New York or Salt Lake City are common). Point `HELIUS_SENDER_URL` at the regional sender (e.g. `http://fra-sender.helius-rpc.com/fast`).
 - **Prefer gRPC** (`GRPC_URL`) over websockets if your provider offers it. Try `GRPC_DESHRED=true` if they support deshred.
-- **Dynamic priority fees** (`PRIORITY_FEE_MODE=dynamic`) pay up to `PRIORITY_FEE_MAX_SOL` in busy moments. Positions book the fee each transaction really paid. Replay, research, the edge gate and the survival checks (exit reserve, smallest viable trade, fee drag) assume the cap on every trade, so a strategy is never judged on fees cheaper than it may pay: keep the cap realistic.
+- **Dynamic priority fees** (`PRIORITY_FEE_MODE=dynamic`) pay up to `PRIORITY_FEE_MAX_SOL` in busy moments. Set the cap to fit your trade size: at `BUY_SOL=0.05` and the default 10% fee drag, the round trip at the cap must stay under 0.005 SOL (for example `PRIORITY_FEE_MAX_SOL=0.001` with the default tips), or the bot refuses to start. Positions book the fee each transaction really paid. Replay, research, the edge gate and the survival checks (exit reserve, smallest viable trade, fee drag) assume the cap on every trade, so a strategy is never judged on fees cheaper than it may pay: keep the cap realistic.
 - **Measure compute.** Run paper mode with `SIMULATE_DRY_RUN=true` and a funded wallet, then read `unitsConsumed` from `data/trades.jsonl`. Set `BUY_COMPUTE_UNITS` just above it: a lower limit at the same total fee means a higher per-CU price.
 - **Watch "Landed slots after launch"** on the dashboard. It's the metric that matters, and it moves with tip, priority fee and region.
 
@@ -384,7 +384,8 @@ npm run typecheck
 - **Edge gate**:
   - no buys (but full recording) until the settings are proven;
   - only launches recorded under the exact settings count (or, for a shadow-tested candidate, those since it was found): data from before, however profitable, never proves them, and neither does an adopted candidate's own search result;
-  - settings still collecting their proof are never replaced, over many search cycles, so the gate does open; while settings make money, a paper candidate is shadow-tested first and trading goes on;
+  - settings still collecting their proof are never replaced, over many search cycles, so the gate does open; while settings make money, a paper candidate is shadow-tested first and trading goes on; a shadow test is dropped when `.env` changes, and its start carries over a restart but never to other settings;
+  - settings that hardly trade get `AUTOTUNE_MIN_HOURS` in effect, counted over all loaded data, before they are called unproven;
   - the proof is per exact settings, restored after restart, stale after 3h, and withdrawn when the market turns;
   - operating costs must be covered, with sampled data scaled up.
 - **Money across stops and restarts** (live, mock chain):
@@ -392,12 +393,13 @@ npm run typecheck
   - a sell in flight at shutdown is booked once it landed, with the exact wallet change, never as a loss;
   - after a crash the chain wins over the saved holdings; missing tokens are booked at the last price, with an alert;
   - an RPC error while restarting never drops a position, and the owner hears about it while it lasts;
-  - trades closed while starting reach the cost ledger and the Telegram reports, and reconciliations a stop cut off are finished;
+  - trades closed while starting reach the cost ledger and the Telegram reports, and reconciliations a stop cut off are finished, for open and for just-closed trades;
   - the other mode's positions survive a `DRY_RUN` switch;
   - the same coin is never bought twice at once (a double click, or a manual buy during an automatic one);
   - a failed sell is retried with wider slippage, its fee is reconciled, and the token account is closed afterwards for its rent;
   - an exit that keeps failing alerts the owner;
   - a pause and the day's losses survive a restart, and the daily limit resets the next day.
+- **Sizing**: never above `BUY_SOL`, whatever the wallet, sizing mode or bankroll; a `BUY_SOL` below the smallest trade worth its worst-case fees, and an edge proof that the loaded data could never reach, are refused at startup.
 - **Resilience**: a gRPC stream is reopened until it works and replaced when it goes silent, an undecodable transaction is skipped; the smart-money window forgets old buys (bounded memory) and replays use the same window; dynamic fees are judged at their cap; overlapping writes never tear a file.
 - **Security**: a non-local API without a strong token is refused at startup; the token only counts from a header or the WebSocket subprotocol, never the URL; RPC keys in query, path or user info are masked; Telegram commands and buttons only count from the owner (a group needs `TELEGRAM_OWNER_IDS`).
 - **Live autonomy**:

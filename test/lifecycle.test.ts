@@ -7,7 +7,7 @@ import pino from 'pino'
 import { afterEach, describe, expect, it } from 'vitest'
 import { type Config, loadConfig } from '../src/config.js'
 import { Engine } from '../src/engine.js'
-import { positionPnl } from '../src/trading/positions.js'
+import { type Position, positionPnl } from '../src/trading/positions.js'
 import { MockChain } from './mock-chain.js'
 
 /**
@@ -35,6 +35,9 @@ interface Rig {
   wallet: Keypair
   engine: Engine
   alerts: string[]
+  /** What a notifier would get: closes and on-chain corrections since this start. */
+  closed: Position[]
+  reconciled: [Position, bigint][]
   dataDir: string
 }
 const rigs: Rig[] = []
@@ -74,14 +77,22 @@ async function live(env: Record<string, string> = {}): Promise<Rig> {
   return rig
 }
 
-async function startEngine(cfg: Config, wallet: Keypair): Promise<{ engine: Engine; alerts: string[] }> {
+async function startEngine(cfg: Config, wallet: Keypair) {
   const engine = new Engine(cfg, wallet, log, { drainMs: 300, retryMs: 50 })
   await engine.start()
+  // Taken the way the reporter takes them: nothing is missed between start and subscribing.
   const alerts = engine.takeEarlyAlerts()
   engine.on('alert', (m) => alerts.push(m))
+  const early = engine.takeEarlyClosed()
+  const closed = early.closed
+  const reconciled = early.reconciled
+  engine.on('event', (e) => {
+    if (e.type === 'closed') closed.push(e.data)
+  })
+  engine.on('reconciled', (p, c) => reconciled.push([p, c]))
   await waitFor(() => engine.status().feeds[0]?.connected, 5_000, 'feed connection')
   await new Promise((r) => setTimeout(r, 50))
-  return { engine, alerts }
+  return { engine, alerts, closed, reconciled }
 }
 
 /** Stops the bot, lets `between` happen while it is down, and starts it again on the same data. */
@@ -163,7 +174,7 @@ describe('shutdown with transactions in flight', () => {
     expect(rig.chain.landed.filter((t) => t.kind === 'sell')).toHaveLength(1)
     // Closed while starting, yet in every ledger: the cost ledger (exact, once reconciled) and the notifier's.
     await waitFor(() => Math.abs(rig.engine.costs.status().earnedSol - Number(walletChange(rig)) / 1e9) < 1e-9, 5_000, 'cost ledger')
-    expect(rig.engine.takeEarlyClosed().map((p) => p.mint)).toEqual([m])
+    expect(rig.closed.map((p) => p.mint)).toEqual([m])
   })
 })
 
@@ -212,6 +223,26 @@ describe('restart after a crash', () => {
     const exact = await waitFor(() => rig.engine.positions.get(m)?.reconciled && rig.engine.positions.get(m), 8_000, 'reconciled after restart')
     expect(exact.unreconciled).toEqual([])
     expect(exact.walletDeltaLamports).toBe(walletChange(rig))
+  })
+
+  it('finishes the reconciliation of a trade that closed just before the stop', async () => {
+    const rig = await live()
+    const { mint, dev, m } = await bought(rig)
+    rig.chain.failing.add('getTransaction') // the sell's exact result is not in yet at the stop
+    rig.chain.trade(mint, { user: dev, sellTokens: 10_000_000_000_000n })
+    const closed = await waitFor(() => rig.engine.positions.history().find((p) => p.mint === m && p.status === 'closed'), 8_000, 'exit')
+    expect(closed.reconciled).toBe(false)
+    await restart(rig, () => {
+      // Saved although closed, until its last transaction is reconciled.
+      expect(saved(rig)).toEqual([expect.objectContaining({ mint: m, status: 'closed', unreconciled: [expect.any(String)] })])
+      rig.chain.failing.clear()
+    })
+    expect(rig.engine.positions.has(m)).toBe(false) // not traded again
+    const exact = await waitFor(() => rig.reconciled.find(([p]) => p.mint === m), 8_000, 'correction after restart')
+    expect(positionPnl(exact[0])).toBe(walletChange(rig))
+    await rig.engine.stop()
+    expect(saved(rig)).toEqual([]) // settled: gone from the file
+    Object.assign(rig, await startEngine(rig.cfg, rig.wallet))
   })
 
   it('keeps the other mode’s positions when DRY_RUN changes, and says so', async () => {

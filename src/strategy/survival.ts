@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import type { Config } from '../config.js'
 import { lamportsToSol } from '../config.js'
-import { txNetworkLamports } from '../trading/fees.js'
+import { feeSchedule, minViableBuyLamports } from '../trading/fees.js'
 import { type Position, positionPnl } from '../trading/positions.js'
 import type { Logger } from '../util/logger.js'
 import { readJson, writeJsonAtomic } from '../util/persist.js'
@@ -29,39 +29,8 @@ export interface Vitals {
   runwayTrades: number
 }
 
-/**
- * Upfront account costs of a first buy: Token-2022 ATA rent plus pump's
- * one-time user volume accumulator, rounded up. The ATA rent comes back when
- * the account is closed, but it must be on hand to buy.
- */
-export const BUY_ACCOUNT_OVERHEAD_LAMPORTS = 4_500_000n
-
-/**
- * Network costs per trade, at the most they can be (dynamic priority fees at
- * their cap): the exit reserve and the viability checks must hold in a busy
- * network too.
- */
-export function feeSchedule(cfg: Config) {
-  const buyNetwork = txNetworkLamports(cfg, 'buy', 'worst')
-  const sellNetwork = txNetworkLamports(cfg, 'sell', 'worst')
-  return {
-    buyNetwork,
-    sellNetwork,
-    buyUpfront: buyNetwork + BUY_ACCOUNT_OVERHEAD_LAMPORTS,
-    roundTrip: buyNetwork + sellNetwork,
-  }
-}
-
-/**
- * A trade only makes sense if tips and priority fees are a small share of it:
- * at 0.003 SOL round-trip, a 0.01 SOL trade starts 30% down.
- */
-export function minViableBuyLamports(cfg: Config): bigint {
-  const { roundTrip } = feeSchedule(cfg)
-  const byFees = (roundTrip * 10_000n + BigInt(Math.round(cfg.survival.maxFeeDragPct * 100)) - 1n) /
-    BigInt(Math.round(cfg.survival.maxFeeDragPct * 100))
-  return byFees > cfg.survival.minBuyLamports ? byFees : cfg.survival.minBuyLamports
-}
+// The fee arithmetic lives with the other fees; config checks it at startup too.
+export { BUY_ACCOUNT_OVERHEAD_LAMPORTS, feeSchedule, minViableBuyLamports } from '../trading/fees.js'
 
 interface SurvivalFile {
   version: 1
@@ -200,9 +169,11 @@ export class Survival {
     if (desired > cfg.buyLamports) desired = cfg.buyLamports
     const defensive = cfg.survival.defensiveDrawdownPct > 0 && drawdownPct >= cfg.survival.defensiveDrawdownPct
     if (defensive) desired /= 2n
-    // A small bankroll trades at the smallest viable size rather than not at all.
+    // A small bankroll trades at the smallest viable size rather than not at
+    // all, but never above BUY_SOL: that is the most the owner allows per trade
+    // (loadConfig refuses a BUY_SOL below the smallest viable size).
     if (desired < minViable) desired = minViable
-    const size = desired <= affordable ? desired : affordable >= minViable ? affordable : 0n
+    const size = minViable > cfg.buyLamports ? 0n : desired <= affordable ? desired : affordable >= minViable ? affordable : 0n
     const runway = free > 0n ? Number(free / (minViable + fees.buyUpfront)) : 0
 
     let state: VitalState

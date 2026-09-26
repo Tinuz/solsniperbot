@@ -192,8 +192,12 @@ export class Reporter {
     this.send(`▶️ Gestart${restarts ? ` (herstart #${restarts})` : ''} · ${tradingLine(this.engine.status())}${cfg.notify.commands ? '\nTyp /help voor de commando’s.' : ''}`)
     // Raised while the engine started (restored positions, a pause still in force), before we listened.
     for (const m of this.engine.takeEarlyAlerts()) this.send(m)
-    // Closed while the engine settled restored positions on-chain: they belong in the ledger too.
-    for (const p of this.engine.takeEarlyClosed()) this.onClosed(p)
+    // Closed while the engine settled restored positions on-chain: they belong in the ledger too,
+    // with their P&L as it stands now; later corrections only for trades closed before this start.
+    const early = this.engine.takeEarlyClosed()
+    for (const p of early.closed) this.onClosed(p)
+    const added = new Set(early.closed.map((p) => p.mint))
+    for (const [p, correction] of early.reconciled) if (!added.has(p.mint) && this.ledger.correct(p.mint, Number(correction))) this.save()
     this.timer = setInterval(() => void this.tick(), 60_000)
     this.timer.unref()
     if (cfg.notify.commands && cfg.notify.telegram) {

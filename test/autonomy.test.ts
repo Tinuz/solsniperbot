@@ -187,7 +187,7 @@ function fakeEngine(cfg = loadConfig({ ...BASE, DATA_DIR: tmp(), TELEGRAM_BOT_TO
   engine.risk = { snapshot: () => ({ paused: false }), pause: () => {}, resume: () => {} }
   engine.survival = { paperRealizedLamports: 0n }
   engine.takeEarlyAlerts = () => []
-  engine.takeEarlyClosed = () => []
+  engine.takeEarlyClosed = () => ({ closed: [], reconciled: [] })
   engine.status = () => ({
     uptimeSec: 2 * 86_400,
     risk: { paused: false },

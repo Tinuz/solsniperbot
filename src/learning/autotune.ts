@@ -275,6 +275,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
         this.state.active = this.baseline
         this.state.cooldownUntil = undefined
         this.state.cooldownReason = undefined
+        // A candidate shadow-tested against the old settings says nothing about the new ones.
+        this.state.shadow = undefined
+        this.state.forwardSince = undefined
         if (dropped.length) {
           this.log.warn({ dropped: describe(dropped) }, 'autotune: .env settings changed since the last adoption, tuned overrides dropped')
           void this.journal.append({ type: 'reset', at: this.now(), reason: '.env settings changed', dropped })
@@ -283,7 +286,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       } else {
         const overrides = diffParams(this.baseline, this.state.active)
         if (overrides.length) {
-          this.setActive(this.state.active)
+          // Restored as they were, with the start of their forward proof.
+          const fs = this.state.forwardSince
+          this.setActive(this.state.active, fs?.key === paramsKey(this.state.active) ? fs.since : undefined)
           this.log.info({ overrides: describe(overrides) }, 'autotune: tuned settings restored')
         }
       }
@@ -337,6 +342,12 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const o = this.cfg.autotune
     const current = paramsFromConfig(this.cfg)
     const probationAdoption = this.adopts && st.probation ? this.adoption(st.probation.adoptionId) : undefined
+    // A shadow test only compares with the settings it started from: once those
+    // changed (a revert, a rollback), its candidate would overwrite the new ones.
+    if (st.shadow && paramsKey(st.shadow.from) !== paramsKey(current)) {
+      void this.journal.append({ type: 'shadow-dropped', at, changes: st.shadow.changes, reason: 'settings changed since it started' })
+      st.shadow = undefined
+    }
     const shadow = !probationAdoption ? st.shadow : undefined
     const coolingDown = (st.cooldownUntil ?? 0) > at
     // Hourly checks are cheap; the search itself runs every AUTOTUNE_INTERVAL_HOURS,
@@ -607,8 +618,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       sh.last = pr
       if (pr.status === 'passed') {
         st.shadow = undefined
-        st.forwardSince = { key: paramsKey(sh.to), since: sh.since }
-        this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`)
+        this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`, sh.since)
       } else if (pr.status === 'failed') {
         st.shadow = undefined
         st.rolledBack = [...this.recentRollbacks(at), { key: paramsKey(sh.to), at }]
@@ -705,11 +715,14 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     return out
   }
 
-  /** Puts adopted settings into effect and on probation. */
-  private adopt(from: TunableParams, to: TunableParams, changes: ParamChange[], test: Adoption['test'], at: number, why: string): void {
+  /**
+   * Puts adopted settings into effect and on probation. `shadowSince`: the
+   * launches since then were its shadow test, and count as its forward proof.
+   */
+  private adopt(from: TunableParams, to: TunableParams, changes: ParamChange[], test: Adoption['test'], at: number, why: string, shadowSince?: number): void {
     const st = this.state
     const adoption: Adoption = { id: (st.adoptions.at(-1)?.id ?? 0) + 1, at, changes, from, to, test, status: 'probation' }
-    this.setActive(to)
+    this.setActive(to, shadowSince)
     st.adoptions = [...st.adoptions, adoption].slice(-MAX_ADOPTIONS_KEPT)
     st.probation = { adoptionId: adoption.id, since: at, neededTrades: this.cfg.autotune.probationTrades }
     void this.journal.append({ type: 'adopt', at, adoption: adoption.id, changes, test, live: this.live })
@@ -721,9 +734,15 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
   }
 
   /** Puts `p` into effect on the running bot. */
-  private setActive(p: TunableParams): void {
+  /**
+   * Puts `p` into effect. Its forward proof starts now, or at `forwardSince`
+   * (a shadow test): an older start never carries over, or the data that
+   * picked the settings could count as their proof.
+   */
+  private setActive(p: TunableParams, forwardSince?: number): void {
     applyParams(this.cfg, p)
     this.state.active = p
+    this.state.forwardSince = forwardSince === undefined ? undefined : { key: paramsKey(p), since: forwardSince }
     this.version++
   }
 

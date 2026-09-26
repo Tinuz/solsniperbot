@@ -244,6 +244,18 @@ describe('evaluateEdge', () => {
     expect(e.recent!.trades).toBeLessThan(200) // only the newest 30% counted
   })
 
+  it('gives settings that hardly trade AUTOTUNE_MIN_HOURS in effect, counted over all loaded data, then calls them unproven', () => {
+    const strictCfg = cfgWith({ ENTRY_MODE: 'momentum', MOMENTUM_MIN_BUYERS: '30', MOMENTUM_MIN_NET_BUY_SOL: '20' })
+    const strict = paramsFromConfig(strictCfg)
+    const o = { ...OPTS, minHours: 24 }
+    // In effect for the last 15 hours only: no verdict yet.
+    expect(evaluateEdge(recordedUnder(momentumMarket(600), strict), strictCfg, strict, o, 0).status).toBe('insufficient-data')
+    // In effect for all 50 hours, though the window holds only the newest 15: unproven.
+    const e = evaluateEdge(recordedUnder(momentumMarket(600), strict, 1), strictCfg, strict, o, 0)
+    expect(e.status).toBe('unproven')
+    expect(e.reason).toMatch(/enough trades/)
+  })
+
   it('counts every launch since a given moment for a candidate picked then (shadow test)', () => {
     const records = dataset(600)
     const since = records[420]!.t
@@ -567,11 +579,42 @@ describe('AutoTuner', () => {
     expect(a.t.status().edge).toMatchObject({ status: 'proven', allowed: true })
     expect(a.t.sizeFactor()).toBe(1) // paper: no reduced stake
 
+    // The shadow start is kept as the start of its proof, across a restart too.
+    const state = async () => JSON.parse(await readFile(join(dir, 'tuning', 'state-paper.json'), 'utf8'))
+    const adopted = paramsFromConfig(a.cfg)
+    expect((await state()).forwardSince).toEqual({ key: paramsKey(adopted), since: START + 51 * HOUR })
+    const b = tuner(env, clock)
+    await b.t.load()
+    expect(paramsKey(paramsFromConfig(b.cfg))).toBe(paramsKey(adopted))
+    await b.t.run()
+    expect(b.t.tradingGate().allowed).toBe(true)
+
     // Back to the .env settings by hand: they need their own proof before trading again.
     await a.t.revert()
+    expect((await state()).forwardSince).toBeUndefined()
     expect(a.t.tradingGate()).toMatchObject({ allowed: false, reason: expect.stringMatching(/checking/) })
     await a.t.run()
     expect(a.t.tradingGate().allowed).toBe(true) // recorded under them, and they make money
+  })
+
+  it('drops a shadow test when the .env settings change: its candidate never overwrites them', async () => {
+    const { dir, env } = await setup({ REQUIRE_EDGE: 'true' })
+    const clock = { now: START + 51 * HOUR }
+    const a = tuner(env, clock)
+    await a.t.load()
+    expect((await a.t.run()).reason).toMatch(/shadow test started/)
+    expect(a.t.status().shadow).not.toBeNull()
+
+    // The owner edits .env and restarts while the shadow test runs.
+    const edited = { ...env, STOP_LOSS_PCT: '35' }
+    const b = tuner(edited, clock)
+    await b.t.load()
+    expect(b.t.status().shadow).toBeNull()
+    await writeRecords(dir, launchesUnder(paramsFromConfig(b.cfg), 80, clock.now))
+    clock.now += 5 * HOUR
+    const run = await b.t.run()
+    expect(run.probation).toBeUndefined() // no stale shadow verdict
+    expect(b.cfg.exits.stopLossPct).toBe(35) // the owner's edit stands
   })
 
   it('live: shadow-tests a candidate first, then trades it at reduced size until probation passes', async () => {

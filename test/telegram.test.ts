@@ -101,13 +101,14 @@ function fakeEngine(env: Record<string, string>, dir = tmp()) {
   }
   const open: Position[] = []
   const earlyClosed: Position[] = []
+  const earlyReconciled: [Position, bigint][] = []
   const sold: string[] = []
   const vitals = { equitySol: 1.0 as number | null }
   engine.cfg = cfg
   engine.survival = { paperRealizedLamports: 0n }
   engine.risk = riskManager
   engine.takeEarlyAlerts = () => []
-  engine.takeEarlyClosed = () => earlyClosed.splice(0)
+  engine.takeEarlyClosed = () => ({ closed: earlyClosed.splice(0), reconciled: earlyReconciled.splice(0) })
   engine.positions = {
     list: () => open,
     history: () => [],
@@ -125,7 +126,7 @@ function fakeEngine(env: Record<string, string>, dir = tmp()) {
     recorder: { written: 18_849 },
     usage: { streamedMbPerDay: 900, heliusCreditsPerDay: null },
   })
-  return { engine: engine as unknown as Engine, cfg, risk, riskManager, open, earlyClosed, sold, vitals, dir }
+  return { engine: engine as unknown as Engine, cfg, risk, riskManager, open, earlyClosed, earlyReconciled, sold, vitals, dir }
 }
 
 async function started(env: Record<string, string>, clock: { now: number }, dir?: string) {
@@ -226,6 +227,23 @@ describe('digest and highlights', () => {
     closers.push(() => r.stop('SIGTERM'))
     expect(r.todayText()).toContain('Trades: 1 trade · 100% winst · +0,0200 SOL')
     await waitFor(() => tg.texts().some((t) => t.includes('🟢 GONE +0,0200 SOL')))
+  })
+
+  it('applies on-chain corrections from while it was starting, once: to trades from before the start only', async () => {
+    const tg = await fakeTelegram()
+    const dir = tmp()
+    // A trade from before the restart, already in the saved ledger at an estimate.
+    writeFileSync(join(dir, 'notify.json'), JSON.stringify({ trades: [{ at: NOON - 3_600_000, mint: 'OLD', symbol: 'OLD', pnl: 10_000_000, cost: 50_000_000 }] }))
+    const f = fakeEngine({ TELEGRAM_API_URL: tg.url, NOTIFY_DIGEST_HOURS: '0' }, dir)
+    const gone = position({ mint: 'GONE', symbol: 'GONE', status: 'closed', closedAt: NOON - 60_000, realizedLamports: 70_000_000n, tokensHeld: 0n, valueLamports: 0n })
+    f.earlyClosed.push(gone)
+    // Its correction is already in its P&L when the reporter reads it; OLD's is not.
+    f.earlyReconciled.push([gone, 3_000_000n], [position({ mint: 'OLD', symbol: 'OLD' }), 5_000_000n])
+    const r = new Reporter(f.engine, log, () => NOON)
+    await r.start()
+    closers.push(() => r.stop('SIGTERM'))
+    // OLD 0.010 + 0.005 corrected, GONE +0.020 as it stands: 0.035.
+    expect(r.todayText()).toContain('Trades: 2 trades · 100% winst · +0,0350 SOL')
   })
 
   it('sends a digest on the local clock, with the forward-test check', async () => {
