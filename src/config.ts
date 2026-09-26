@@ -110,6 +110,7 @@ const schema = z.object({
   MOMENTUM_MAX_SELL_RATIO: num(0.4, { min: 0, max: 10 }),
   MOMENTUM_MAX_EARLY_BUY_SOL: num(0, { min: 0 }),
   MOMENTUM_MAX_TOP_BUYER_PCT: num(0, { min: 0, max: 100 }),
+  MOMENTUM_MIN_SMART_BUYERS: num(0, { min: 0, max: 20, int: true }),
 
   // Filters
   ALLOW_MAYHEM: bool(false),
@@ -260,6 +261,8 @@ export interface Config {
     maxEarlyBuyLamports: bigint
     /** Skip coins where one wallet (not the dev) holds more than this % of the supply. 0 = off. */
     maxTopBuyerPct: number
+    /** Wait until at least this many smart-money wallets bought (see learning/wallets.ts). 0 = off. */
+    minSmartBuyers: number
   }
 
   filters: {
@@ -489,6 +492,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxSellRatio: e.MOMENTUM_MAX_SELL_RATIO,
       maxEarlyBuyLamports: solToLamports(e.MOMENTUM_MAX_EARLY_BUY_SOL),
       maxTopBuyerPct: e.MOMENTUM_MAX_TOP_BUYER_PCT,
+      minSmartBuyers: e.MOMENTUM_MIN_SMART_BUYERS,
     },
 
     filters: {

@@ -23,6 +23,7 @@ import { CreatorReputation } from './strategy/creators.js'
 import { staticFilter } from './strategy/filters.js'
 import { MetadataFetcher, hasSocials } from './strategy/metadata.js'
 import { decideMomentum, momentumSnapshot } from './strategy/momentum.js'
+import { WalletBook, readWalletEntries } from './learning/wallets.js'
 import { RiskManager } from './strategy/risk.js'
 import { OperatingCosts } from './strategy/costs.js'
 import { Survival, type Vitals } from './strategy/survival.js'
@@ -53,6 +54,9 @@ export type EngineEvent =
   | { type: 'position'; data: Position }
   | { type: 'closed'; data: Position }
   | { type: 'notice'; data: { level: 'info' | 'warn' | 'error'; message: string; at: number } }
+
+/** Days of logged early buys the smart-money book is built from. */
+const WALLET_HISTORY_DAYS = 14
 
 const percentile = (values: number[], p: number) => {
   if (values.length === 0) return undefined
@@ -104,6 +108,10 @@ export class Engine extends EventEmitter<{
   readonly executor: Executor
   readonly recorder?: LaunchRecorder
   readonly tuner?: AutoTuner
+  /** Smart money: early-buy history per wallet, from the recordings (see learning/wallets.ts). */
+  readonly wallets = new WalletBook()
+  private walletsLoading?: Set<string>
+  private smartCache = { at: 0, count: 0 }
   private readonly blockhash: BlockhashCache
   private readonly fees: PriorityFees
   private readonly lander?: Lander
@@ -174,7 +182,19 @@ export class Engine extends EventEmitter<{
     })
 
     if (cfg.recorder.enabled) {
-      this.recorder = new LaunchRecorder({ dataDir: cfg.dataDir, horizonMs: cfg.recorder.horizonMs, maxTrades: cfg.recorder.maxTrades }, log)
+      this.recorder = new LaunchRecorder(
+        {
+          dataDir: cfg.dataDir,
+          horizonMs: cfg.recorder.horizonMs,
+          maxTrades: cfg.recorder.maxTrades,
+          ignoreWallets: [this.executor.walletAddress.toBase58()],
+          onWallets: (e) => {
+            this.wallets.add(e)
+            this.walletsLoading?.add(e.mint)
+          },
+        },
+        log,
+      )
     }
     // Built before anything can change cfg, so it captures the .env settings.
     if (cfg.autotune.mode !== 'off' || cfg.autotune.requireEdge) {
@@ -212,6 +232,7 @@ export class Engine extends EventEmitter<{
     this.fees.start()
     this.tracker.start()
     await this.creators.load()
+    void this.loadWallets()
     await this.positions.start()
     if (!cfg.dryRun) await this.refreshBalance()
 
@@ -367,7 +388,7 @@ export class Engine extends EventEmitter<{
   }
 
   private checkMomentum(mint: string, launch: Launch, state: MintState): void {
-    const d = decideMomentum(momentumSnapshot(state, launch, Date.now()), this.cfg.momentum, this.cfg.filters.maxEntryMcapLamports)
+    const d = decideMomentum(momentumSnapshot(state, launch, Date.now(), (w) => this.wallets.isSmart(w)), this.cfg.momentum, this.cfg.filters.maxEntryMcapLamports)
     if (d.action === 'wait') return
     this.momentum.delete(mint)
     if (d.action === 'reject') {
@@ -504,6 +525,7 @@ export class Engine extends EventEmitter<{
       survival: lamportsView(vitals),
       recorder: this.recorder?.stats() ?? null,
       usage: this.usage(),
+      wallets: this.walletStats(),
       costs: this.costs.enabled ? this.costs.status() : null,
       tuning: this.tuner?.status() ?? { mode: 'off' as const },
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
@@ -533,6 +555,32 @@ export class Engine extends EventEmitter<{
         slotsAfterLaunch: this.latency.slots.summary(),
       },
     }
+  }
+
+  /**
+   * Builds the smart-money book from the logged early buys of the last
+   * WALLET_HISTORY_DAYS, in the background: until it is loaded, no wallet
+   * counts as smart. Launches that finish meanwhile are added live, once.
+   */
+  private async loadWallets(): Promise<void> {
+    this.walletsLoading = new Set()
+    try {
+      const from = new Date(Date.now() - WALLET_HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
+      const entries = await readWalletEntries(this.cfg.dataDir, from)
+      for (const e of entries) if (!this.walletsLoading.has(e.mint)) this.wallets.add(e)
+      this.log.info({ wallets: this.wallets.size, smart: this.wallets.smartCount(), baseRate: this.wallets.baseRate.toFixed(3) }, 'smart-money book loaded')
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'could not load the smart-money book')
+    } finally {
+      this.walletsLoading = undefined
+      this.smartCache.at = 0
+    }
+  }
+
+  /** For the dashboard and Telegram; counting smart wallets walks the whole book, so at most once a minute. */
+  walletStats() {
+    if (Date.now() - this.smartCache.at > 60_000) this.smartCache = { at: Date.now(), count: this.wallets.smartCount() }
+    return { tracked: this.wallets.size, smart: this.smartCache.count, baseRate: this.wallets.baseRate }
   }
 
   /**

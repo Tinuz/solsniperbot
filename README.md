@@ -103,7 +103,7 @@ Both tools replay what the bot actually runs with, autotuned settings included. 
 
 ### Research: is there an edge at all?
 
-`analyze` and `backtest` look at the settings you have and what is near them. `npm run research` asks the bigger question: does *any* strategy within the bounds make money on this data? It searches entry mode, momentum thresholds, insider filters, launch filters and exits together, starting from eight very different strategies (blind sniping, patient momentum, strict momentum with insider filters, quick exits, slow exits, and your settings and patient momentum with a moonbag) and improving each step by step. It takes up to 10 minutes by default (`-- --budget=20` for more, `-- --days=3` for recent data only).
+`analyze` and `backtest` look at the settings you have and what is near them. `npm run research` asks the bigger question: does *any* strategy within the bounds make money on this data? It searches entry mode, momentum thresholds, insider filters, launch filters and exits together, starting from nine very different strategies (blind sniping, patient momentum, strict momentum with insider filters, quick exits, slow exits, your settings and patient momentum with a moonbag, and following smart money) and improving each step by step. It takes up to 10 minutes by default (`-- --budget=20` for more, `-- --days=3` for recent data only).
 
 The search is honest by construction. The recordings are split by time into three parts:
 1. **Search (oldest 60%).** Strategies are found here. Each one is scored *without its single best trade*, so a strategy that lives off one lucky coin scores low.
@@ -147,7 +147,7 @@ Every `AUTOTUNE_INTERVAL_HOURS` (default 6) the bot looks for better settings in
 
 **Strict limits.**
 - **What it can change.** Only which coins to buy, when, and when to sell:
-  - entry: `ENTRY_MODE` (instant or momentum), the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`, and the insider filters `MOMENTUM_MAX_EARLY_BUY_SOL`, `MOMENTUM_MAX_TOP_BUYER_PCT` (each can also be switched off);
+  - entry: `ENTRY_MODE` (instant or momentum), the momentum thresholds `MOMENTUM_MIN_BUYERS`, `MOMENTUM_MIN_NET_BUY_SOL`, `MOMENTUM_MAX_SELL_RATIO`, `MOMENTUM_MIN_AGE_MS`, `MOMENTUM_MAX_AGE_MS`, the insider filters `MOMENTUM_MAX_EARLY_BUY_SOL`, `MOMENTUM_MAX_TOP_BUYER_PCT` (each can also be switched off), and smart money `MOMENTUM_MIN_SMART_BUYERS` (0 to 3);
   - filters: `DEV_BUY_MIN_SOL`, `DEV_BUY_MAX_SOL`, `DEV_MAX_SUPPLY_PCT`, `MAX_ENTRY_MCAP_SOL`, `CREATOR_MAX_LAUNCHES`;
   - exits: `TAKE_PROFIT`, `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TRAILING_ARM_PCT`, `MAX_HOLD_SECONDS`, `STALE_SECONDS`, `EXIT_ON_DEV_SELL`, and the moonbag: `MOONBAG_PCT` (on or off), `MOONBAG_SECURE_PCT`, `MOONBAG_STOP_BUFFER_PCT`, `MOONBAG_TRAILING_PCT`.
 - **What it never touches.** Trade size, reserve, tips, fees, slippage, risk limits and survival rules.
@@ -235,7 +235,18 @@ Setup:
 | Mode | Behaviour |
 | --- | --- |
 | `ENTRY_MODE=instant` | Buy the moment a launch passes the filters (block-0 sniping). Fastest; most exposed to bundled launches and instant rugs. |
-| `ENTRY_MODE=momentum` | Watch a passing launch and buy only once it has `MOMENTUM_MIN_BUYERS` distinct buyers, `MOMENTUM_MIN_NET_BUY_SOL` net inflow excluding the dev, a sell/buy ratio under `MOMENTUM_MAX_SELL_RATIO`, and the dev has not sold, all within `MOMENTUM_MAX_AGE_MS`. Optional insider filters skip it when non-dev wallets bought more than `MOMENTUM_MAX_EARLY_BUY_SOL` in the first 0.5s (bundled with the launch) or one wallet other than the dev holds more than `MOMENTUM_MAX_TOP_BUYER_PCT`% of the supply. |
+| `ENTRY_MODE=momentum` | Watch a passing launch and buy only once it has `MOMENTUM_MIN_BUYERS` distinct buyers, `MOMENTUM_MIN_NET_BUY_SOL` net inflow excluding the dev, a sell/buy ratio under `MOMENTUM_MAX_SELL_RATIO`, and the dev has not sold, all within `MOMENTUM_MAX_AGE_MS`. Optional insider filters skip it when non-dev wallets bought more than `MOMENTUM_MAX_EARLY_BUY_SOL` in the first 0.5s (bundled with the launch) or one wallet other than the dev holds more than `MOMENTUM_MAX_TOP_BUYER_PCT`% of the supply. With `MOMENTUM_MIN_SMART_BUYERS` it also waits for smart money (below). |
+
+#### Smart money: follow wallets that keep getting in early on runners
+
+Copy traders profit by buying when wallets with a track record buy. The bot learns such wallets from its own recordings:
+
+1. **What it logs.** For every finished launch, `data/wallets/<day>.jsonl` gets the early buyers (each wallet's first buy within the first minute, the dev and the bot itself aside). For each it notes whether the price later reached twice what the wallet paid (a *hit*).
+2. **Who is smart.** A wallet needs at least 3 early buys. Its hit rate, shrunk for small samples (hits / (buys + 2)), must be at least 25% and at least twice the average wallet's. Wallets that buy everything, and insiders whose coins dump, don't qualify.
+3. **No look-ahead.** A launch only counts once its recording has ended, so a wallet is always judged on what was known at that moment. Live, the book is built at startup from the last 14 days of logs and grows as launches finish. Every replay walks forward through time the same way.
+4. **The signal.** With `MOMENTUM_MIN_SMART_BUYERS=1`, momentum entry waits until a smart wallet has bought, and the launch reason says so (`5 buyers (1 smart)`). The other momentum thresholds still apply; set them low to follow smart money alone.
+
+`npm run analyze` has a *Smart money* section: how many wallets qualify, and how launches with smart early buyers did compared with the rest. `npm run research` and autotune try the signal as soon as the data supports it. `/status` in Telegram shows how many smart wallets the bot knows. Recordings from before this existed have no buyer addresses, so it takes a few days of new data before the signal can prove itself.
 
 ### Filters
 
@@ -341,6 +352,12 @@ npm run typecheck
   - never at a loss, and not when every moonbag slot is taken;
   - the moonbag's own rules (break-even stop with its fee, wide trailing stop, only a dead coin ends the ride, no time limit);
   - end to end, a moonbag outlasts `MAX_HOLD_SECONDS` and `STALE_SECONDS` while normal positions are closed by them;
+- **Smart money**:
+  - early buyers are logged with the right outcome, without the dev, the bot itself or late buyers;
+  - a wallet only counts as smart with enough hits well above the average;
+  - the walk-forward annotation never uses a launch that hadn't finished;
+  - the live momentum rule and the replay wait for a smart buyer the same way;
+  - end to end, the engine learns a smart wallet from the logs and buys only the launch it buys;
   - in the replay, a moonbag still riding when the recording ends counts at no more than its stop;
   - in the replay, a runner rides further and a crash after the free ride still leaves the trade in profit;
   - end to end, the moonbag frees its position slot and is stopped above entry;

@@ -373,6 +373,7 @@ export class Reporter {
       `Open: ${open.length - bags} ${open.length - bags === 1 ? 'positie' : 'posities'} · ${bags} ${bags === 1 ? 'moonbag' : 'moonbags'}`,
       `Vandaag: ${trades(today.trades)} · ${solNl(today.pnl)}`,
       `Draait ${durationNl(s.uptimeSec * 1000)} · ${intNl(s.recorder?.written ?? 0)} launches opgenomen`,
+      ...(s.wallets?.tracked ? [`Slimme wallets: ${intNl(s.wallets.smart)} van ${intNl(s.wallets.tracked)} gevolgd (basis ${pctNl(s.wallets.baseRate * 100, 0, false)} hits)`] : []),
     ].join('\n')
   }
 

@@ -74,6 +74,11 @@ export interface LaunchRecord {
   skippedTrades?: number
   /** Hard row cap reached before the horizon: nothing is known after the last row. */
   truncated: boolean
+  /**
+   * Not stored: set when loaded (see `annotateSmartBuyers`). Wallet indices of
+   * the early buyers that were smart money at the moment of the launch.
+   */
+  smart?: number[]
   graduated: boolean
   /** Written before the horizon ended (bot shut down). */
   partial: boolean
