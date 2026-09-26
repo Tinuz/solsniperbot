@@ -86,6 +86,7 @@ Recording happens after decisions, so it costs no latency. Let the bot collect a
 npm run analyze             # report: what works, what doesn't, suggested filter values
 npm run backtest            # grid search over exit settings (TP tiers, SL, trailing, hold, stale)
 npm run research            # is there a profitable strategy at all, anywhere within the bounds?
+npm run forward             # days later: did research's candidates hold up on launches recorded since?
 ```
 
 Both tools replay the recorded launches through the bot's **own** filter, momentum and exit functions, with fills after `PAPER_LATENCY_MS`. `analyze` reports:
@@ -111,6 +112,12 @@ The search is honest by construction. The recordings are split by time into thre
 3. **Test (newest 20%).** The winner must make money here, in both halves, and without its best trade. Neither the search nor the choice ever saw this part.
 
 The report (in `data/reports/`) gives the verdict, the current settings next to the best candidate on all three parts, every gate, and the `.env` lines to use it. *None held up* is a real answer: it means no strategy within the bounds made money on data it wasn't chosen on, and the bot is right to keep observing.
+
+### Forward test: judge candidates on launches that didn't exist yet
+
+Every `npm run research` also freezes the settings in effect and its finalists in `data/candidates/`, together with the moment its data ended. A few days later, `npm run forward` replays each of them on the launches recorded after that moment only. None of them could have been fitted to that data, so this is as honest as paper trading them, and it tests all of them at once without trading. The replay matches the bot's own trades closely (see the calibration check in `analyze`).
+
+Each candidate is judged on what was agreed up front: at least 50 trades (`-- --min-trades=`), a positive total, and still positive without the single best trade. The report shows ✅ pass, ❌ fail or ⏳ pending (not enough trades yet), and notes when trade size, latency or fees differ from when the candidates were frozen. With ten candidates one can pass by luck, so a pass earns a paper test of its own, not live trading. By default it covers the last 3 research runs (`-- --sets=`).
 
 To try other settings on the same data, set them for one run. In PowerShell: `$env:ENTRY_MODE="momentum"; npm run analyze` (and `Remove-Item Env:ENTRY_MODE` afterwards). In bash: `ENTRY_MODE=momentum npm run analyze`. These tools never change settings; the autotuner below does, in paper mode only.
 
@@ -391,6 +398,7 @@ npm run typecheck
   - the search runs in a real worker thread;
   - while observing, it explores the whole bounded range and adopts a strategy far beyond one step when it holds up, but never while trading or without the edge gate.
 - **Strategy research**: finds a profitable strategy far from the current settings and proves it on the newest 20% it never used; finds nothing on a market of dead coins and rugs; needs enough data; never picks excluded settings; respects its time budget.
+- **Forward test**: candidates are frozen at the end of the research data and judged only on launches after it; pass needs enough trades, a positive total and a positive total without the best trade; saved sets load newest first; changed trade size, latency or fees are reported.
 - **Replay**: the offline replay matches the live exact curve math to within 2 lamports, and follows TP tiers, dev-dump exits, slippage skips, momentum timing the insider signals (early bundled buys, biggest holder) and moonbags.
 - **End to end**: the real engine runs against a mock chain that verifies ed25519 signatures, decodes the submitted instructions, executes them against curve math and streams back the program's events. Covered: paper take-profit, a moonbag free ride, filter rejections, momentum entry, live buy through Jito (tip, multi-path dedupe), dev-dump exit with account close, exact wallet reconciliation, failed-buy accounting, the API's security checks, a paper bot running out of money and shutting itself down (then refusing to restart), and launch recording of both rejected and traded coins.
 

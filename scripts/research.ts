@@ -14,6 +14,7 @@ import { loadConfig } from '../src/config.js'
 import { loadTunedParams } from '../src/learning/autotune.js'
 import { loadSample } from '../src/learning/dataset.js'
 import { SUMMARY_HEADERS, parseArgs, sol, summaryRow, table, writeReport } from '../src/learning/report.js'
+import { candidateSetFromResearch, saveCandidates } from '../src/learning/forward.js'
 import { type Scored, searchStrategies } from '../src/learning/search.js'
 import { applyParams, paramsFromConfig, toEnv } from '../src/learning/tunable.js'
 
@@ -90,6 +91,14 @@ if (r.finalists.length > 1) {
 }
 if (r.decision === 'none') {
   say('No strategy within the bounds made money on data it was not chosen on. More data may change that; so may market conditions. The bot keeps observing instead of trading, which is the right call until something holds up.')
+}
+
+// Freeze the current settings and every finalist: `npm run forward` judges them on launches recorded from now on.
+if (r.finalists.length) {
+  const path = await saveCandidates(cfg.dataDir, candidateSetFromResearch(r, cfg, records))
+  say(`## Forward test`)
+  say()
+  say(`The current settings and the ${r.finalists.length} finalists are frozen in \`${path}\`. In a few days, \`npm run forward\` replays them on launches recorded after ${new Date(records[records.length - 1]!.t).toISOString().slice(0, 16)} UTC, which none of them could have been fitted to.`)
 }
 
 const report = out.join('\n')

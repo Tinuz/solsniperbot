@@ -23,6 +23,7 @@
     "analyze": "tsx scripts/analyze.ts",
     "backtest": "tsx scripts/backtest.ts",
     "research": "tsx scripts/research.ts",
+    "forward": "tsx scripts/forward.ts",
     "telegram": "tsx scripts/telegram.ts"
   },
   "dependencies": {
