@@ -6,7 +6,7 @@ import { Reporter } from './notify/reporter.js'
 import { loadKeypair } from './solana/wallet.js'
 import { DeadError } from './strategy/survival.js'
 import { createLogger } from './util/logger.js'
-import { EXIT_CONFIG, EXIT_DEAD } from './util/restart-policy.js'
+import { EXIT_CONFIG, EXIT_DEAD, reportsFailedStart } from './util/restart-policy.js'
 
 loadDotenv({ quiet: true })
 
@@ -76,7 +76,12 @@ async function main(): Promise<void> {
       await reporter.sendNow(`💀 refuses to start: ${err.message}`)
       process.exit(EXIT_DEAD)
     }
-    await reporter.sendNow(`❌ failed to start: ${(err as Error).message}`)
+    const message = (err as Error).message
+    const streak = Number(process.env.SUPERVISOR_CRASH_STREAK ?? 0)
+    if (reportsFailedStart(streak)) {
+      const hint = /\b429\b/.test(message) ? '; the RPC provider refuses requests (credits used up or rate limited): check your plan' : ''
+      await reporter.sendNow(`❌ failed to start${streak ? ` (attempt ${streak + 1})` : ''}: ${message}${hint}`)
+    }
     throw err
   }
   await api.start()

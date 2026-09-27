@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import type { Config } from '../config.js'
 import { type Position, positionPnl } from '../trading/positions.js'
 import type { Logger } from '../util/logger.js'
@@ -7,7 +8,33 @@ import { readJson, writeJsonAtomic } from '../util/persist.js'
 const DAY_MS = 86_400_000
 const DAYS_PER_MONTH = 30.4375
 const PRICE_REFRESH_MS = 3_600_000
-const PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,eur'
+
+/** Public SOL price sources (no key needed), tried in order. */
+export const PRICE_SOURCES: PriceSource[] = [
+  {
+    name: 'CoinGecko',
+    url: 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,eur',
+    parse: (d) => {
+      const s = (d as { solana?: { usd?: number; eur?: number } }).solana
+      return { usd: s?.usd, eur: s?.eur }
+    },
+  },
+  {
+    name: 'Binance',
+    url: 'https://api.binance.com/api/v3/ticker/price?symbols=%5B%22SOLUSDT%22,%22SOLEUR%22%5D',
+    parse: (d) => {
+      const rows = Array.isArray(d) ? (d as { symbol?: string; price?: string }[]) : []
+      const at = (symbol: string) => Number(rows.find((r) => r.symbol === symbol)?.price)
+      return { usd: at('SOLUSDT'), eur: at('SOLEUR') }
+    },
+  },
+]
+
+export interface PriceSource {
+  name: string
+  url: string
+  parse(data: unknown): { usd?: number; eur?: number }
+}
 
 export type SolPrice = { usd: number; eur: number; at: number }
 
@@ -19,15 +46,30 @@ interface CostsFile {
   price?: SolPrice
 }
 
-/** Public SOL price (CoinGecko, no key needed). */
-export async function fetchSolPrice(): Promise<SolPrice> {
-  const res = await fetch(PRICE_URL, { signal: AbortSignal.timeout(10_000), headers: { accept: 'application/json' } })
-  if (!res.ok) throw new Error(`price API: HTTP ${res.status}`)
-  const data = (await res.json()) as { solana?: { usd?: number; eur?: number } }
-  const usd = data.solana?.usd
-  const eur = data.solana?.eur
-  if (!(usd && usd > 0 && eur && eur > 0)) throw new Error('price API: no SOL price in response')
-  return { usd, eur, at: Date.now() }
+/**
+ * JSON from a response body. Some CDNs send a gzipped body without saying so
+ * (no Content-Encoding), which fetch then hands over still compressed.
+ */
+export function parseJsonBody(body: Buffer): unknown {
+  const raw = body[0] === 0x1f && body[1] === 0x8b ? gunzipSync(body) : body
+  return JSON.parse(raw.toString('utf8'))
+}
+
+/** Public SOL price in USD and EUR: the first source that answers with both. */
+export async function fetchSolPrice(sources: PriceSource[] = PRICE_SOURCES): Promise<SolPrice> {
+  const errors: string[] = []
+  for (const src of sources) {
+    try {
+      const res = await fetch(src.url, { signal: AbortSignal.timeout(10_000), headers: { accept: 'application/json', 'accept-encoding': 'identity' } })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const { usd, eur } = src.parse(parseJsonBody(Buffer.from(await res.arrayBuffer())))
+      if (!(usd && usd > 0 && eur && eur > 0)) throw new Error('no SOL price in the response')
+      return { usd, eur, at: Date.now() }
+    } catch (err) {
+      errors.push(`${src.name}: ${(err as Error).message}`)
+    }
+  }
+  throw new Error(`price API: ${errors.join('; ')}`)
 }
 
 /**

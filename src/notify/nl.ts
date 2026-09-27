@@ -12,7 +12,9 @@ const STATES: Record<string, string> = { healthy: 'gezond', defensive: 'defensie
 const PHRASES: [RegExp, string | ((...m: string[]) => string)][] = [
   // Starting and stopping.
   [/^💀 refuses to start: /, '💀 Start geweigerd: '],
+  [/^❌ failed to start \(attempt (\d+)\): /, (_, n) => `❌ Starten mislukt (poging ${n}): `],
   [/^❌ failed to start: /, '❌ Starten mislukt: '],
+  [/; the RPC provider refuses requests \(credits used up or rate limited\): check your plan/, '; de RPC-provider weigert verzoeken (credits op of te veel verzoeken): kijk je abonnement na'],
   [/bot is dead since (\S+): /, (_, at) => `de bot is dood sinds ${at}: `],
   [/Fund the wallet to at least (\S+ SOL) to revive it/, (_, n) => `Vul de wallet aan tot minstens ${n} om hem weer te laten handelen`],
   [/Set PAPER_RESET=true to start a new paper wallet/, 'Zet PAPER_RESET=true voor een nieuwe paper-wallet'],

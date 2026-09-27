@@ -33,7 +33,8 @@ function supervise(entry: string, argv: string[]): void {
     startedAt = Date.now()
     lastBeat = 0
     hung = false
-    child = fork(entry, argv, { env: { ...process.env, SUPERVISOR_RESTARTS: String(restarts) } })
+    // The crash streak lets the bot report a failing start now and then, not at every attempt.
+    child = fork(entry, argv, { env: { ...process.env, SUPERVISOR_RESTARTS: String(restarts), SUPERVISOR_CRASH_STREAK: String(state.crashes) } })
     log(`bot started (pid ${child.pid}${restarts ? `, restart #${restarts}` : ''})`)
     child.on('message', (m: { type?: string }) => {
       if (m?.type === 'heartbeat') lastBeat = Date.now()
