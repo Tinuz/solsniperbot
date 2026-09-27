@@ -105,6 +105,11 @@ export class OperatingCosts {
     this.state.earnedLamports += Number(positionPnl(pos))
   }
 
+  /** A closed position's P&L turned out different on-chain (see PositionManager.reconcile). */
+  bookCorrection(lamports: bigint): void {
+    this.state.earnedLamports += Number(lamports)
+  }
+
   async persist(): Promise<void> {
     try {
       await writeJsonAtomic(this.path, this.state)

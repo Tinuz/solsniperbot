@@ -13,9 +13,30 @@ import { type ExitDecision, type PositionBooks, decideExit } from '../strategy/e
 import type { RiskManager } from '../strategy/risk.js'
 import type { Logger } from '../util/logger.js'
 import { DebouncedWriter, Journal, readJson } from '../util/persist.js'
-import type { BuyRequest, Executor, SimulationReport, Timings, TradeResult } from './executor.js'
+import { sleep } from '../util/time.js'
+import type { BuyRequest, Executor, SimulationReport, SubmitHooks, Timings, TradeResult } from './executor.js'
+import { BASE_FEE_LAMPORTS, priorityLamports } from './fees.js'
 
 export type PositionStatus = 'opening' | 'open' | 'closing' | 'closed' | 'failed'
+
+/**
+ * A transaction whose outcome the bot does not know (it stopped or crashed
+ * while it was in flight), or a restart after which what the wallet holds
+ * must be checked. The position is not traded until the chain settles it.
+ */
+export interface PendingTx {
+  /** `sync`: no transaction known; compare the holdings with the wallet. */
+  side: 'buy' | 'sell' | 'sync'
+  signature?: string
+  /** After this block height the transaction can no longer land. */
+  lastValidBlockHeight?: number
+  /** Sell: the tokens it sells, and how the sale is booked if it landed. */
+  tokens?: bigint
+  reason?: string
+  tier?: number
+  moonbag?: boolean
+  since: number
+}
 
 export interface SellRecord {
   at: number
@@ -76,6 +97,22 @@ export interface Position {
   error?: string
   timings?: Timings
   simulation?: SimulationReport
+  /** Outcome not known yet: see PendingTx. */
+  pending?: PendingTx
+  nextResolveAt?: number
+  /** Failed sell rounds in a row (the owner hears about a stuck exit). */
+  sellFailures?: number
+  /** Failed on-chain checks in a row while pending (the owner hears about it). */
+  resolveFailures?: number
+  /** Landed transactions whose exact wallet change is not booked yet (retried, also after a restart). */
+  unreconciled?: string[]
+  /** Since when some transaction is waiting to be reconciled. */
+  unreconciledSince?: number
+  /** Failed reconciliation rounds in a row, and when the next one is due. */
+  reconcileFailures?: number
+  nextReconcileAt?: number
+  /** Why this position's P&L stays an estimate even once reconciled (a sale the bot did not see). */
+  estimated?: string
 }
 
 export interface PositionStats {
@@ -88,16 +125,31 @@ export interface PositionStats {
   avgHoldMs: number
 }
 
-const BASE_FEE = 5_000n
+/** Failed sell rounds in a row before the owner is alerted. */
+const STUCK_ALERT_ROUNDS = 3
+/** Failed on-chain checks of a pending position (one every 10 s) before the owner is alerted. */
+const UNSETTLED_ALERT_TRIES = 6
+/** A transaction whose exact result can't be found for this long keeps its estimated P&L for good. */
+const RECONCILE_GIVE_UP_MS = 3 * 86_400_000
+const utcDay = (t: number) => new Date(t).toISOString().slice(0, 10)
+/** Without a known transaction, a restored buy that has not shown up by then never will. */
+const UNKNOWN_TX_MS = 120_000
 
 /** Net P&L: realized + current value - cost - network fees. */
 export function positionPnl(p: Position): bigint {
-  if (p.reconciled && p.walletDeltaLamports !== undefined) return p.walletDeltaLamports + p.valueLamports
+  if (p.reconciled && p.walletDeltaLamports !== undefined && !p.estimated) return p.walletDeltaLamports + p.valueLamports
   return p.realizedLamports + p.valueLamports - p.costLamports - p.networkFeesLamports
 }
 
 interface Deps {
   cfg: Config
+  /** How long to wait before checking a pending position on-chain again after an RPC error (default 10 s). */
+  retryMs?: number
+  /**
+   * Reconciliation: tries per round and the wait between them (12 × 1.5 s),
+   * and the wait before a failed round is retried (1 min, doubling to 1 h).
+   */
+  reconcile?: { attempts?: number; delayMs?: number; retryMs?: number }
   executor: Executor
   market: MarketBook
   protocol: PumpProtocol
@@ -119,10 +171,29 @@ export interface OpenRequest extends BuyRequest {
  * exit decisions, sells with escalating-slippage retries, persistence and
  * P&L booking.
  */
-export class PositionManager extends EventEmitter<{ update: [Position]; closed: [Position] }> {
+export class PositionManager extends EventEmitter<{
+  update: [Position]
+  closed: [Position]
+  /** Booked P&L of a finished position was corrected by the exact on-chain amount. */
+  reconciled: [Position, bigint]
+  /** Something the owner must hear about (a stuck exit, tokens gone from the wallet). */
+  alert: [string]
+}> {
   private readonly active = new Map<string, Position>()
   private readonly recent: Position[] = []
-  private readonly selling = new Set<string>()
+  /** Mints with a buy, sell or on-chain check in flight: never two at once. */
+  private readonly busy = new Set<string>()
+  /** Buys, sells and checks in flight, so a shutdown can wait for them. */
+  private readonly inflight = new Set<Promise<unknown>>()
+  /** The other mode's positions (DRY_RUN switched): kept in the file untouched, not managed. */
+  private foreign: unknown[] = []
+  /** Finished live positions whose last transactions are not reconciled yet: saved, so a restart finishes them. */
+  private readonly settling = new Map<string, Position>()
+  /** Those of them that finished in an earlier run: not part of this run's totals. */
+  private readonly earlierRun = new WeakSet<Position>()
+  /** Signatures being reconciled right now: never two lookups of one transaction at once. */
+  private readonly reconciling = new Set<string>()
+  private stopping = false
   private readonly journal: Journal
   private readonly store: DebouncedWriter
   private readonly totals: PositionStats = {
@@ -140,7 +211,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     super()
     const onError = (err: unknown) => d.log.error({ err }, 'failed to persist positions')
     this.journal = new Journal(join(d.cfg.dataDir, 'trades.jsonl'), onError)
-    this.store = new DebouncedWriter(join(d.cfg.dataDir, 'positions.json'), () => [...this.active.values()], 200, onError)
+    this.store = new DebouncedWriter(join(d.cfg.dataDir, 'positions.json'), () => [...this.active.values(), ...this.settling.values(), ...this.foreign], 200, onError)
   }
 
   // Lifecycle -----------------------------------------------------------------
@@ -150,10 +221,33 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     this.timer = setInterval(() => this.tick(), 1_000)
   }
 
-  async stop(): Promise<void> {
+  /**
+   * First step of a shutdown: no new buys or sell attempts, then waits up to
+   * `timeoutMs` for the transactions in flight to finish normally.
+   */
+  async drain(timeoutMs: number): Promise<void> {
+    this.stopping = true
     clearInterval(this.timer)
-    await this.store.flush()
+    const deadline = Date.now() + timeoutMs
+    while (this.inflight.size > 0 && Date.now() < deadline) await sleep(50)
+  }
+
+  /**
+   * Last step, after the signature tracker stopped: a transaction still in
+   * flight was reported `aborted` and stays saved as pending, for the next
+   * start to settle on-chain. Then the final save; nothing writes after it.
+   */
+  async stop(): Promise<void> {
+    this.stopping = true
+    clearInterval(this.timer)
+    await Promise.allSettled([...this.inflight])
+    await this.store.close()
     await this.journal.flush()
+  }
+
+  /** A shutdown has begun: no new positions. */
+  get stopped(): boolean {
+    return this.stopping
   }
 
   has(mint: string): boolean {
@@ -191,6 +285,9 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
 
   async open(req: OpenRequest): Promise<Position> {
     const mint = req.mint.toBase58()
+    if (this.stopping) throw new Error('shutting down')
+    // Checked and registered with no await in between: a second buy of the same coin cannot slip through.
+    if (this.active.has(mint) || this.busy.has(mint)) throw new Error('already holding this coin')
     const pos: Position = {
       mint,
       name: req.name,
@@ -222,10 +319,24 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
       nextSellAt: 0,
     }
     this.active.set(mint, pos)
+    this.busy.add(mint)
     this.d.risk.recordBuy()
     this.changed(pos)
+    try {
+      return await this.track(this.runBuy(pos, req))
+    } finally {
+      this.busy.delete(mint)
+    }
+  }
 
-    const result = await this.d.executor.buy(req)
+  private async runBuy(pos: Position, req: OpenRequest): Promise<Position> {
+    const result = await this.d.executor.buy(req, this.saveSubmitted(pos, 'buy'))
+    if (!result.ok && result.aborted) {
+      this.d.log.warn({ mint: pos.mint, signature: result.signature }, 'stopped with a buy in flight: the next start checks whether it landed')
+      this.changed(pos)
+      return pos
+    }
+    pos.pending = undefined
     if (!result.ok) {
       pos.status = 'failed'
       pos.error = result.error
@@ -234,33 +345,50 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
       pos.closedAt = Date.now()
       pos.costLamports = 0n
       // A buy that executed and failed still paid its network fee (tips only move on success).
-      if (result.landed) pos.networkFeesLamports = BASE_FEE + this.d.cfg.buyPriorityLamports
+      if (result.landed) {
+        pos.networkFeesLamports = result.networkFeeLamports ?? BASE_FEE_LAMPORTS + priorityLamports(this.d.cfg, 'buy')
+        if (!pos.paper && result.signature) this.landedFailure(pos, result.signature)
+      }
       this.finish(pos)
-      void this.journal.append({ type: 'buy-failed', at: Date.now(), mint, error: result.error, signature: result.signature, paper: pos.paper })
+      void this.journal.append({ type: 'buy-failed', at: Date.now(), mint: pos.mint, error: result.error, signature: result.signature, paper: pos.paper })
       return pos
     }
-
-    this.applyBuy(pos, req, result)
+    this.applyBuy(pos, result)
     return pos
   }
 
-  private applyBuy(pos: Position, req: OpenRequest, r: Extract<TradeResult, { ok: true }>): void {
+  /** Saves the signature of a transaction on its way, so a restart can settle it on-chain. */
+  private saveSubmitted(pos: Position, side: 'buy'): SubmitHooks
+  private saveSubmitted(pos: Position, side: 'sell', sale: Pick<PendingTx, 'tokens' | 'reason' | 'tier' | 'moonbag'>): SubmitHooks
+  private saveSubmitted(pos: Position, side: 'buy' | 'sell', sale: Partial<PendingTx> = {}): SubmitHooks {
+    return {
+      onSubmit: (signature, lastValidBlockHeight) => {
+        if (side === 'buy') pos.buySignature = signature
+        pos.pending = { side, signature, lastValidBlockHeight, ...sale, since: Date.now() }
+        // Written now, not debounced: a hard kill right after sending must not lose the signature.
+        void this.store.flush()
+      },
+    }
+  }
+
+  private applyBuy(pos: Position, r: Extract<TradeResult, { ok: true }>): void {
     pos.status = 'open'
-    pos.buySignature = r.signature
+    if (r.signature) pos.buySignature = r.signature
     pos.filledAt = Date.now()
-    pos.entrySlot = r.slot
-    pos.slotsAfterLaunch = req.launchSlot && r.slot ? r.slot - req.launchSlot : undefined
+    pos.entrySlot = r.slot || undefined
+    pos.slotsAfterLaunch = pos.launchSlot && r.slot ? r.slot - pos.launchSlot : undefined
     pos.tokensBought = r.tokens
     pos.tokensHeld = r.tokens
-    pos.costLamports = r.lamports > 0n ? r.lamports : req.lamports
-    pos.networkFeesLamports += this.estimatedNetworkFee('buy')
+    if (r.lamports > 0n) pos.costLamports = r.lamports
+    pos.networkFeesLamports += r.networkFeeLamports
     pos.timings = r.timings
     pos.simulation = r.simulation
     pos.lastPriceAt = Date.now()
-    if (!pos.paper) this.markLanded(pos)
+    if (!pos.paper && r.signature) this.markLanded(pos, r.signature)
     if (pos.tokensHeld === 0n) {
       pos.status = 'failed'
       pos.error = 'buy landed but token balance could not be determined; check the wallet manually'
+      this.alert(`⚠️ ${pos.symbol}: buy landed but no tokens were found in the wallet; check it manually (${pos.mint})`)
       this.finish(pos)
       return
     }
@@ -281,8 +409,8 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
       },
       'position opened',
     )
-    void this.journal.append({ type: 'buy', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, signature: r.signature, lamports: pos.costLamports, tokens: pos.tokensBought, slot: r.slot, slotsAfterLaunch: pos.slotsAfterLaunch, timings: r.timings, simulation: r.simulation })
-    if (!pos.paper) void this.reconcile(pos, r.signature)
+    void this.journal.append({ type: 'buy', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, signature: r.signature || undefined, lamports: pos.costLamports, tokens: pos.tokensBought, slot: r.slot, slotsAfterLaunch: pos.slotsAfterLaunch, timings: r.timings, simulation: r.simulation })
+    if (!pos.paper && r.signature) void this.reconcile(pos, r.signature)
     this.changed(pos)
   }
 
@@ -297,7 +425,12 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
   }
 
   private tick(): void {
+    this.retryReconciliations()
     for (const pos of this.active.values()) {
+      if (pos.pending) {
+        if (!pos.paper) void this.resolve(pos)
+        continue
+      }
       if (pos.status !== 'open') continue
       const state = this.d.market.get(pos.mint)
       this.reprice(pos, state)
@@ -319,7 +452,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
 
   private evaluate(pos: Position, state: MintState | undefined): void {
     const now = Date.now()
-    if (this.selling.has(pos.mint) || now < pos.nextSellAt) return
+    if (pos.pending || this.busy.has(pos.mint) || now < pos.nextSellAt) return
     let decision: ExitDecision
     if (state?.complete) {
       decision = { action: 'sell', pct: 100, reason: 'graduated to PumpSwap', urgent: true }
@@ -354,7 +487,7 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
       costLamports: Number(pos.costLamports),
       realizedLamports: Number(pos.realizedLamports),
       networkLamports: Number(pos.networkFeesLamports),
-      sellNetworkLamports: Number(this.estimatedNetworkFee('sell')),
+      sellNetworkLamports: Number(this.d.executor.networkFee('sell')),
     }
   }
 
@@ -374,77 +507,14 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
    */
   async sell(mint: string, pct: number, reason: string, tier?: number, moonbag = false): Promise<boolean> {
     const pos = this.active.get(mint)
-    if (!pos || pos.status !== 'open' || this.selling.has(mint)) return false
-    this.selling.add(mint)
+    if (!pos || pos.status !== 'open' || pos.pending || this.busy.has(mint) || this.stopping) return false
+    this.busy.add(mint)
     pos.status = 'closing'
     this.changed(pos)
-    const { exits } = this.d.cfg
     try {
-      const all = pct >= 100
-      let tokens = all ? pos.tokensHeld : (pos.tokensHeld * BigInt(Math.round(pct * 100))) / 10_000n
-      // Don't leave dust behind a partial sell.
-      if (!all && pos.tokensHeld - tokens < pos.tokensBought / 100n) tokens = pos.tokensHeld
-      if (tokens <= 0n) return false
-      const sellingAll = tokens === pos.tokensHeld
-      let migrationWaits = 0
-
-      for (let attempt = 0; attempt <= exits.sellRetries; attempt++) {
-        const slippageBps =
-          exits.sellRetries === 0
-            ? exits.sellSlippageBps
-            : Math.round(exits.sellSlippageBps + ((exits.sellMaxSlippageBps - exits.sellSlippageBps) * attempt) / exits.sellRetries)
-        const graduated = this.d.market.get(mint)?.complete ?? false
-        pos.sellAttempts++
-        const result = await this.d.executor.sell({
-          mint: new PublicKey(mint),
-          tokenProgram: new PublicKey(pos.tokenProgram),
-          creator: new PublicKey(this.d.market.get(mint)?.curve.creator ?? pos.creator),
-          isMayhemMode: pos.isMayhemMode,
-          tokens,
-          slippageBps,
-          // Only on the first attempt: a stray dust transfer would make the close fail.
-          closeAccount: sellingAll && exits.closeTokenAccount && attempt === 0 && !graduated,
-        })
-        if (result.ok) {
-          await this.applySell(pos, tokens, result, reason, tier, moonbag)
-          return true
-        }
-
-        this.d.log.warn({ mint, symbol: pos.symbol, attempt, slippageBps, error: result.error }, 'sell attempt failed')
-        if (result.landed) pos.networkFeesLamports += BASE_FEE + this.d.cfg.sellPriorityLamports
-        if (pos.paper && graduated) {
-          // Paper mode cannot route through the AMM: book at the last curve value.
-          await this.applySell(pos, tokens, { ok: true, paper: true, signature: 'paper-graduated', slot: 0, tokens, lamports: pos.valueLamports, tradeFeesLamports: 0n, timings: { buildMs: 0, sendMs: 0 } }, reason, tier, moonbag)
-          return true
-        }
-        if (/Pool account not found/i.test(result.error) && migrationWaits < 30) {
-          // Migration to PumpSwap not finished yet; wait and retry without using up attempts.
-          migrationWaits++
-          await new Promise((r) => setTimeout(r, 2_000))
-          attempt--
-          continue
-        }
-        if (!pos.paper && !result.slippage) {
-          // Unknown failure: re-sync the balance in case tokens moved.
-          const onChain = await this.d.executor.tokenBalance(new PublicKey(mint), new PublicKey(pos.tokenProgram)).catch(() => undefined)
-          if (onChain === 0n) {
-            pos.tokensHeld = 0n
-            pos.valueLamports = 0n
-            this.close(pos, `${reason} (tokens no longer in wallet)`)
-            return false
-          }
-          if (onChain !== undefined && onChain < tokens) tokens = onChain
-        }
-      }
-      pos.status = 'open'
-      pos.error = `sell failed after ${exits.sellRetries + 1} attempts`
-      // Back off before the exit policy retries: 2s, 4s, ... capped at 30s.
-      const failures = Math.ceil(pos.sellAttempts / (exits.sellRetries + 1))
-      pos.nextSellAt = Date.now() + Math.min(30_000, 2_000 * 2 ** Math.max(0, failures - 1))
-      this.changed(pos)
-      return false
+      return await this.track(this.runSell(pos, pct, reason, tier, moonbag))
     } finally {
-      this.selling.delete(mint)
+      this.busy.delete(mint)
       if (pos.status === 'closing') {
         pos.status = 'open'
         this.changed(pos)
@@ -452,11 +522,170 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     }
   }
 
-  async sellAll(reason: string): Promise<void> {
-    await Promise.all(this.list().filter((p) => p.status === 'open').map((p) => this.sell(p.mint, 100, reason)))
+  private async runSell(pos: Position, pct: number, reason: string, tier: number | undefined, moonbag: boolean): Promise<boolean> {
+    const { mint } = pos
+    const { exits } = this.d.cfg
+    const all = pct >= 100
+    let tokens = all ? pos.tokensHeld : (pos.tokensHeld * BigInt(Math.round(pct * 100))) / 10_000n
+    // Don't leave dust behind a partial sell.
+    if (!all && pos.tokensHeld - tokens < pos.tokensBought / 100n) tokens = pos.tokensHeld
+    if (tokens <= 0n) return false
+    const sellingAll = tokens === pos.tokensHeld
+    const signatures: string[] = []
+    let migrationWaits = 0
+
+    for (let attempt = 0; attempt <= exits.sellRetries; attempt++) {
+      // Shutting down: no new attempts; the exit policy decides again after the restart.
+      if (this.stopping) return false
+      const slippageBps =
+        exits.sellRetries === 0
+          ? exits.sellSlippageBps
+          : Math.round(exits.sellSlippageBps + ((exits.sellMaxSlippageBps - exits.sellSlippageBps) * attempt) / exits.sellRetries)
+      const graduated = this.d.market.get(mint)?.complete ?? false
+      // Only on the first attempt: a stray dust transfer would make the close fail.
+      const closeAccount = sellingAll && exits.closeTokenAccount && attempt === 0 && !graduated
+      pos.sellAttempts++
+      const result = await this.d.executor.sell(
+        {
+          mint: new PublicKey(mint),
+          tokenProgram: new PublicKey(pos.tokenProgram),
+          creator: new PublicKey(this.d.market.get(mint)?.curve.creator ?? pos.creator),
+          isMayhemMode: pos.isMayhemMode,
+          tokens,
+          slippageBps,
+          closeAccount,
+        },
+        this.saveSubmitted(pos, 'sell', { tokens, reason, tier, moonbag }),
+      )
+      if (result.ok) {
+        pos.pending = undefined
+        this.applySell(pos, tokens, result, reason, tier, moonbag)
+        this.sellRecovered(pos)
+        if (pos.status === 'closed' && !closeAccount && !pos.paper && exits.closeTokenAccount) void this.closeTokenAccount(pos)
+        return true
+      }
+      if (result.aborted) {
+        this.d.log.warn({ mint, symbol: pos.symbol, signature: result.signature }, 'stopped with a sell in flight: the next start checks whether it landed')
+        return false
+      }
+      pos.pending = undefined
+      if (result.signature) signatures.push(result.signature)
+
+      this.d.log.warn({ mint, symbol: pos.symbol, attempt, slippageBps, error: result.error }, 'sell attempt failed')
+      if (result.landed) {
+        pos.networkFeesLamports += result.networkFeeLamports ?? BASE_FEE_LAMPORTS + priorityLamports(this.d.cfg, 'sell')
+        if (!pos.paper && result.signature) this.landedFailure(pos, result.signature)
+      }
+      if (pos.paper && graduated) {
+        // Paper mode cannot route through the AMM: book at the last curve value.
+        const paper = { ok: true, paper: true, signature: 'paper-graduated', slot: 0, tokens, lamports: pos.valueLamports, tradeFeesLamports: 0n, networkFeeLamports: this.d.executor.networkFee('sell'), timings: { buildMs: 0, sendMs: 0 } } as const
+        this.applySell(pos, tokens, paper, reason, tier, moonbag)
+        return true
+      }
+      if (/Pool account not found/i.test(result.error) && migrationWaits < 30) {
+        // Migration to PumpSwap not finished yet; wait and retry without using up attempts.
+        migrationWaits++
+        await sleep(2_000)
+        attempt--
+        continue
+      }
+      if (!pos.paper && !result.slippage) {
+        // Unknown failure: tokens may have left the wallet (an attempt that
+        // was given up on landed after all).
+        const onChain = await this.settledBalance(pos)
+        if (onChain !== undefined && onChain < pos.tokensHeld) {
+          this.bookMissing(pos, pos.tokensHeld - onChain, await this.landedAmong(signatures), reason, tier, moonbag)
+          return true
+        }
+      }
+    }
+    pos.status = 'open'
+    pos.error = `sell failed after ${exits.sellRetries + 1} attempts`
+    // Back off before the exit policy retries: 2s, 4s, ... capped at 30s.
+    const failures = Math.ceil(pos.sellAttempts / (exits.sellRetries + 1))
+    pos.nextSellAt = Date.now() + Math.min(30_000, 2_000 * 2 ** Math.max(0, failures - 1))
+    this.sellFailed(pos, reason)
+    this.changed(pos)
+    return false
   }
 
-  private async applySell(pos: Position, tokens: bigint, r: Extract<TradeResult, { ok: true }>, reason: string, tier?: number, moonbag = false): Promise<void> {
+  async sellAll(reason: string): Promise<void> {
+    await Promise.all(this.list().filter((p) => p.status === 'open' && !p.pending).map((p) => this.sell(p.mint, 100, reason)))
+  }
+
+  private sellFailed(pos: Position, reason: string): void {
+    pos.sellFailures = (pos.sellFailures ?? 0) + 1
+    if (pos.sellFailures !== STUCK_ALERT_ROUNDS) return
+    this.alert(`⚠️ ${pos.symbol}: selling keeps failing (${STUCK_ALERT_ROUNDS} rounds, ${reason}): ${pos.error ?? 'unknown error'}. The bot keeps retrying; check the RPC and landing if this lasts.`)
+  }
+
+  private sellRecovered(pos: Position): void {
+    if ((pos.sellFailures ?? 0) >= STUCK_ALERT_ROUNDS) this.alert(`✅ ${pos.symbol}: sold after all`)
+    pos.sellFailures = 0
+  }
+
+  /**
+   * Books tokens that left the wallet without a sale the bot saw complete. With
+   * the signature of the sale that took them, reconciliation makes the P&L
+   * exact; without one it stays an estimate at the last price, and the owner
+   * is told to check the wallet.
+   */
+  private bookMissing(pos: Position, tokens: bigint, signature: string | undefined, reason: string, tier?: number, moonbag = false): void {
+    if (!signature) {
+      pos.estimated = 'tokens left the wallet without a sale the bot saw; proceeds estimated at the last price'
+      this.alert(`⚠️ ${pos.symbol}: tokens left the wallet without a sale the bot saw; booked at the last price. Check the wallet (${pos.mint}).`)
+    }
+    this.reprice(pos)
+    const found = { ok: true, paper: false, signature: signature ?? '', slot: 0, tokens, lamports: 0n, tradeFeesLamports: 0n, networkFeeLamports: signature ? this.d.executor.networkFee('sell') : 0n, timings: { buildMs: 0, sendMs: 0 } } as const
+    this.applySell(pos, tokens, found, `${reason} (found on-chain)`, tier, moonbag)
+  }
+
+  /**
+   * Token balance, read twice a moment apart and the higher one kept: right
+   * after a trade the RPC can still show the balance from before it, and a
+   * stale low reading must never book tokens as gone.
+   */
+  private async settledBalance(pos: Position): Promise<bigint | undefined> {
+    const read = () => this.d.executor.tokenBalance(new PublicKey(pos.mint), new PublicKey(pos.tokenProgram)).catch(() => undefined)
+    const first = await read()
+    if (first === undefined || first >= pos.tokensHeld) return first
+    await sleep(2_000)
+    const second = await read()
+    if (second === undefined) return undefined
+    return second > first ? second : first
+  }
+
+  /** The newest of `signatures` that landed, if any. */
+  private async landedAmong(signatures: string[]): Promise<string | undefined> {
+    for (const sig of [...signatures].reverse()) {
+      if ((await this.d.executor.txOutcome(sig).catch(() => 'unknown')) === 'landed') return sig
+    }
+    return undefined
+  }
+
+  /**
+   * A full exit that could not close the token account in the same
+   * transaction (a retry, or a graduated coin) leaves its rent behind:
+   * close it once the account reads empty.
+   */
+  private async closeTokenAccount(pos: Position): Promise<void> {
+    for (let i = 0; i < 3 && !this.stopping; i++) {
+      await sleep(3_000)
+      try {
+        const r = await this.d.executor.closeTokenAccount(new PublicKey(pos.mint), new PublicKey(pos.tokenProgram))
+        if (r.ok) {
+          this.d.log.info({ mint: pos.mint, symbol: pos.symbol, signature: r.signature }, 'closed the empty token account')
+          this.landedFailure(pos, r.signature)
+          return
+        }
+        if (r.error !== 'the account still holds tokens') return
+      } catch (err) {
+        this.d.log.debug({ mint: pos.mint, err: (err as Error).message }, 'could not close the token account yet')
+      }
+    }
+  }
+
+  private applySell(pos: Position, tokens: bigint, r: Extract<TradeResult, { ok: true }>, reason: string, tier?: number, moonbag = false): void {
     let lamports = r.lamports
     if (lamports === 0n && !r.paper) {
       // Fill was not seen on the stream; book the expected proceeds until reconciled.
@@ -464,14 +693,14 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     }
     pos.tokensHeld -= tokens
     pos.realizedLamports += lamports
-    pos.networkFeesLamports += this.estimatedNetworkFee('sell')
+    pos.networkFeesLamports += r.networkFeeLamports
     pos.sells.push({ at: Date.now(), tokens, lamports, signature: r.signature, reason })
-    if (!r.paper) this.markLanded(pos)
+    if (!r.paper && r.signature) this.markLanded(pos, r.signature)
     if (tier !== undefined) pos.tiersDone = tier + 1
     pos.error = undefined
     this.d.log.info({ mint: pos.mint, symbol: pos.symbol, reason, sol: lamportsToSol(lamports), tokens: Number(tokens) / 1e6, paper: pos.paper }, 'sold')
-    void this.journal.append({ type: 'sell', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, signature: r.signature, lamports, tokens, reason, timings: r.timings, simulation: r.simulation })
-    if (!r.paper) void this.reconcile(pos, r.signature)
+    void this.journal.append({ type: 'sell', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, signature: r.signature || undefined, lamports, tokens, reason, timings: r.timings, simulation: r.simulation })
+    if (!r.paper && r.signature) void this.reconcile(pos, r.signature)
     if (pos.tokensHeld <= 0n) {
       pos.tokensHeld = 0n
       pos.valueLamports = 0n
@@ -514,21 +743,33 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
         void this.journal.append({ type: 'close', at: Date.now(), mint: pos.mint, symbol: pos.symbol, paper: pos.paper, reason: pos.closeReason, pnlLamports: pnl, cost: pos.costLamports, realized: pos.realizedLamports, networkFees: pos.networkFeesLamports })
       }
     }
+    if (!pos.paper && pos.unreconciled?.length) this.keepSettling(pos)
     this.store.schedule()
     this.emit('closed', pos)
   }
 
   // Accounting ----------------------------------------------------------------
 
-  /** A new landed tx makes the wallet delta incomplete until it is reconciled too. */
-  private markLanded(pos: Position): void {
-    pos.landedTxs++
-    pos.reconciled = pos.reconciledTxs >= pos.landedTxs
+  /** A transaction that executed and failed still moved the wallet (its fees): reconcile it like any other. */
+  private landedFailure(pos: Position, signature: string): void {
+    this.markLanded(pos, signature)
+    void this.reconcile(pos, signature)
   }
 
-  private estimatedNetworkFee(side: 'buy' | 'sell'): bigint {
-    const c = this.d.cfg
-    return side === 'buy' ? c.buyTipLamports + c.buyPriorityLamports + BASE_FEE : c.sellTipLamports + c.sellPriorityLamports + BASE_FEE
+  /** A new landed tx makes the wallet delta incomplete until it is reconciled too. */
+  private markLanded(pos: Position, signature: string): void {
+    if (pos.unreconciled?.includes(signature)) return
+    pos.landedTxs++
+    pos.reconciled = pos.reconciledTxs >= pos.landedTxs
+    pos.unreconciled = [...(pos.unreconciled ?? []), signature]
+    pos.unreconciledSince ??= Date.now()
+    if (isFinished(pos)) this.keepSettling(pos)
+  }
+
+  /** A finished position stays in the file until its last transactions are reconciled. */
+  private keepSettling(pos: Position): void {
+    this.settling.set(settlingKey(pos), pos)
+    this.store.schedule()
   }
 
   /**
@@ -537,30 +778,82 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
    * (totals and daily risk) is corrected by the difference.
    */
   private async reconcile(pos: Position, signature: string): Promise<void> {
-    const delta = await this.d.executor.walletDelta(signature)
-    if (delta === undefined) {
-      this.d.log.warn({ mint: pos.mint, signature }, 'could not reconcile transaction; P&L stays estimated')
-      return
+    if (this.reconciling.has(signature)) return
+    this.reconciling.add(signature)
+    try {
+      await this.reconcileOnce(pos, signature)
+    } finally {
+      this.reconciling.delete(signature)
     }
+  }
+
+  private async reconcileOnce(pos: Position, signature: string): Promise<void> {
+    const t = this.d.reconcile ?? {}
+    const delta = await this.d.executor.walletDelta(signature, { attempts: t.attempts, delayMs: t.delayMs })
+    // Checked again: a restart may have retried it while this one was still waiting.
+    if (!pos.unreconciled?.includes(signature)) return
+    if (delta === undefined) return this.reconcileFailed(pos, signature)
     pos.walletDeltaLamports = (pos.walletDeltaLamports ?? 0n) + delta
+    pos.unreconciled = pos.unreconciled.filter((s) => s !== signature)
     pos.reconciledTxs++
+    pos.reconcileFailures = 0
+    if (!pos.unreconciled.length) {
+      pos.unreconciledSince = undefined
+      pos.nextReconcileAt = undefined
+      if (this.settling.delete(settlingKey(pos))) this.store.schedule()
+    }
     pos.reconciled = pos.reconciledTxs >= pos.landedTxs
     if (pos.reconciled && pos.bookedPnlLamports !== undefined) {
       const exact = positionPnl(pos)
       const correction = exact - pos.bookedPnlLamports
       if (correction !== 0n) {
-        const wasWin = pos.bookedPnlLamports > 0n
-        this.totals.netPnlLamports += correction
-        this.d.risk.recordRealized(correction)
-        if (wasWin !== exact > 0n) {
-          this.totals.wins += wasWin ? -1 : 1
-          this.totals.losses += wasWin ? 1 : -1
+        // A trade booked by an earlier run is not in this run's totals, and its
+        // correction belongs to today's loss limit only if it closed today.
+        const earlier = this.earlierRun.has(pos)
+        if (!earlier) {
+          const wasWin = pos.bookedPnlLamports > 0n
+          this.totals.netPnlLamports += correction
+          if (wasWin !== exact > 0n) {
+            this.totals.wins += wasWin ? -1 : 1
+            this.totals.losses += wasWin ? 1 : -1
+          }
         }
+        if (!earlier || utcDay(pos.closedAt ?? 0) === utcDay(Date.now())) this.d.risk.recordRealized(correction)
         pos.bookedPnlLamports = exact
         void this.journal.append({ type: 'reconcile', at: Date.now(), mint: pos.mint, pnlLamports: exact, correctionLamports: correction })
+        this.emit('reconciled', pos, correction)
       }
     }
     this.changed(pos)
+  }
+
+  /** Not found yet (a slow or failing RPC): try again later, and give up after a few days. */
+  private reconcileFailed(pos: Position, signature: string): void {
+    pos.reconcileFailures = (pos.reconcileFailures ?? 0) + 1
+    if (Date.now() - (pos.unreconciledSince ?? Date.now()) > RECONCILE_GIVE_UP_MS) {
+      pos.estimated = `the exact result of ${pos.unreconciled?.length ?? 1} transaction(s) was not found in 3 days; P&L stays estimated`
+      this.d.log.warn({ mint: pos.mint, signature, unreconciled: pos.unreconciled }, 'giving up on reconciling; P&L stays estimated')
+      pos.unreconciled = []
+      pos.unreconciledSince = undefined
+      pos.nextReconcileAt = undefined
+      this.settling.delete(settlingKey(pos))
+      this.changed(pos)
+      return
+    }
+    const base = this.d.reconcile?.retryMs ?? 60_000
+    pos.nextReconcileAt = Date.now() + Math.min(3_600_000, base * 2 ** Math.min(pos.reconcileFailures - 1, 10))
+    this.d.log.warn({ mint: pos.mint, signature, tries: pos.reconcileFailures }, 'could not reconcile transaction yet; retrying later')
+    this.store.schedule()
+  }
+
+  /** Failed reconciliations that are due again, of open and of finished positions. */
+  private retryReconciliations(): void {
+    const now = Date.now()
+    for (const pos of [...this.active.values(), ...this.settling.values()]) {
+      if (pos.paper || !pos.unreconciled?.length || pos.nextReconcileAt === undefined || now < pos.nextReconcileAt) continue
+      pos.nextReconcileAt = undefined
+      for (const sig of pos.unreconciled) void this.reconcile(pos, sig)
+    }
   }
 
   private changed(pos: Position): void {
@@ -568,38 +861,165 @@ export class PositionManager extends EventEmitter<{ update: [Position]; closed: 
     this.emit('update', pos)
   }
 
+  private alert(message: string): void {
+    this.d.log.warn(message)
+    this.emit('alert', message)
+  }
+
+  private track<T>(p: Promise<T>): Promise<T> {
+    const tracked: Promise<T> = p.finally(() => this.inflight.delete(tracked))
+    this.inflight.add(tracked)
+    return tracked
+  }
+
   // Restore -------------------------------------------------------------------
 
-  /** Reloads open positions after a restart and re-seeds their live curve state. */
+  /**
+   * Reloads the positions after a restart and re-seeds their live curve
+   * state. Live positions are checked against the chain before they trade
+   * again: a buy or sell in flight at the stop may have landed since, and
+   * after a crash the saved holdings may be out of date.
+   */
   private async restore(): Promise<void> {
     const saved = await readJson<Record<string, unknown>[]>(join(this.d.cfg.dataDir, 'positions.json'))
     if (!saved?.length) return
+    const restored: Position[] = []
     for (const raw of saved) {
       const pos = reviveBigints(raw) as unknown as Position
-      if (pos.paper !== this.d.executor.paper) continue
-      if (pos.status === 'opening') {
-        // Crashed mid-buy: trust the chain, not the file.
-        const bal = await this.d.executor.tokenBalance(new PublicKey(pos.mint), new PublicKey(pos.tokenProgram)).catch(() => 0n)
-        if (bal === 0n) continue
-        pos.tokensBought = bal
-        pos.tokensHeld = bal
+      if (pos.paper !== this.d.executor.paper) {
+        this.foreign.push(raw)
+        continue
       }
-      pos.status = 'open'
-      pos.nextSellAt = 0
-      try {
-        const acct = await this.d.rpc.getAccountInfo(bondingCurvePda(new PublicKey(pos.mint)))
-        if (acct) {
-          const curve = curveFromAccount(decodeBondingCurve(acct.data))
-          this.d.market.seed(new PublicKey(pos.mint), curve, 0)
+      if (isFinished(pos)) {
+        // Closed before the stop, its last reconciliations cut off: finish them.
+        if (!pos.paper && pos.unreconciled?.length) {
+          this.settling.set(settlingKey(pos), pos)
+          this.earlierRun.add(pos)
+          for (const sig of pos.unreconciled) void this.reconcile(pos, sig)
         }
-      } catch (err) {
-        this.d.log.warn({ mint: pos.mint, err: (err as Error).message }, 'could not refresh curve for restored position')
+        continue
       }
+      if (pos.paper) {
+        if (pos.status === 'opening') continue // a paper buy ends with the process
+        pos.pending = undefined
+      } else if (!pos.pending) {
+        pos.pending = pos.status === 'opening' ? { side: 'buy', since: pos.openedAt } : { side: 'sync', since: Date.now() }
+      }
+      pos.status = pos.pending?.side === 'buy' ? 'opening' : 'open'
+      pos.nextSellAt = 0
+      pos.nextResolveAt = 0
+      restored.push(pos)
+    }
+    // All at once: a slow RPC must not stretch the start by the number of positions.
+    await Promise.all(restored.map((pos) => this.seedCurve(pos)))
+    for (const pos of restored) {
       this.active.set(pos.mint, pos)
-      this.d.log.info({ mint: pos.mint, symbol: pos.symbol }, 'restored open position')
+      this.d.log.info({ mint: pos.mint, symbol: pos.symbol, check: pos.pending?.side }, 'restored position')
+    }
+    if (this.foreign.length) {
+      const mode = this.d.executor.paper ? 'live' : 'paper'
+      const bags = this.foreign.filter((p) => (p as { moonbag?: boolean }).moonbag).length
+      this.alert(
+        `⚠️ ${this.foreign.length} ${mode} position(s)${bags ? ` (${bags} moonbag(s))` : ''} from before DRY_RUN changed are kept but not managed; switch back to manage them.`,
+      )
+    }
+    await Promise.all(restored.filter((pos) => pos.pending).map((pos) => this.resolve(pos)))
+    // Reconciliations the last stop cut off.
+    for (const pos of restored) if (!pos.paper) for (const sig of pos.unreconciled ?? []) void this.reconcile(pos, sig)
+  }
+
+  private async seedCurve(pos: Position): Promise<void> {
+    try {
+      const acct = await this.d.rpc.getAccountInfo(bondingCurvePda(new PublicKey(pos.mint)))
+      if (acct) this.d.market.seed(new PublicKey(pos.mint), curveFromAccount(decodeBondingCurve(acct.data)), 0)
+    } catch (err) {
+      this.d.log.warn({ mint: pos.mint, err: (err as Error).message }, 'could not refresh curve for restored position')
     }
   }
+
+  /** Settles a pending position on-chain; retried from the tick until it succeeds. */
+  private async resolve(pos: Position): Promise<void> {
+    const p = pos.pending
+    if (!p || this.busy.has(pos.mint) || Date.now() < (pos.nextResolveAt ?? 0)) return
+    this.busy.add(pos.mint)
+    try {
+      await this.track(this.settle(pos, p))
+      if ((pos.resolveFailures ?? 0) >= UNSETTLED_ALERT_TRIES) this.alert(`✅ ${pos.symbol}: checked on-chain again; managed as usual`)
+      pos.resolveFailures = 0
+    } catch (err) {
+      pos.nextResolveAt = Date.now() + (this.d.retryMs ?? 10_000)
+      pos.resolveFailures = (pos.resolveFailures ?? 0) + 1
+      this.d.log.warn({ mint: pos.mint, err: (err as Error).message, tries: pos.resolveFailures }, 'could not check the position on-chain yet; retrying')
+      if (pos.resolveFailures === UNSETTLED_ALERT_TRIES) {
+        this.alert(`⚠️ ${pos.symbol}: cannot check this position on-chain (${(err as Error).message}); it is not traded until it can, so no stop-loss meanwhile. Retrying every 10 s.`)
+      }
+    } finally {
+      this.busy.delete(pos.mint)
+    }
+  }
+
+  private async settle(pos: Position, p: PendingTx): Promise<void> {
+    // RPC errors throw: an unreadable balance is never taken for an empty one.
+    const balance = await this.d.executor.tokenBalance(new PublicKey(pos.mint), new PublicKey(pos.tokenProgram))
+    const outcome = p.signature ? await this.d.executor.txOutcome(p.signature) : 'unknown'
+    const mayStillLand = async () =>
+      outcome === 'unknown' && (p.lastValidBlockHeight ? !(await this.d.executor.expired(p.lastValidBlockHeight)) : Date.now() - p.since < UNKNOWN_TX_MS)
+
+    if (p.side === 'buy') {
+      // Tokens in the wallet while the buy failed are not from it (left from before): the buy failed.
+      if (balance > 0n && outcome !== 'failed') {
+        // Seen, but not confirmed yet: wait, so it is booked with its transaction.
+        if (p.signature && outcome === 'unknown' && (await mayStillLand())) {
+          pos.nextResolveAt = Date.now() + 3_000
+          return
+        }
+        pos.pending = undefined
+        // Only a confirmed transaction is reconciled: tokens alone don't say which one brought them.
+        const signature = outcome === 'landed' ? p.signature : undefined
+        if (!signature) pos.estimated = 'buy found on-chain after a restart without a confirmed transaction; its cost is the amount that was sent'
+        this.d.log.info({ mint: pos.mint, symbol: pos.symbol, tokens: balance.toString() }, 'buy from before the restart landed')
+        this.applyBuy(pos, { ok: true, paper: false, signature: signature ?? '', slot: 0, tokens: balance, lamports: 0n, tradeFeesLamports: 0n, networkFeeLamports: this.d.executor.networkFee('buy'), timings: { buildMs: 0, sendMs: 0 } })
+        return
+      }
+      if (await mayStillLand()) {
+        pos.nextResolveAt = Date.now() + 3_000
+        return
+      }
+      pos.pending = undefined
+      pos.status = 'failed'
+      pos.closedAt = Date.now()
+      pos.costLamports = 0n
+      if (outcome === 'failed') {
+        pos.error = 'buy failed on-chain (found after a restart)'
+        pos.networkFeesLamports = BASE_FEE_LAMPORTS + priorityLamports(this.d.cfg, 'buy')
+        if (p.signature) this.landedFailure(pos, p.signature)
+      } else if (outcome === 'landed') {
+        pos.error = 'buy landed but no tokens are in the wallet'
+        this.alert(`⚠️ ${pos.symbol}: a buy from before the restart landed but no tokens are in the wallet; check it manually (${pos.mint})`)
+      } else {
+        pos.error = 'buy never landed'
+      }
+      this.finish(pos)
+      return
+    }
+
+    if (balance >= pos.tokensHeld) {
+      if (p.side === 'sell' && (await mayStillLand())) {
+        pos.nextResolveAt = Date.now() + 3_000
+        return
+      }
+      pos.pending = undefined
+      this.changed(pos)
+      return
+    }
+    pos.pending = undefined
+    const sold = p.side === 'sell' && outcome === 'landed'
+    this.bookMissing(pos, pos.tokensHeld - balance, sold ? p.signature : undefined, p.reason ?? 'sold before the restart', sold ? p.tier : undefined, sold ? p.moonbag : false)
+  }
 }
+
+const isFinished = (p: Position) => p.status === 'closed' || p.status === 'failed'
+const settlingKey = (p: Position) => `${p.mint}:${p.openedAt}`
 
 const BIGINT_FIELDS = new Set([
   'costLamports',

@@ -1,6 +1,7 @@
 import type { Config } from '../config.js'
 import { type ExitDecision, decideExit, moonbagFloorPct } from '../strategy/exits.js'
 import { EARLY_WINDOW_MS, type MomentumSnapshot, decideMomentum } from '../strategy/momentum.js'
+import { txNetworkLamports } from '../trading/fees.js'
 import type { LaunchRecord } from './record.js'
 
 export interface ReplayConfig {
@@ -39,8 +40,12 @@ export interface ReplayResult {
   peakGainPct: number
 }
 
+/**
+ * Replay settings from a config. Network fees are taken at their worst case
+ * (dynamic priority fees at their cap), so a replayed strategy never looks
+ * better than it may trade.
+ */
 export function replayConfigFrom(cfg: Config, over: Partial<ReplayConfig> = {}): ReplayConfig {
-  const base = 5_000
   return {
     entry: cfg.entryMode,
     momentum: cfg.momentum,
@@ -49,8 +54,8 @@ export function replayConfigFrom(cfg: Config, over: Partial<ReplayConfig> = {}):
     latencyMs: cfg.paperLatencyMs,
     buyLamports: Number(cfg.buyLamports),
     buySlippageBps: cfg.buySlippageBps,
-    buyNetworkLamports: Number(cfg.buyTipLamports + cfg.buyPriorityLamports) + base,
-    sellNetworkLamports: Number(cfg.sellTipLamports + cfg.sellPriorityLamports) + base,
+    buyNetworkLamports: Number(txNetworkLamports(cfg, 'buy', 'worst')),
+    sellNetworkLamports: Number(txNetworkLamports(cfg, 'sell', 'worst')),
     ...over,
   }
 }
@@ -118,8 +123,14 @@ export function replayLaunch(rec: LaunchRecord, c: ReplayConfig): ReplayResult {
     let devSold = false
     let i = 0
     let decided = false
-    // Check at every trade and on a 250ms clock, like the live engine.
-    for (let t = 0; t <= Math.min(c.momentum.maxAgeMs + 250, end); t += 250) {
+    // Decide after every trade and on a 250ms clock, like the live engine.
+    const limit = Math.min(c.momentum.maxAgeMs + 250, end)
+    let tick = 0
+    for (;;) {
+      const nextTrade = i < trades.length ? trades[i]![0] : Number.POSITIVE_INFINITY
+      const t = Math.min(tick, nextTrade)
+      if (t > limit) break
+      if (t === tick) tick += 250
       while (i < trades.length && trades[i]![0] <= t) {
         const [dt, , vtAfter, side, lamports, wallet] = trades[i]!
         const tokens = Math.abs(lastVt - vtAfter)

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { minViableBuyLamports } from './trading/fees.js'
 
 // Env parsing helpers -----------------------------------------------------------
 
@@ -200,6 +201,10 @@ const schema = z.object({
   // Notifications
   TELEGRAM_BOT_TOKEN: optionalString,
   TELEGRAM_CHAT_ID: optionalString,
+  TELEGRAM_OWNER_IDS: z
+    .string()
+    .default('')
+    .refine((v) => v.split(',').every((id) => !id.trim() || /^\d+$/.test(id.trim())), 'comma-separated numeric Telegram user ids'),
   TELEGRAM_API_URL: z.string().url().default('https://api.telegram.org'),
   NOTIFY_TRADES: bool(false),
   NOTIFY_DAILY_HOUR_UTC: num(7, { min: -1, max: 23, int: true }),
@@ -357,7 +362,7 @@ export interface Config {
     maxChanges: number
     probationTrades: number
     cooldownMs: number
-    /** Only buy while the settings in effect make money on recent launches. */
+    /** Only buy while the settings in effect made money on launches recorded after they were chosen. */
     requireEdge: boolean
     /** Live autotune: trade size (% of normal) while new settings are on probation. */
     liveProbationSizePct: number
@@ -367,7 +372,7 @@ export interface Config {
   costs: { perMonth: number; currency: 'usd' | 'eur' | 'sol' }
 
   notify: {
-    telegram?: { token: string; chatId: string; apiUrl: string }
+    telegram?: { token: string; chatId: string; apiUrl: string; ownerIds: string[] }
     /** Also report every closed trade. */
     trades: boolean
     /** UTC hour of the daily summary; -1 disables it. */
@@ -394,6 +399,9 @@ export function deriveWsUrl(rpcUrl: string): string {
   u.protocol = u.protocol === 'http:' ? 'ws:' : 'wss:'
   return u.toString()
 }
+
+/** Only this machine can connect to a server bound here. */
+export const isLoopbackHost = (host: string) => /^(localhost|127(\.\d{1,3}){3}|::1|\[::1\])$/.test(host)
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = schema.safeParse(env)
@@ -423,6 +431,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.MOMENTUM_MAX_AGE_MS <= e.MOMENTUM_MIN_AGE_MS) {
     throw new Error('MOMENTUM_MAX_AGE_MS must be greater than MOMENTUM_MIN_AGE_MS')
   }
+  if (!isLoopbackHost(e.API_HOST) && !e.API_TOKEN) {
+    throw new Error(`API_HOST=${e.API_HOST} makes the control API reachable from other machines: set API_TOKEN (16+ characters), or keep API_HOST=127.0.0.1 and use an SSH tunnel`)
+  }
+  if (e.API_TOKEN && e.API_TOKEN.length < 16) throw new Error('API_TOKEN must be at least 16 characters (e.g. `openssl rand -hex 24`)')
+  // The dashboard sends it as a WebSocket subprotocol, which allows only these characters.
+  if (e.API_TOKEN && !/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(e.API_TOKEN)) throw new Error('API_TOKEN may contain letters, digits and ! # $ % & \' * + - . ^ _ ` | ~ only (e.g. `openssl rand -hex 24`)')
+  if (e.MOMENTUM_MIN_SMART_BUYERS > 0 && e.MOMENTUM_MAX_AGE_MS > 60_000) {
+    // Smart buyers are only known among the first minute's buyers (SMART_EARLY_MS): replay could not check a longer window.
+    throw new Error('MOMENTUM_MIN_SMART_BUYERS needs MOMENTUM_MAX_AGE_MS <= 60000 (smart buyers are judged on the first minute)')
+  }
   if (e.MIN_BUY_SOL > e.BUY_SOL) throw new Error('MIN_BUY_SOL must be <= BUY_SOL')
   if (e.NOTIFY_DIGEST_HOURS > 0 && 24 % e.NOTIFY_DIGEST_HOURS !== 0) {
     throw new Error('NOTIFY_DIGEST_HOURS must divide the day evenly: 1, 2, 3, 4, 6, 8, 12 or 24 (0 = off)')
@@ -451,7 +469,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error('Live trading (DRY_RUN=false) requires PRIVATE_KEY or KEYPAIR_PATH')
   }
 
-  return {
+  const cfg: Config = {
     rpcUrl: e.RPC_URL,
     wsUrl: e.WS_URL ?? deriveWsUrl(e.RPC_URL),
     sendRpcUrls: e.SEND_RPC_URLS,
@@ -583,7 +601,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     costs: { perMonth: e.OPERATING_COST_PER_MONTH, currency: e.OPERATING_COST_CURRENCY },
 
     notify: {
-      telegram: e.TELEGRAM_BOT_TOKEN && e.TELEGRAM_CHAT_ID ? { token: e.TELEGRAM_BOT_TOKEN, chatId: e.TELEGRAM_CHAT_ID, apiUrl: e.TELEGRAM_API_URL } : undefined,
+      telegram:
+        e.TELEGRAM_BOT_TOKEN && e.TELEGRAM_CHAT_ID
+          ? { token: e.TELEGRAM_BOT_TOKEN, chatId: e.TELEGRAM_CHAT_ID, apiUrl: e.TELEGRAM_API_URL, ownerIds: e.TELEGRAM_OWNER_IDS.split(',').map((id) => id.trim()).filter(Boolean) }
+          : undefined,
       trades: e.NOTIFY_TRADES,
       dailyHourUtc: e.NOTIFY_DAILY_HOUR_UTC,
       digestHours: e.NOTIFY_DIGEST_HOURS,
@@ -596,16 +617,40 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     dataDir: e.DATA_DIR,
     logLevel: e.LOG_LEVEL,
   }
+
+  // BUY_SOL is the most a trade may be: it must be large enough that the
+  // round-trip fees, at their worst, stay under MAX_FEE_DRAG_PCT of it.
+  const minViable = minViableBuyLamports(cfg)
+  if (minViable > cfg.buyLamports) {
+    const worst = e.PRIORITY_FEE_MODE === 'dynamic' ? ` (dynamic priority fees counted at PRIORITY_FEE_MAX_SOL=${e.PRIORITY_FEE_MAX_SOL})` : ''
+    throw new Error(
+      `BUY_SOL=${e.BUY_SOL} is below the smallest trade worth its fees, ${lamportsToSol(minViable).toFixed(4)} SOL: round-trip tips and priority fees${worst} must stay under MAX_FEE_DRAG_PCT=${e.MAX_FEE_DRAG_PCT}% of a trade. Raise BUY_SOL, lower the fees, or raise MAX_FEE_DRAG_PCT.`,
+    )
+  }
+  // The tuner and the edge gate need AUTOTUNE_MIN_HOURS of data inside what they load:
+  // the newest AUTOTUNE_DAYS daily files, today's still filling up, so as little as
+  // (AUTOTUNE_DAYS - 1) full days right after midnight UTC.
+  const loadedHours = (cfg.autotune.days - 1) * 24
+  if ((cfg.autotune.requireEdge || cfg.autotune.mode !== 'off') && cfg.autotune.minHours > loadedHours) {
+    const days = Math.ceil(cfg.autotune.minHours / 24) + 1
+    throw new Error(
+      `AUTOTUNE_MIN_HOURS=${e.AUTOTUNE_MIN_HOURS} can't always be reached with AUTOTUNE_DAYS=${e.AUTOTUNE_DAYS} of daily files (today's is partial, so as little as ${loadedHours}h are loaded): set AUTOTUNE_DAYS=${days} or more, or lower AUTOTUNE_MIN_HOURS`,
+    )
+  }
+  return cfg
 }
 
 /** Config with secrets stripped, safe to log or expose on the API. */
 export function publicConfig(c: Config) {
+  // Providers put keys in the query (?api-key=), in the path (QuickNode, Triton: /<key>/) or in the user info.
   const redact = (u: string) => {
     try {
       const url = new URL(u)
-      for (const k of [...url.searchParams.keys()]) url.searchParams.set(k, '***')
-      if (url.password) url.password = '***'
-      return url.toString()
+      const path = url.pathname
+        .split('/')
+        .map((seg) => (/[A-Za-z0-9_-]{16,}/.test(seg) ? '***' : seg))
+        .join('/')
+      return `${url.protocol}//${url.host}${path}${url.search ? '?***' : ''}`
     } catch {
       return '***'
     }
@@ -616,6 +661,8 @@ export function publicConfig(c: Config) {
     rpcUrl: redact(c.rpcUrl),
     wsUrl: redact(c.wsUrl),
     sendRpcUrls: c.sendRpcUrls.map(redact),
+    heliusSenderUrl: redact(c.heliusSenderUrl),
+    jitoUrls: c.jitoUrls.map(redact),
     grpc: grpc ? { url: redact(grpc.url), deshred: grpc.deshred } : undefined,
     jitoAuthUuid: c.jitoAuthUuid ? '***' : undefined,
     api: { host: api.host, port: api.port, tokenSet: Boolean(api.token) },

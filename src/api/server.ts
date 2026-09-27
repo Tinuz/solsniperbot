@@ -1,14 +1,24 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { publicConfig } from '../config.js'
+import { isLoopbackHost, publicConfig } from '../config.js'
 import type { Engine, EngineEvent } from '../engine.js'
 import { toJson } from '../util/json.js'
 import type { Logger } from '../util/logger.js'
 
 const MAX_BODY = 16 * 1024
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+/** Browsers cannot set headers on a WebSocket: the dashboard offers the token as a subprotocol after this one. */
+export const WS_AUTH_PROTOCOL = 'sniper-auth'
+
+/** Constant-time comparison (hashing first makes the lengths equal). */
+function sameSecret(given: string, expected: string): boolean {
+  const a = createHash('sha256').update(given).digest()
+  const b = createHash('sha256').update(expected).digest()
+  return timingSafeEqual(a, b)
+}
 
 class HttpError extends Error {
   constructor(
@@ -53,11 +63,12 @@ function send(res: ServerResponse, status: number, body: unknown, type = 'applic
  * the Host header must be local (blocks DNS rebinding), cross-origin requests
  * are refused, and mutating calls require a JSON body (which forces a CORS
  * preflight that this server never approves). Set API_TOKEN to also require
- * a bearer token.
+ * a bearer token; the config refuses a non-local API_HOST without one.
  */
 export class ApiServer {
   private readonly server = createServer((req, res) => void this.handle(req, res))
-  private readonly wss = new WebSocketServer({ noServer: true })
+  // Selects the auth protocol itself, so the token is never echoed back.
+  private readonly wss = new WebSocketServer({ noServer: true, handleProtocols: (protocols) => (protocols.has(WS_AUTH_PROTOCOL) ? WS_AUTH_PROTOCOL : false) })
   private statusTimer?: NodeJS.Timeout
   private dashboard?: string
 
@@ -79,9 +90,8 @@ export class ApiServer {
   async start(): Promise<string> {
     const { host, port, token } = this.engine.cfg.api
     this.dashboard = await readFile(new URL('./dashboard.html', import.meta.url), 'utf8')
-    if (!LOCAL_HOSTS.has(host) && !token) {
-      this.log.warn({ host }, 'API is bound to a non-local interface without API_TOKEN: anyone who can reach it can trade your wallet')
-    }
+    // loadConfig refuses this; checked again because the server is what exposes the wallet.
+    if (!isLoopbackHost(host) && !token) throw new Error(`API_HOST=${host} needs API_TOKEN: anyone who can reach it could trade the wallet`)
     await new Promise<void>((resolve, reject) => {
       this.server.once('error', reject)
       this.server.listen(port, host, resolve)
@@ -124,9 +134,12 @@ export class ApiServer {
 
     const token = this.engine.cfg.api.token
     if (!token) return true
-    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '')
-    const query = new URL(req.url ?? '/', 'http://x').searchParams.get('token')
-    return bearer === token || query === token
+    // A header only: a token in the URL would end up in logs and browser history.
+    const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '')?.[1]
+    if (bearer !== undefined) return sameSecret(bearer, token)
+    const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((p) => p.trim())
+    const offered = protocols[0] === WS_AUTH_PROTOCOL ? protocols[1] : undefined
+    return offered !== undefined && sameSecret(offered, token)
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

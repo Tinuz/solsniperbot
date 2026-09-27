@@ -1,5 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import type { Logger } from '../util/logger.js'
-import { sleep } from '../util/time.js'
 import { type TelegramTarget, telegramCall } from './telegram.js'
 
 export interface Command {
@@ -16,8 +16,8 @@ export interface CommandHandlers {
 
 interface Update {
   update_id: number
-  message?: { date: number; text?: string; chat: { id: number | string } }
-  callback_query?: { id: string; data?: string; message?: { chat: { id: number | string } } }
+  message?: { date: number; text?: string; chat: { id: number | string }; from?: { id: number } }
+  callback_query?: { id: string; data?: string; from?: { id: number }; message?: { chat: { id: number | string } } }
 }
 
 /** Seconds Telegram holds a getUpdates request open when there is nothing new. */
@@ -37,9 +37,13 @@ export const COMMAND_MENU = [
 ]
 
 /**
- * Listens for commands from the owner's chat (long polling, no open port).
- * Messages from any other chat are ignored, and so are commands that were
- * sent while the bot was down: a /verkoopalles from hours ago must not fire.
+ * Listens for commands from the owner (long polling, no open port). A
+ * command or button counts only from the owner's chat *and* from the owner:
+ * a user in TELEGRAM_OWNER_IDS, or without that setting, the private chat's
+ * own user (in a private chat the chat id is the user's id). In a group,
+ * other members can read along but never pause or sell. Commands sent while
+ * the bot was down are ignored too: a /verkoopalles from hours ago must not
+ * fire.
  */
 export class TelegramCommands {
   private offset?: number
@@ -47,6 +51,7 @@ export class TelegramCommands {
   private readonly abort = new AbortController()
   private loop?: Promise<void>
   private readonly startedAt: number
+  private warnedGroup = false
 
   constructor(
     private readonly target: TelegramTarget,
@@ -90,19 +95,28 @@ export class TelegramCommands {
         failures++
         // 409: something else reads this bot's updates (a second bot, `npm run telegram`, a webhook).
         if (failures === 1 || failures % 20 === 0) this.log.warn({ err: (err as Error).message }, 'telegram: cannot read commands, retrying')
-        await Promise.race([sleep(Math.min(60_000, 2_000 * 2 ** Math.min(failures, 5))), new Promise((r) => this.abort.signal.addEventListener('abort', r))])
+        await delay(Math.min(60_000, 2_000 * 2 ** Math.min(failures, 5)), undefined, { signal: this.abort.signal }).catch(() => undefined)
       }
     }
   }
 
-  private ours(chatId: number | string | undefined): boolean {
-    return chatId !== undefined && String(chatId) === this.target.chatId
+  /** From the owner, in the owner's chat. */
+  private allowed(chatId: number | string | undefined, userId: number | undefined): boolean {
+    if (chatId === undefined || userId === undefined || String(chatId) !== this.target.chatId) return false
+    const owners = this.target.ownerIds ?? []
+    if (owners.length) return owners.includes(String(userId))
+    if (String(userId) === String(chatId)) return true
+    if (!this.warnedGroup) {
+      this.warnedGroup = true
+      this.log.warn('telegram: commands in a group chat are ignored until TELEGRAM_OWNER_IDS lists who may give them')
+    }
+    return false
   }
 
   private async dispatch(u: Update): Promise<void> {
     if (u.message) {
       const m = u.message
-      if (!this.ours(m.chat.id) || !m.text?.startsWith('/')) return
+      if (!m.text?.startsWith('/') || !this.allowed(m.chat.id, m.from?.id)) return
       if (m.date * 1000 < this.startedAt - STALE_MS) return
       const [head = '', ...rest] = m.text.trim().split(/\s+/)
       const name = head.slice(1).split('@')[0]!.toLowerCase()
@@ -111,7 +125,7 @@ export class TelegramCommands {
     }
     const q = u.callback_query
     if (!q) return
-    const text = this.ours(q.message?.chat.id) && q.data ? await this.handlers.button(q.data) : undefined
+    const text = this.allowed(q.message?.chat.id, q.from?.id) && q.data ? await this.handlers.button(q.data) : undefined
     await telegramCall(this.target, 'answerCallbackQuery', { callback_query_id: q.id, ...(text ? { text } : {}) }).catch(() => undefined)
   }
 }

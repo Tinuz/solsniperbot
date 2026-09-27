@@ -75,27 +75,71 @@ export function earlyBuys(rec: Pick<LaunchRecord, 'trades'>, addresses: readonly
   return out
 }
 
-/** Early-buy history per wallet, and who counts as smart money. */
+/**
+ * Smart money is judged on the early buys whose outcome became known in
+ * this many days before the moment of the decision: live and in every
+ * replay alike, so the signal validated offline is the one traded.
+ */
+export const SMART_WINDOW_DAYS = 14
+const DAY_MS = 86_400_000
+
+interface WalletStat {
+  address: string
+  n: number
+  hits: number
+}
+
+/** The early buys whose outcome was known on one UTC day, to forget them together. */
+interface DayBucket {
+  day: number
+  hit: WalletStat[]
+  miss: WalletStat[]
+}
+
+/**
+ * Early-buy history per wallet over a rolling window, and who counts as
+ * smart money. Memory stays bounded however long the bot runs: early buys
+ * older than the window are forgotten, and a wallet with none left is
+ * dropped.
+ */
 export class WalletBook {
-  private readonly wallets = new Map<string, { n: number; hits: number }>()
+  private readonly wallets = new Map<string, WalletStat>()
+  /** Oldest day first. */
+  private readonly buckets: DayBucket[] = []
   private totalBuys = 0
   private totalHits = 0
   /** Latest `until` added: nothing after it is known. */
   knownUntil = 0
 
+  constructor(private readonly windowDays = SMART_WINDOW_DAYS) {}
+
+  /** Adds a finished launch's early buys, and forgets what fell out of the window by its time. */
   add(e: WalletEntry): void {
+    const bucket = this.bucket(Math.floor(e.until / DAY_MS))
     for (const [, address, hit] of e.buys) {
-      const w = this.wallets.get(address)
-      if (w) {
-        w.n++
-        w.hits += hit
-      } else {
-        this.wallets.set(address, { n: 1, hits: hit })
+      let w = this.wallets.get(address)
+      if (!w) {
+        w = { address, n: 0, hits: 0 }
+        this.wallets.set(address, w)
       }
+      w.n++
+      w.hits += hit
+      ;(hit ? bucket.hit : bucket.miss).push(w)
       this.totalBuys++
       this.totalHits += hit
     }
     if (e.until > this.knownUntil) this.knownUntil = e.until
+    this.prune(this.knownUntil)
+  }
+
+  /** Forgets the early buys whose outcome is older than the window before `now`. */
+  prune(now: number): void {
+    const oldest = Math.floor((now - this.windowDays * DAY_MS) / DAY_MS)
+    while (this.buckets.length && this.buckets[0]!.day < oldest) {
+      const b = this.buckets.shift()!
+      for (const w of b.hit) this.forget(w, 1)
+      for (const w of b.miss) this.forget(w, 0)
+    }
   }
 
   /** Share of all early buys that were hits. */
@@ -129,6 +173,26 @@ export class WalletBook {
     for (const w of this.wallets.values()) if (w.n >= SMART_MIN_APPEARANCES && w.hits / (w.n + 2) >= min) n++
     return n
   }
+
+  private bucket(day: number): DayBucket {
+    const last = this.buckets[this.buckets.length - 1]
+    if (last?.day === day) return last
+    // Outcomes arrive nearly in order: search from the newest day.
+    let i = this.buckets.length
+    while (i > 0 && this.buckets[i - 1]!.day > day) i--
+    if (i > 0 && this.buckets[i - 1]!.day === day) return this.buckets[i - 1]!
+    const b: DayBucket = { day, hit: [], miss: [] }
+    this.buckets.splice(i, 0, b)
+    return b
+  }
+
+  private forget(w: WalletStat, hit: 0 | 1): void {
+    w.n--
+    w.hits -= hit
+    this.totalBuys--
+    this.totalHits -= hit
+    if (w.n <= 0) this.wallets.delete(w.address)
+  }
 }
 
 const DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/
@@ -158,13 +222,11 @@ export async function readWalletEntries(dataDir: string, fromDay = '0000-00-00')
   return out.sort((a, b) => a.until - b.until)
 }
 
-/** Replays need history from before the first launch: this many days of it. */
-export const SMART_HISTORY_DAYS = 7
-
 /**
  * Sets `rec.smart` on every record: the wallet indices of its early buyers
  * that were smart money at the moment of the launch, judged only on launches
- * whose outcome was known by then. Records without logged buyers get none.
+ * whose outcome was known by then, over the same rolling window as the live
+ * book. Records without logged buyers get none.
  */
 export function annotateSmartBuyers(records: LaunchRecord[], entries: WalletEntry[]): void {
   const byMint = new Map(entries.map((e) => [e.mint, e]))
@@ -173,6 +235,7 @@ export function annotateSmartBuyers(records: LaunchRecord[], entries: WalletEntr
   let next = 0
   for (const rec of sorted) {
     while (next < entries.length && entries[next]!.until <= rec.t) book.add(entries[next++]!)
+    book.prune(rec.t)
     const own = byMint.get(rec.mint)
     rec.smart = own ? own.buys.filter(([, address]) => book.isSmart(address)).map(([index]) => index) : []
   }
@@ -182,6 +245,6 @@ export function annotateSmartBuyers(records: LaunchRecord[], entries: WalletEntr
 export async function annotateFromDisk(dataDir: string, records: LaunchRecord[]): Promise<void> {
   if (!records.length) return
   const first = records.reduce((m, r) => Math.min(m, r.t), Number.POSITIVE_INFINITY)
-  const fromDay = new Date(first - SMART_HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10)
+  const fromDay = new Date(first - SMART_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10)
   annotateSmartBuyers(records, await readWalletEntries(dataDir, fromDay))
 }

@@ -136,7 +136,7 @@ describe('replay', () => {
     const mcfg = { ...cfg.momentum, minAgeMs: 1_000, maxAgeMs: 10_000, minBuyers: 4, minNetBuyLamports: 2_000_000_000n }
     const r = replayLaunch(record(buyers), rc({ entry: 'momentum', momentum: mcfg }))
     expect(r.entered).toBe(true)
-    expect(r.entryMs).toBe(1_500 + 300) // 4th buyer at 1400ms, next 250ms check at 1500ms, plus latency
+    expect(r.entryMs).toBe(1_400 + 300) // decided on the 4th buyer's trade at 1400ms, like the live engine, plus latency
     expect(replayLaunch(record([]), rc({ entry: 'momentum', momentum: mcfg }))).toMatchObject({ entered: false, skipReason: 'momentum window expired' })
   })
 
@@ -167,13 +167,18 @@ describe('replay: insider signals', () => {
   })
 
   it('tracks the biggest holder from the reserves, and lets a sold bag go', () => {
-    // One wallet buys ~8% of the supply.
+    // One wallet buys ~9% of the supply: seen on that very trade, as live.
     const whale = record([{ dt: 800, buy: 3e9, wallet: 9 }, ...organic])
     expect(replayLaunch(whale, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '5' })).skipReason).toMatch(/one wallet holds [0-9.]+% of the supply/)
     expect(replayLaunch(whale, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '12' })).entered).toBe(true)
-    // It sells most of it before the bot decides: no longer a big holder.
-    const sold = record([{ dt: 800, buy: 3e9, wallet: 9 }, { dt: 900, sellTokens: 60e12, wallet: 9 }, ...organic, { dt: 1_700, buy: 0.6e9 }])
-    expect(replayLaunch(sold, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '5' })).skipReason ?? '').not.toMatch(/one wallet/)
+    // It buys more: past 10% of the supply...
+    const more = record([{ dt: 800, buy: 3e9, wallet: 9 }, { dt: 1_000, buy: 1e9, wallet: 9 }, ...organic])
+    expect(replayLaunch(more, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '10' })).skipReason).toMatch(/one wallet holds 1\d\.\d% of the supply/)
+    // ...unless it sold most of its bag first: what it sold no longer counts.
+    const sold = record([{ dt: 800, buy: 3e9, wallet: 9 }, { dt: 900, sellTokens: 60e12, wallet: 9 }, { dt: 1_000, buy: 1e9, wallet: 9 }, ...organic])
+    const r = replayLaunch(sold, cfgOf({ MOMENTUM_MAX_TOP_BUYER_PCT: '10' }))
+    expect(r.skipReason ?? '').not.toMatch(/one wallet/)
+    expect(r.entered).toBe(true)
   })
 })
 

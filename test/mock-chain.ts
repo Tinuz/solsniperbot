@@ -38,7 +38,7 @@ interface CoinState {
 
 export interface LandedTx {
   signature: string
-  kind: 'buy' | 'sell'
+  kind: 'buy' | 'sell' | 'close'
   programs: string[]
   tipLamports: bigint
   tipAccount?: string
@@ -74,6 +74,13 @@ export class MockChain {
   private readonly seen = new Map<string, LandedTx>()
   /** Makes the next N buy transactions fail on-chain with a slippage error. */
   failNextBuys = 0
+  /** Makes the next N sell transactions fail on-chain with a slippage error. */
+  failNextSells = 0
+  /** Accepts the next N transactions but holds them, unexecuted, until `release()` (in flight). */
+  holdNext = 0
+  private held: { signature: string; base64: string; via: string }[] = []
+  /** RPC methods that fail for now (an outage). */
+  readonly failing = new Set<string>()
 
   async start(): Promise<number> {
     this.server = createServer((req, res) => {
@@ -106,6 +113,27 @@ export class MockChain {
   async stop(): Promise<void> {
     for (const ws of this.wss.clients) ws.terminate()
     await new Promise<void>((r) => this.server.close(() => r()))
+  }
+
+  /** The held transactions land now. */
+  release(): void {
+    for (const h of this.held.splice(0)) this.execute(h.base64, h.via, true)
+  }
+
+  /** The held transactions never land: they are dropped and their blockhash expires. */
+  dropHeld(): void {
+    this.held.splice(0)
+    this.blockHeight += 200
+  }
+
+  tokensOf(mint: PublicKey, owner: PublicKey): bigint {
+    return this.tokenBalance(mint, owner)
+  }
+
+  /** Tokens leave `owner`'s wallet without a transaction the bot sent (sold elsewhere). */
+  drain(mint: PublicKey, owner: PublicKey, tokens: bigint): void {
+    const coin = this.coins.get(mint.toBase58())!
+    this.emitLogs(this.fakeSig(), [this.sell(coin, owner, tokens).line])
   }
 
   fund(owner: PublicKey, lamports: bigint): void {
@@ -299,6 +327,7 @@ export class MockChain {
 
   private rpc(method: string, params: unknown[], via: string): unknown {
     const ctx = { context: { slot: this.slot } }
+    if (this.failing.has(method)) throw new Error('mock outage')
     switch (method) {
       case 'getLatestBlockhash':
         return { ...ctx, value: { blockhash: bs58.encode(Buffer.alloc(32, 7)), lastValidBlockHeight: this.blockHeight + 150 } }
@@ -353,12 +382,19 @@ export class MockChain {
   }
 
   /** Verifies, decodes and executes a submitted transaction. */
-  private execute(base64: string, via: string): string {
+  private execute(base64: string, via: string, released = false): string {
     const tx = VersionedTransaction.deserialize(Buffer.from(base64, 'base64'))
     const signature = bs58.encode(tx.signatures[0]!)
     const already = this.seen.get(signature)
     if (already) {
       already.receivedBy.push(via)
+      return signature
+    }
+    // Held (or re-broadcast while held): accepted, not executed.
+    if (!released && this.held.some((h) => h.signature === signature)) return signature
+    if (!released && this.holdNext > 0) {
+      this.holdNext--
+      this.held.push({ signature, base64, via })
       return signature
     }
     const keys = tx.message.staticAccountKeys
@@ -380,6 +416,7 @@ export class MockChain {
       }
       if (program.equals(TOKEN_2022_PROGRAM_ID) && ix.data[0] === 9) record.closesAccount = true
     }
+    if (!pumpIx && record.closesAccount) return this.closeOnly(tx, record, signature)
     if (!pumpIx) throw new Error('no pump instruction')
 
     const data = Buffer.from(pumpIx.data)
@@ -419,12 +456,14 @@ export class MockChain {
         line = ''
       } else {
         const q = quoteSell(coin.curve, RATES, amount)
-        if (q.quoteOut < minOut) {
+        if (this.failNextSells > 0 || q.quoteOut < minOut) {
+          this.failNextSells = Math.max(0, this.failNextSells - 1)
           err = { InstructionError: [2, { Custom: 6003 }] }
           line = ''
         } else {
           const r = this.sell(coin, payer, amount)
           post += r.received - record.tipLamports + (record.closesAccount ? 2_039_280n : 0n)
+          if (record.closesAccount) this.tokens.delete(`${mint.toBase58()}:${payer.toBase58()}`)
           line = r.line
         }
       }
@@ -438,6 +477,35 @@ export class MockChain {
     setTimeout(() => {
       this.statuses.set(signature, { slot: this.slot + 1, err })
       this.emitLogs(signature, line ? [line] : [], err)
+    }, 25)
+    return signature
+  }
+
+  /** Closing an empty token account on its own: its rent comes back. */
+  private closeOnly(tx: VersionedTransaction, record: LandedTx, signature: string): string {
+    record.kind = 'close'
+    const keys = tx.message.staticAccountKeys
+    const payer = keys[0]!
+    const closeIx = tx.message.compiledInstructions.find((ix) => keys[ix.programIdIndex]!.equals(TOKEN_2022_PROGRAM_ID))!
+    const ata = keys[closeIx.accountKeyIndexes[0]!]!.toBase58()
+    const entry = [...this.tokens].find(([k]) => {
+      const [m, owner] = k.split(':')
+      return associatedTokenAddress(new PublicKey(owner!), new PublicKey(m!), TOKEN_2022_PROGRAM_ID).toBase58() === ata
+    })
+    const pre = this.balanceOf(payer)
+    let post = pre - 5_000n
+    let err: unknown = null
+    if (!entry || entry[1] !== 0n) err = { InstructionError: [2, { Custom: 11 }] }
+    else {
+      this.tokens.delete(entry[0])
+      post += 2_039_280n
+    }
+    this.lamports.set(payer.toBase58(), post)
+    this.deltas.set(signature, { payer: payer.toBase58(), pre, post, fee: 5_000n })
+    this.landed.push(record)
+    setTimeout(() => {
+      this.statuses.set(signature, { slot: this.slot + 1, err })
+      this.emitLogs(signature, [], err)
     }, 25)
     return signature
   }

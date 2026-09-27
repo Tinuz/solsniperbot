@@ -7,14 +7,16 @@ import { Keypair, PublicKey } from '@solana/web3.js'
 import bs58 from 'bs58'
 import pino from 'pino'
 import { afterEach, describe, expect, it } from 'vitest'
+import { WebSocket } from 'ws'
 import { ApiServer } from '../src/api/server.js'
-import { loadConfig } from '../src/config.js'
+import { loadConfig, publicConfig } from '../src/config.js'
 import { Engine, type EngineEvent } from '../src/engine.js'
 import type { LaunchRecord } from '../src/learning/record.js'
 import { Reporter } from '../src/notify/reporter.js'
 import { DeadError } from '../src/strategy/survival.js'
 import { PUMP_PROGRAM_ID } from '../src/pump/constants.js'
 import { positionPnl } from '../src/trading/positions.js'
+import { toJson } from '../src/util/json.js'
 import { MockChain } from './mock-chain.js'
 
 const log = pino({ level: process.env.TEST_LOG ?? 'silent' })
@@ -381,7 +383,7 @@ describe('telegram (real engine)', () => {
       await waitFor(() => sent.some((t) => t.startsWith('[paper] ▶️ Gestart · handelt')), 5_000, 'started message')
       const mint = chain.launch({ symbol: 'TGRM', devBuyLamports: 500_000_000n }).mint.toBase58()
       await waitFor(() => engine.positions.get(mint)?.status === 'open', 5_000, 'position')
-      const ask = (text: string) => queue.push({ update_id: queue.length + sent.length + 1, message: { date: Math.floor(Date.now() / 1000), text, chat: { id: 7 } } })
+      const ask = (text: string) => queue.push({ update_id: queue.length + sent.length + 1, message: { date: Math.floor(Date.now() / 1000), text, chat: { id: 7 }, from: { id: 7 } } })
       ask('/status')
       const status = await waitFor(() => sent.find((t) => t.includes('🤖 Status')), 5_000, '/status reply')
       expect(status).toContain('Open: 1 positie · 0 moonbags')
@@ -416,5 +418,60 @@ describe('control API', () => {
 
     const page = await fetch(`${base}/`).then((r) => r.text())
     expect(page).toContain('<title>Sol Sniper</title>')
+  })
+
+  it('with API_TOKEN, takes the token only from a header or the WebSocket subprotocol', async () => {
+    const token = 'k'.repeat(20) + 'Secret-42'
+    const { apiUrl, engine } = await boot({ API_TOKEN: token }, undefined, true)
+    const base = apiUrl!
+    const status = (headers: Record<string, string> = {}, path = '/api/status') => fetch(`${base}${path}`, { headers }).then((r) => r.status)
+    expect(await status()).toBe(403)
+    expect(await status({ authorization: `Bearer ${token}x` })).toBe(403)
+    expect(await status({ authorization: `Bearer ${token.slice(0, -1)}` })).toBe(403)
+    expect(await status({}, `/api/status?token=${token}`)).toBe(403) // never from the URL
+    expect(await status({ authorization: `Bearer ${token}` })).toBe(200)
+    const pause = await fetch(`${base}/api/pause`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` } })
+    expect(pause.status).toBe(200)
+    expect(engine.risk.snapshot().paused).toBe(true)
+
+    const wsUrl = `${base.replace('http', 'ws')}/ws`
+    const opened = (protocols?: string[]) =>
+      new Promise<{ ok: boolean; protocol?: string; first?: string }>((resolve) => {
+        const ws = new WebSocket(wsUrl, protocols)
+        ws.once('message', (d) => {
+          resolve({ ok: true, protocol: ws.protocol, first: JSON.parse(d.toString()).type })
+          ws.close()
+        })
+        ws.once('error', () => resolve({ ok: false }))
+      })
+    expect(await opened()).toEqual({ ok: false })
+    expect(await opened(['sniper-auth', 'wrong-token-000000'])).toEqual({ ok: false })
+    // The token is never echoed back: the server picks the auth protocol itself.
+    expect(await opened(['sniper-auth', token])).toEqual({ ok: true, protocol: 'sniper-auth', first: 'snapshot' })
+  })
+})
+
+describe('config safety', () => {
+  const base = { RPC_URL: 'https://rpc.example.com' }
+  it('refuses a control API reachable from other machines without a strong token', () => {
+    expect(() => loadConfig({ ...base, API_HOST: '0.0.0.0' })).toThrow(/API_HOST=0.0.0.0 .*set API_TOKEN/)
+    expect(() => loadConfig({ ...base, API_HOST: '0.0.0.0', API_TOKEN: 'short' })).toThrow(/at least 16 characters/)
+    expect(() => loadConfig({ ...base, API_HOST: '0.0.0.0', API_TOKEN: 'has spaces in it, sadly' })).toThrow(/may contain letters, digits/)
+    expect(loadConfig({ ...base, API_HOST: '0.0.0.0', API_TOKEN: 'a'.repeat(32) }).api.host).toBe('0.0.0.0')
+    expect(loadConfig({ ...base, API_HOST: '127.0.0.1' }).api.token).toBeUndefined()
+  })
+
+  it('never exposes provider keys, wherever the URL keeps them', () => {
+    const c = loadConfig({
+      RPC_URL: 'https://mainnet.helius-rpc.com/?api-key=abcd1234abcd1234',
+      WS_URL: 'wss://user:pass@example.solana-mainnet.quiknode.pro/0123456789abcdef0123456789abcdef/',
+      SEND_RPC_URLS: 'https://rpc.triton.one/SECRETKEY0123456789',
+      TELEGRAM_BOT_TOKEN: '123:ABC',
+      TELEGRAM_CHAT_ID: '42',
+    })
+    const json = toJson(publicConfig(c))
+    for (const secret of ['abcd1234abcd1234', '0123456789abcdef0123456789abcdef', 'SECRETKEY0123456789', 'pass', '123:ABC']) expect(json).not.toContain(secret)
+    expect(publicConfig(c).rpcUrl).toBe('https://mainnet.helius-rpc.com/?***')
+    expect(publicConfig(c).wsUrl).toBe('wss://example.solana-mainnet.quiknode.pro/***/')
   })
 })

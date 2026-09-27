@@ -2,12 +2,41 @@ import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises
 import { dirname } from 'node:path'
 import { toJson } from './json.js'
 
-/** Writes JSON atomically (temp file + rename) so a crash never leaves a torn file. */
-export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
-  const tmp = `${path}.${process.pid}.tmp`
-  await writeFile(tmp, toJson(value, 2))
-  await rename(tmp, path)
+export interface WriteOptions {
+  /**
+   * For large snapshots of plain data (numbers, strings, arrays, objects: no
+   * bigints, keys, sets or maps): no replacer and no indentation, several
+   * times faster, so the trading thread barely notices the save.
+   */
+  compact?: boolean
+}
+
+let tmpSeq = 0
+/** Writes still in progress per path: the next write to a path starts after the previous one finished. */
+const writing = new Map<string, Promise<void>>()
+
+/**
+ * Writes JSON atomically (temp file + rename) so a crash never leaves a torn
+ * file. Writes to the same path are serialized, and every write has its own
+ * temp file, so concurrent callers can never interleave.
+ */
+export function writeJsonAtomic(path: string, value: unknown, opts: WriteOptions = {}): Promise<void> {
+  // Serialize now: the snapshot is what the caller holds at this moment.
+  const json = opts.compact ? JSON.stringify(value) : toJson(value, 2)
+  const prev = writing.get(path) ?? Promise.resolve()
+  const next = prev
+    .catch(() => undefined)
+    .then(async () => {
+      await mkdir(dirname(path), { recursive: true })
+      const tmp = `${path}.${process.pid}.${++tmpSeq}.tmp`
+      await writeFile(tmp, json)
+      await rename(tmp, path)
+    })
+  writing.set(path, next)
+  void next.finally(() => {
+    if (writing.get(path) === next) writing.delete(path)
+  }).catch(() => undefined)
+  return next
 }
 
 export async function readJson<T>(path: string): Promise<T | undefined> {
@@ -52,16 +81,18 @@ export class Journal {
 export class DebouncedWriter {
   private timer: NodeJS.Timeout | undefined
   private inFlight: Promise<void> = Promise.resolve()
+  private closed = false
 
   constructor(
     private readonly path: string,
     private readonly snapshot: () => unknown,
     private readonly delayMs = 250,
     private readonly onError: (err: unknown) => void = () => {},
+    private readonly opts: WriteOptions = {},
   ) {}
 
   schedule(): void {
-    if (this.timer) return
+    if (this.timer || this.closed) return
     this.timer = setTimeout(() => {
       this.timer = undefined
       void this.flush()
@@ -73,7 +104,14 @@ export class DebouncedWriter {
       clearTimeout(this.timer)
       this.timer = undefined
     }
-    this.inFlight = this.inFlight.then(() => writeJsonAtomic(this.path, this.snapshot())).catch(this.onError)
+    if (this.closed) return this.inFlight
+    this.inFlight = this.inFlight.then(() => writeJsonAtomic(this.path, this.snapshot(), this.opts)).catch(this.onError)
     return this.inFlight
+  }
+
+  /** Final write; nothing is written after it (a late change cannot overwrite the last snapshot). */
+  async close(): Promise<void> {
+    await this.flush()
+    this.closed = true
   }
 }

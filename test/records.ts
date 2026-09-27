@@ -1,6 +1,7 @@
 import { Keypair } from '@solana/web3.js'
 import type { LaunchRecord, TradeRow } from '../src/learning/record.js'
 import { summarize } from '../src/learning/record.js'
+import { type TunableParams, settingsFingerprint } from '../src/learning/tunable.js'
 import { type CurveState, applyBuy, applySell, buyCostForTokens, quoteBuyExactIn, quoteSell } from '../src/pump/curve.js'
 
 const RATES = { protocolBps: 95n, creatorBps: 30n }
@@ -107,4 +108,15 @@ export function momentumMarket(n: number, start = 1_750_000_000_000): LaunchReco
     const t = start + i * 300_000
     return r < 0.55 ? deadCoin(t) : r < 0.85 ? earlyRug(t) : steadyPump(t)
   })
+}
+
+/**
+ * Stamps the newest `share` of `records` as recorded while `params` were in
+ * effect (the recorder stamps every recording with the settings fingerprint):
+ * as if the settings took effect then. The edge gate only counts those.
+ */
+export function recordedUnder(records: LaunchRecord[], params: TunableParams, share = 0.3): LaunchRecord[] {
+  const fp = settingsFingerprint(params)
+  const from = Math.floor(records.length * (1 - share))
+  return records.map((r, i) => (i >= from ? { ...r, settings: fp } : r))
 }

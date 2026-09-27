@@ -133,10 +133,11 @@ export class RpcClient {
     )
   }
 
-  async getSignatureStatuses(signatures: string[]): Promise<(SignatureStatus | null)[]> {
+  /** `history`: also search older blocks (slower); without it only recent transactions are found. */
+  async getSignatureStatuses(signatures: string[], history = false): Promise<(SignatureStatus | null)[]> {
     const r = await this.call<{ value: (SignatureStatus | null)[] }>(
       'getSignatureStatuses',
-      [signatures, { searchTransactionHistory: false }],
+      [signatures, { searchTransactionHistory: history }],
       4_000,
     )
     return r.value

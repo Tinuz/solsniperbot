@@ -100,8 +100,13 @@ interface TuningState {
   lastRun?: CycleSummary
   lastProposalAt?: number
   lastCheckAt?: number
-  /** Whether the settings in effect make money on recent launches. */
+  /** Whether the settings in effect made money on launches recorded under them (forward data). */
   edge?: EdgeResult
+  /**
+   * A shadow-tested candidate's forward data starts when it was found, not
+   * when it went live: the launches it was shadow-tested on count too.
+   */
+  forwardSince?: { key: string; since: number }
 }
 
 export interface AutoTunerOptions {
@@ -171,8 +176,9 @@ export async function loadTunedParams(cfg: Config): Promise<{ params: TunablePar
  *   the adoption, it is rolled back and tuning pauses for a cooldown.
  *
  * With REQUIRE_EDGE it is also the bot's permission to trade: buying is only
- * allowed while the settings in effect make money on recent launches
- * (`evaluateEdge`). Until then the bot only watches and records.
+ * allowed while the settings in effect made money on launches recorded
+ * after they were chosen (`evaluateEdge`). Until then the bot only watches
+ * and records.
  *
  * Trade size, reserve, fees and risk limits are never touched. Overrides live
  * in data/tuning and are dropped as soon as the .env settings change.
@@ -269,6 +275,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
         this.state.active = this.baseline
         this.state.cooldownUntil = undefined
         this.state.cooldownReason = undefined
+        // A candidate shadow-tested against the old settings says nothing about the new ones.
+        this.state.shadow = undefined
+        this.state.forwardSince = undefined
         if (dropped.length) {
           this.log.warn({ dropped: describe(dropped) }, 'autotune: .env settings changed since the last adoption, tuned overrides dropped')
           void this.journal.append({ type: 'reset', at: this.now(), reason: '.env settings changed', dropped })
@@ -277,7 +286,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       } else {
         const overrides = diffParams(this.baseline, this.state.active)
         if (overrides.length) {
-          this.setActive(this.state.active)
+          // Restored as they were, with the start of their forward proof.
+          const fs = this.state.forwardSince
+          this.setActive(this.state.active, fs?.key === paramsKey(this.state.active) ? fs.since : undefined)
           this.log.info({ overrides: describe(overrides) }, 'autotune: tuned settings restored')
         }
       }
@@ -331,7 +342,13 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const o = this.cfg.autotune
     const current = paramsFromConfig(this.cfg)
     const probationAdoption = this.adopts && st.probation ? this.adoption(st.probation.adoptionId) : undefined
-    const shadow = this.live && !probationAdoption ? st.shadow : undefined
+    // A shadow test only compares with the settings it started from: once those
+    // changed (a revert, a rollback), its candidate would overwrite the new ones.
+    if (st.shadow && paramsKey(st.shadow.from) !== paramsKey(current)) {
+      void this.journal.append({ type: 'shadow-dropped', at, changes: st.shadow.changes, reason: 'settings changed since it started' })
+      st.shadow = undefined
+    }
+    const shadow = !probationAdoption ? st.shadow : undefined
     const coolingDown = (st.cooldownUntil ?? 0) > at
     // Hourly checks are cheap; the search itself runs every AUTOTUNE_INTERVAL_HOURS,
     // or with every check while data is still short (then it returns at once).
@@ -360,6 +377,8 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? { adopted: shadow.to, previous: shadow.from, since: shadow.since, neededTrades: shadow.neededTrades }
           : undefined,
       edge: o.requireEdge,
+      waitForVerdict: o.requireEdge,
+      currentSince: st.forwardSince?.key === paramsKey(current) ? st.forwardSince.since : undefined,
       explore: this.mayExplore() ? { budgetMs: EXPLORE_BUDGET_MS } : undefined,
       now: at,
     }
@@ -599,7 +618,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       sh.last = pr
       if (pr.status === 'passed') {
         st.shadow = undefined
-        this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`)
+        this.adopt(sh.from, sh.to, sh.changes, sh.test, at, `after a shadow test (${pr.detail})`, sh.since)
       } else if (pr.status === 'failed') {
         st.shadow = undefined
         st.rolledBack = [...this.recentRollbacks(at), { key: paramsKey(sh.to), at }]
@@ -617,7 +636,9 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
           ? 'autotune off: edge check only'
           : coolingDown
             ? `cooling down until ${iso(st.cooldownUntil ?? at)} (${st.cooldownReason ?? ''})`
-            : `next search after ${iso((st.lastProposalAt ?? at) + o.intervalMs)}`
+            : res.collecting
+              ? `no search while the settings in effect collect their forward proof (${res.edge?.reason ?? ''})`
+              : `next search after ${iso((st.lastProposalAt ?? at) + o.intervalMs)}`
       return { ...base, decision: 'skipped', reason, changes: [], gates: [] }
     }
     st.lastProposalAt = at
@@ -679,11 +700,13 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
       currentLamports: metrics.current.test.totalPnlLamports,
       candidateLamports: metrics.candidate?.test.totalPnlLamports ?? 0,
     }
-    if (this.live) {
-      // Real money: first prove it forward on launches nobody has seen yet, without trading it.
+    // Real money, or paper settings that are making money right now: first prove the
+    // candidate forward on launches nobody has seen yet, without trading it. Paper
+    // trading goes on meanwhile, and the shadow test becomes the candidate's forward proof.
+    if (this.live || (this.cfg.autotune.requireEdge && res.edge?.status === 'proven')) {
       st.shadow = { since: at, neededTrades: this.cfg.autotune.probationTrades, from: job.current, to: p.candidate, changes: p.changes, test }
       void this.journal.append({ type: 'shadow', at, changes: p.changes, test })
-      this.notice('info', `autotune: shadow-testing ${describe(p.changes)} on new launches before trading it live (${this.cfg.autotune.probationTrades} trades)`)
+      this.notice('info', `autotune: shadow-testing ${describe(p.changes)} on new launches before trading it${this.live ? ' live' : ''} (${this.cfg.autotune.probationTrades} trades)`)
       out.reason = `all ${out.gates.length} gates passed; shadow test started`
       if (this.timer) this.schedule(this.intervalMs())
       return out
@@ -692,11 +715,14 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     return out
   }
 
-  /** Puts adopted settings into effect and on probation. */
-  private adopt(from: TunableParams, to: TunableParams, changes: ParamChange[], test: Adoption['test'], at: number, why: string): void {
+  /**
+   * Puts adopted settings into effect and on probation. `shadowSince`: the
+   * launches since then were its shadow test, and count as its forward proof.
+   */
+  private adopt(from: TunableParams, to: TunableParams, changes: ParamChange[], test: Adoption['test'], at: number, why: string, shadowSince?: number): void {
     const st = this.state
     const adoption: Adoption = { id: (st.adoptions.at(-1)?.id ?? 0) + 1, at, changes, from, to, test, status: 'probation' }
-    this.setActive(to)
+    this.setActive(to, shadowSince)
     st.adoptions = [...st.adoptions, adoption].slice(-MAX_ADOPTIONS_KEPT)
     st.probation = { adoptionId: adoption.id, since: at, neededTrades: this.cfg.autotune.probationTrades }
     void this.journal.append({ type: 'adopt', at, adoption: adoption.id, changes, test, live: this.live })
@@ -708,9 +734,15 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
   }
 
   /** Puts `p` into effect on the running bot. */
-  private setActive(p: TunableParams): void {
+  /**
+   * Puts `p` into effect. Its forward proof starts now, or at `forwardSince`
+   * (a shadow test): an older start never carries over, or the data that
+   * picked the settings could count as their proof.
+   */
+  private setActive(p: TunableParams, forwardSince?: number): void {
     applyParams(this.cfg, p)
     this.state.active = p
+    this.state.forwardSince = forwardSince === undefined ? undefined : { key: paramsKey(p), since: forwardSince }
     this.version++
   }
 
@@ -781,7 +813,7 @@ export class AutoTuner extends EventEmitter<{ notice: ['info' | 'warn' | 'error'
     const lines: string[] = [
       '# Autotune report',
       '',
-      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.live ? ' (adopts in LIVE trading after a shadow test, at reduced size during probation)' : this.adopts ? ' (adopts automatically, paper only)' : ' (proposes only)'}.`,
+      `Generated ${new Date(s.at).toISOString()} (${s.trigger}). Mode: **${this.cfg.autotune.mode}**${this.live ? ' (adopts in LIVE trading after a shadow test, at reduced size during probation)' : this.adopts ? ' (adopts automatically, paper only; after a shadow test while the settings in effect make money)' : ' (proposes only)'}.`,
       '',
     ]
     if (this.cfg.autotune.requireEdge) {
