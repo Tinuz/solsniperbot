@@ -195,7 +195,7 @@ Every cycle is logged to `data/tuning/history.jsonl`. `data/tuning/report.md` ho
 ## Running unattended
 
 `npm run supervise` builds the bot and keeps it running:
-- **Restarts.** After a crash, or when it stops responding (no heartbeat for 90 s), it restarts after 5 s, then 10 s, 20 s, and so on up to 5 min. It keeps trying through long network outages, and a stable run resets the delay.
+- **Restarts.** After a crash, or when it stops responding (no heartbeat for 90 s), it restarts after 5 s, then 10 s, 20 s, and so on up to 5 min. It keeps trying through long network outages, and a stable run resets the delay. A start that keeps failing is reported on Telegram at the 1st, 2nd, 4th, 8th… attempt, not at every one; when the RPC answers HTTP 429 (for example `max usage reached`: the plan's credits are used up), the message says so.
 - **When it stays down.** After Ctrl-C, after the bot declares itself dead (exit code 3: it waits for a top-up), or after a configuration error (exit code 78: fix `.env`).
 - **Autostart on Windows.** Task Scheduler → *Create Task* → trigger *At log on* → action `npm`, arguments `run supervise`, *Start in* the bot's folder.
 - **Linux.** A systemd service with `ExecStart=npm run supervise` (or `node dist/index.js` with `Restart=on-failure` and `RestartPreventExitStatus=3 78`).
@@ -241,7 +241,7 @@ Setup:
 3. Set `TELEGRAM_CHAT_ID` (and for a group `TELEGRAM_OWNER_IDS`) and run it again. It sends a test message.
 
 **Cost of existence.** A bot that has to keep itself alive also has to pay for itself. Set `OPERATING_COST_PER_MONTH` (with `OPERATING_COST_CURRENCY` usd, eur or sol) to what the RPC plan and server cost.
-- **The ledger.** The bot converts the costs to SOL at the current price and accrues them while it runs. It sets them against the P&L of its trades in `data/costs-{paper,live}.json`.
+- **The ledger.** The bot converts the costs to SOL at the current price (CoinGecko, or Binance when that fails; hourly, keeping the last known price meanwhile) and accrues them while it runs. It sets them against the P&L of its trades in `data/costs-{paper,live}.json`.
 - **On the dashboard.** The *Net after costs* tile shows the result.
 - **In the edge gate.** The bot only trades while its recent profit, scaled to a day, covers the daily costs.
 
@@ -411,7 +411,8 @@ npm run typecheck
   - a candidate that fails its shadow test is never traded or proposed again;
   - config refuses live autotune in paper mode and without the edge gate.
 - **Unattended running**:
-  - restart policy: no restart after a clean stop, death or a config error; growing delays after crashes and hangs, never giving up;
+  - restart policy: no restart after a clean stop, death or a config error; growing delays after crashes and hangs, never giving up; a failing start reported at the 1st, 2nd, 4th, 8th… attempt;
+  - the SOL price: a body gzipped without a header is read, and a second source takes over when the first fails;
   - Telegram delivery: in order, waits out rate limits, drops refused messages, token kept out of the API;
   - the reporter's alerts, trade reports, debounced feed outages and once-a-day summary, in Dutch;
   - the digest on the local clock (with the result without the best trade), highlights each sent once, and the trade ledger (from the journal on first start);

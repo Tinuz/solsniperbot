@@ -42,3 +42,10 @@ export function decideRestart(
   const delayMs = Math.min(limits.baseDelayMs * 2 ** (state.crashes - 1), limits.maxDelayMs)
   return { restart: true, delayMs, reason: `the bot ${exit.hung ? 'stopped responding' : `exited with ${exit.signal ?? `code ${exit.code}`}`}`, state }
 }
+
+/**
+ * Whether a start that fails after `crashStreak` crashes in a row is worth a
+ * message: the 1st, 2nd, 4th, 8th... attempt. The supervisor keeps retrying
+ * (up to every 5 minutes), and a message per attempt would drown the chat.
+ */
+export const reportsFailedStart = (crashStreak: number): boolean => (crashStreak & (crashStreak + 1)) === 0

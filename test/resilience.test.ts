@@ -8,11 +8,17 @@ import { loadConfig } from '../src/config.js'
 import { GrpcFeed } from '../src/feed/grpc-feed.js'
 import { replayConfigFrom } from '../src/learning/replay.js'
 import { type WalletEntry, WalletBook, annotateSmartBuyers } from '../src/learning/wallets.js'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { gzipSync } from 'node:zlib'
+import { toDutch } from '../src/notify/nl.js'
+import { type PriceSource, fetchSolPrice, parseJsonBody } from '../src/strategy/costs.js'
 import { RiskManager } from '../src/strategy/risk.js'
 import { Survival } from '../src/strategy/survival.js'
 import { Executor } from '../src/trading/executor.js'
 import { txNetworkLamports } from '../src/trading/fees.js'
 import { writeJsonAtomic } from '../src/util/persist.js'
+import { reportsFailedStart } from '../src/util/restart-policy.js'
 import { buildRecord } from './records.js'
 
 const log = pino({ level: 'silent' })
@@ -254,5 +260,48 @@ describe('atomic writes', () => {
     await Promise.all(Array.from({ length: 12 }, (_, n) => writeJsonAtomic(path, big(n), { compact: n % 2 === 0 })))
     expect(JSON.parse(readFileSync(path, 'utf8')).n).toBe(11) // the last one wins, whole
     expect(readdirSync(dir)).toEqual(['state.json']) // no temp files left behind
+  })
+})
+
+describe('SOL price', () => {
+  it('reads a body that is gzipped without saying so, and falls back to the next source', async () => {
+    const json = JSON.stringify({ solana: { usd: 150.5, eur: 139.2 } })
+    expect(parseJsonBody(gzipSync(json))).toEqual({ solana: { usd: 150.5, eur: 139.2 } })
+    expect(parseJsonBody(Buffer.from(json))).toEqual({ solana: { usd: 150.5, eur: 139.2 } })
+
+    // A server that gzips without a Content-Encoding header, and one that is down.
+    const server = createServer((req, res) => {
+      if (req.url === '/down') {
+        res.statusCode = 503
+        return res.end('busy')
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(req.url === '/gz' ? gzipSync(json) : '[{"symbol":"SOLUSDT","price":"151.00"},{"symbol":"SOLEUR","price":"140.00"}]')
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const gecko = (path: string): PriceSource => ({ name: 'gecko', url: base + path, parse: (d) => (d as { solana: { usd: number; eur: number } }).solana })
+    const binance: PriceSource = {
+      name: 'binance',
+      url: `${base}/binance`,
+      parse: (d) => ({ usd: Number((d as { price: string }[])[0]!.price), eur: Number((d as { price: string }[])[1]!.price) }),
+    }
+    try {
+      expect(await fetchSolPrice([gecko('/gz'), binance])).toMatchObject({ usd: 150.5, eur: 139.2 })
+      expect(await fetchSolPrice([gecko('/down'), binance])).toMatchObject({ usd: 151, eur: 140 })
+      await expect(fetchSolPrice([gecko('/down')])).rejects.toThrow(/price API: gecko: HTTP 503/)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+})
+
+describe('a start that keeps failing', () => {
+  it('is reported at the 1st, 2nd, 4th, 8th... attempt, with a hint when the RPC refuses requests', () => {
+    const reported = Array.from({ length: 20 }, (_, streak) => streak).filter(reportsFailedStart).map((s) => s + 1)
+    expect(reported).toEqual([1, 2, 4, 8, 16])
+    expect(toDutch('❌ failed to start (attempt 4): HTTP 429: max usage reached; the RPC provider refuses requests (credits used up or rate limited): check your plan')).toBe(
+      '❌ Starten mislukt (poging 4): HTTP 429: max usage reached; de RPC-provider weigert verzoeken (credits op of te veel verzoeken): kijk je abonnement na',
+    )
   })
 })
